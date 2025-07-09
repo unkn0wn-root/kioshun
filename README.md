@@ -177,7 +177,13 @@ func main() {
     cache := cache.NewWithDefaults[string, string]()
     defer cache.Close()
 
-    // Set value with TTL
+    // Set with default TTL (30 min)
+    cache.Set("user:123", "David Nice", kioshun.DefaultExpiration)
+
+    // Set with no expiration
+    cache.Set("user:123", "David Nice", kioshun.NoExpiration)
+
+    // Set value with custom TTL
     cache.Set("user:123", "David Nice", 5*time.Minute)
 
     // Get value

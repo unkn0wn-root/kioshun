@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+const (
+    NoExpiration time.Duration = -1 // Never expires
+    DefaultExpiration time.Duration = 0 // Use default config value
+)
+
 var (
 	ErrCacheClosed = fmt.Errorf("cache is closed")
 )
