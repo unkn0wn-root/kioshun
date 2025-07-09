@@ -1,18 +1,165 @@
 <div align="center">
-  <img src="assets/logo.JPG" alt="CaGo Logo" width="200"/>
+  <img src="assets/logo.JPG" alt="Kioshun Logo" width="200"/>
 
-  # CaGo - In-Memory Cache for Go
+  # Kioshun - In-Memory Cache for Go
+
+  *"kee-oh-shoon" /kiːoʊʃuːn/*
 
   [![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-  *High-performance, thread-safe, sharded in-memory cache for Go*
+  *Fast, thread-safe, sharded in-memory cache for Go*
 </div>
+
+## Table of Contents
+
+- [Benchmark Results](#benchmark-results-kioshun-vs-ristretto-go-cache-and-freecache)
+  - [Running Benchmarks](#running-benchmarks)
+  - [Core Operations](#core-operations)
+  - [Workload-Specific](#workload-specific)
+  - [Simulate 'Real-World' Workflow](#simulate-real-world-workflow)
+  - [Performance Characteristics](#performance-characteristics)
+  - [Stress Test Results](#stress-test-results)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+  - [Basic Configuration](#basic-configuration)
+  - [Predefined Configurations](#predefined-configurations)
+- [Architecture](#architecture)
+  - [Sharded Design](#sharded-design)
+  - [Hash Function Optimization](#hash-function-optimization)
+  - [Eviction Policy Implementation](#eviction-policy-implementation)
+  - [Concurrent Access Patterns](#concurrent-access-patterns)
+  - [Memory Management](#memory-management)
+  - [Eviction Policies](#eviction-policies)
+- [API Reference](#api-reference)
+- [HTTP Middleware](#http-middleware)
+
+### Benchmark Results Kioshun vs. Ristretto, go-cache and freecache
+
+### Running Benchmarks
+
+```bash
+# Run comparison benchmarks
+make bench-compare
+
+# Run stress tests
+make stress-test
+
+# Run all benchmarks with the benchmark runner
+make bench-runner
+
+# Run all benchmark tests
+make bench
+```
+
+Comparing kioshun against leading Go cache libraries:
+
+**Test Environment:**
+- **OS:** macOS (Darwin)
+- **Architecture:** ARM64
+- **CPU:** Apple M4 Max
+- **Go Version:** 1.21+
+
+#### Core Operations
+
+##### SET Operations
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Kioshun** | 52,143,810 | **74.79** | 56 | 4 |
+| **Ristretto** | 55,905,141 | **73.19** | 150 | 5 |
+| **go-cache** | 11,950,642 | 339.8 | 56 | 3 |
+| **freecache** | 8,166,033 | 517.7 | 956 | 2 |
+
+##### GET Operations
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Ristretto** | 182,913,994 | **19.54** | 31 | 2 |
+| **Kioshun** | 79,889,264 | **51.42** | 31 | 2 |
+| **freecache** | 43,043,793 | 83.97 | 1039 | 2 |
+| **go-cache** | 27,013,480 | 134.9 | 15 | 1 |
+
+#### Workload-Specific
+
+##### Mixed Operations (70% reads, 30% writes)
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Ristretto** | 50,880,874 | **60.69** | 69 | 3 |
+| **Kioshun** | 57,670,704 | **63.19** | 36 | 3 |
+| **go-cache** | 17,468,449 | 203.8 | 22 | 2 |
+| **freecache** | 13,021,879 | 274.9 | 1039 | 2 |
+
+##### High Contention Scenarios
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Kioshun** | 49,625,168 | **73.67** | 40 | 2 |
+| **Ristretto** | 15,899,757 | 229.7 | 83 | 3 |
+| **go-cache** | 16,982,012 | 234.8 | 32 | 1 |
+| **freecache** | 11,682,682 | 318.5 | 922 | 2 |
+
+##### Read-Heavy Workloads (90% reads, 10% writes)
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Ristretto** | 68,613,873 | **34.45** | 45 | 3 |
+| **Kioshun** | 41,003,152 | **57.62** | 33 | 3 |
+| **freecache** | 14,973,655 | 159.6 | 1039 | 2 |
+| **go-cache** | 12,914,514 | 186.6 | 18 | 2 |
+
+##### Write-Heavy Workloads (90% writes, 10% reads)
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Kioshun** | 34,513,875 | **69.29** | 46 | 3 |
+| **Ristretto** | 17,119,744 | 151.3 | 132 | 5 |
+| **go-cache** | 9,193,803 | 287.6 | 37 | 2 |
+| **freecache** | 6,132,829 | 377.0 | 1039 | 2 |
+
+#### Simulate 'Real-World' Workflow
+
+##### Real-World Workload Simulation
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Kioshun** | 39,203,995 | **63.04** | 53 | 3 |
+| **Ristretto** | 17,528,142 | 125.8 | 97 | 3 |
+| **go-cache** | 10,621,634 | 227.8 | 40 | 2 |
+| **freecache** | 6,302,244 | 382.0 | 1168 | 2 |
+
+##### Memory Efficiency
+| Cache Library | Ops/sec | ns/op | bytes/op |
+|---------------|---------|-------|----------|
+| **freecache** | 8,404,188 | 286.3 | **0.1641** |
+| **Ristretto** | 16,212,883 | 150.3 | **0.6158** |
+| **Kioshun** | 9,914,840 | 225.0 | **0.7055** |
+| **go-cache** | 10,193,031 | 318.3 | 105.3 |
+
+### Performance Characteristics
+
+- **19-75ns per operation** for most cache operations
+- **10+ million operations/sec** throughput
+
+### Stress Test Results
+
+#### Eviction Policy Performance
+| Policy | Ops/sec | ns/op | B/op | allocs/op |
+|--------|---------|-------|------|-----------|
+| **LRU** | 17,086,760 | **146.2** | 57 | 4 |
+| **FIFO** | 17,229,789 | **148.8** | 57 | 4 |
+| **LFU** | 14,558,103 | 173.3 | 56 | 4 |
+| **Random** | 13,789,909 | 183.0 | 132 | 4 |
+
+#### High Load Scenarios
+| Load Profile | Ops/sec | ns/op | B/op | allocs/op | Description |
+|-------------|---------|-------|------|-----------|-------------|
+| **Small + High Concurrency** | 32,651,302 | **71.60** | 31 | 2 | Many goroutines, small cache |
+| **Medium + Mixed Load** | 29,994,172 | **80.39** | 36 | 3 | Balanced read/write operations |
+| **Large + Read Heavy** | 34,459,508 | **70.79** | 40 | 3 | Large cache, mostly reads |
+| **XLarge + Write Heavy** | 26,019,538 | **87.39** | 51 | 3 | Very large cache, mostly writes |
+| **Extreme + Balanced** | 26,771,521 | **96.33** | 49 | 3 | Maximum scale, balanced ops |
+
 
 ## Installation
 
 ```bash
-go get github.com/unkn0wn-root/cago
+go get github.com/unkn0wn-root/kioshun
 ```
 
 ## Quick Start
@@ -24,7 +171,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/unkn0wn-root/cago"
+    "github.com/unkn0wn-root/kioshun"
 )
 
 func main() {
@@ -83,11 +230,11 @@ persistentCache := cache.New[string, interface{}](cache.PersistentCacheConfig())
 
 ### Sharded Design
 
-CaGo uses a sharded architecture to minimize lock contention:
+Kioshun uses a sharded architecture to minimize lock contention:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      CaGo Cache                             │
+│                      Kioshun Cache                          │
 ├─────────────┬─────────────┬─────────────┬───────────────────┤
 │   Shard 0   │   Shard 1   │   Shard 2   │   ...   │ Shard N │
 │  RWMutex    │  RWMutex    │  RWMutex    │         │ RWMutex │
@@ -161,42 +308,6 @@ const (
     Random                        // Random eviction
     TinyLFU                       // Tiny Least Frequently Used
 )
-```
-
-## Performance
-
-### Benchmark Results
-
-```
-goos: darwin
-goarch: arm64
-pkg: github.com/unkn0wn-root/cago
-cpu: Apple M4 Max
-
-BenchmarkCacheSet-14            3,529,033    370.2 ns/op    77 B/op    6 allocs/op
-BenchmarkCacheGet-14            4,338,128    279.3 ns/op    31 B/op    2 allocs/op
-BenchmarkCacheGetMiss-14        5,375,492    211.2 ns/op    45 B/op    2 allocs/op
-BenchmarkCacheHeavyRead-14      4,349,043    255.0 ns/op    33 B/op    3 allocs/op
-BenchmarkCacheHeavyWrite-14     3,624,556    330.3 ns/op    65 B/op    5 allocs/op
-BenchmarkCacheSize-14          57,196,422     21.6 ns/op     0 B/op    0 allocs/op
-BenchmarkCacheStats-14         11,465,524    104.6 ns/op     0 B/op    0 allocs/op
-```
-
-### Performance Characteristics
-
-- **280-370ns per operation** for most cache operations
-- **10+ million operations/sec**
-- **Linear scalability** with CPU cores due to sharding
-
-### Running Benchmarks
-
-```bash
-# Run all benchmarks
-make bench
-
-or
-
-make bench-full
 ```
 
 ## API Reference
