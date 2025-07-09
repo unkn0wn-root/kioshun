@@ -53,8 +53,6 @@ make bench-runner
 make bench
 ```
 
-Comparing kioshun against leading Go cache libraries:
-
 **Test Environment:**
 - **OS:** macOS (Darwin)
 - **Architecture:** ARM64
