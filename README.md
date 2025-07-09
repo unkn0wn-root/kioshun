@@ -86,7 +86,7 @@ persistentCache := cache.New[string, interface{}](cache.PersistentCacheConfig())
 
 ### Sharded Design
 
-CaGo uses a sharded architecture to minimize lock contention in high-concurrency environments:
+CaGo uses a sharded architecture to minimize lock contention:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -95,6 +95,7 @@ CaGo uses a sharded architecture to minimize lock contention in high-concurrency
 │   Shard 0   │   Shard 1   │   Shard 2   │   ...   │ Shard N │
 │  RWMutex    │  RWMutex    │  RWMutex    │         │ RWMutex │
 │  LRU List   │  LRU List   │  LRU List   │         │ LRU List│
+│  LFU Heap   │  LFU Heap   │  LFU Heap   │         │ LFU Heap│
 │  Hash Map   │  Hash Map   │  Hash Map   │         │ Hash Map│
 │  Stats      │  Stats      │  Stats      │         │ Stats   │
 └─────────────┴─────────────┴─────────────┴───────────────────┘
@@ -105,6 +106,53 @@ CaGo uses a sharded architecture to minimize lock contention in high-concurrency
 - **Minimal Lock Contention**: Each shard maintains independent read-write mutex
 - **Optimal Shard Count**: Auto-detection based on CPU cores
 - **Memory Efficiency**: Object pooling to reduce GC pressure
+
+### Hash Function Optimization
+- **Integer Keys**: Multiplicative hashing with golden ratio constants
+- **String Keys**: FNV-1a algorithm for fast, lock-free hashing
+- **Other Types**: Fallback to string conversion with FNV-1a
+
+### Eviction Policy Implementation
+
+#### LRU (Least Recently Used)
+- **Access**: Move to head in O(1)
+- **Eviction**: Remove tail in O(1)
+- **Memory**: Minimal overhead per item
+
+#### LFU (Least Frequently Used) - **Optimized**
+Uses min-heap for efficient frequency-based eviction:
+- **Access**: Update frequency and rebalance heap in O(log n)
+- **Eviction**: Remove minimum frequency item in O(log n)
+- **Memory**: Additional heap index per item
+
+**LFU Heap Structure:**
+```
+       Min Frequency Item (Root)
+      /                        \
+   Higher Freq              Higher Freq
+  /          \              /          \
+Items      Items        Items        Items
+```
+
+**Eviction Algorithm Comparison:**
+| Policy | Access Time | Eviction Time | Memory Overhead |
+|--------|-------------|---------------|-----------------|
+| LRU    | O(1)        | O(1)          | Low            |
+| LFU    | O(log n)    | O(log n)      | Medium         |
+| FIFO   | O(1)        | O(1)          | Low            |
+| Random | O(1)        | O(1)          | Low            |
+
+### Concurrent Access Patterns
+The sharded design enables high-throughput concurrent access:
+1. **Read Operations**: Multiple goroutines can read from different shards simultaneously
+2. **Write Operations**: Writers only block other operations on the same shard
+3. **Cross-Shard Operations**: Statistics aggregation uses atomic operations to avoid blocking
+
+### Memory Management
+- **Object Pooling**: Reuses `cacheItem` objects to reduce GC pressure
+- **Atomic Statistics**: Per-shard metrics tracked with atomic operations
+- **Lazy Initialization**: LFU heaps only created when LFU policy is selected
+- **Efficient Cleanup**: Background goroutine removes expired items periodically
 
 ### Eviction Policies
 
