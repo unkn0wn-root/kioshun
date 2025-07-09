@@ -158,20 +158,6 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	return cache
 }
 
-// nextPowerOf2 returns the next power of 2 >= n
-func nextPowerOf2(n int) int {
-	if n <= 1 {
-		return 1
-	}
-	n--
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n |= n >> 16
-	return n + 1
-}
-
 // LRU doubly-linked list for a shard
 func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
 	s.head = &cacheItem[V]{}
@@ -743,3 +729,16 @@ func (c *InMemoryCache[K, V]) Keys() []K {
 	return keys
 }
 
+// nextPowerOf2 returns the next power of 2 >= n
+func nextPowerOf2(n int) int {
+	if n <= 1 {
+		return 1
+	}
+	n--
+	n |= n >> 1
+	n |= n >> 2
+	n |= n >> 4
+	n |= n >> 8
+	n |= n >> 16
+	return n + 1
+}
