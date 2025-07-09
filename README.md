@@ -446,36 +446,3 @@ stats := cache.GetGlobalCacheStats()
 // Close all global caches
 cache.CloseAllGlobalCaches()
 ```
-
-## Testing
-
-### Running Tests
-
-```bash
-# Run all tests
-make test
-
-# Run tests with coverage
-make test-coverage
-
-# Run stress tests
-make stress-test
-```
-
-## Development
-
-### Building
-
-```bash
-# Build the project
-make build
-
-# Format code
-make fmt
-
-# Run linting
-make lint
-
-# Run all checks
-make check
-```
