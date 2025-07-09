@@ -37,7 +37,7 @@ func (m *Manager) RegisterCache(name string, config Config) error {
 
 // GetCache retrieves or creates a typed cache instance by name
 func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V], error) {
-    // Try to get existing cache
+	// Try to get existing cache
 	if cached, ok := m.caches.Load(name); ok {
 		if cache, ok := cached.(*InMemoryCache[K, V]); ok {
 			return cache, nil
@@ -54,9 +54,9 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 	}
 
 	cache := New[K, V](config)
-    // Atomic store - if another goroutine created it first, use theirs
+	// Atomic store - if another goroutine created it first, use theirs
 	if actual, loaded := m.caches.LoadOrStore(name, cache); loaded {
-        // Close our instance since another goroutine won the race
+		// Close our instance since another goroutine won the race
 		cache.Close()
 		if existingCache, ok := actual.(*InMemoryCache[K, V]); ok {
 			return existingCache, nil
@@ -87,7 +87,7 @@ func (m *Manager) GetCacheStats() map[string]Stats {
 func (m *Manager) CloseAll() error {
 	var errors []error
 
-    // Close all caches and collect any errors
+	// Close all caches and collect any errors
 	m.caches.Range(func(key, value interface{}) bool {
 		if cache, ok := value.(interface{ Close() error }); ok {
 			if err := cache.Close(); err != nil {
@@ -111,7 +111,7 @@ func (m *Manager) CloseAll() error {
 
 // RemoveCache removes and closes a specific cache by name
 func (m *Manager) RemoveCache(name string) error {
-    // Atomically remove and get the cache
+	// Atomically remove and get the cache
 	if cached, ok := m.caches.LoadAndDelete(name); ok {
 		if cache, ok := cached.(interface{ Close() error }); ok {
 			return cache.Close()

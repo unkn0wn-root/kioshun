@@ -14,12 +14,12 @@ import (
 // BenchmarkCacheHeavyLoad tests high load scenarios
 func BenchmarkCacheHeavyLoad(b *testing.B) {
 	scenarios := []struct {
-		name        string
-		cacheSize   int64
-		numKeys     int
-		numThreads  int
-		readRatio   float64
-		valueSize   int
+		name       string
+		cacheSize  int64
+		numKeys    int
+		numThreads int
+		readRatio  float64
+		valueSize  int
 	}{
 		{"Small_HighConcurrency", 1000, 500, 100, 0.8, 64},
 		{"Medium_MixedLoad", 10000, 5000, 50, 0.7, 256},
@@ -385,7 +385,7 @@ func BenchmarkCacheCleanupStress(b *testing.B) {
 		MaxSize:         10000,
 		ShardCount:      16,
 		CleanupInterval: 100 * time.Millisecond, // Aggressive cleanup
-		DefaultTTL:      500 * time.Millisecond,  // Short default TTL
+		DefaultTTL:      500 * time.Millisecond, // Short default TTL
 		EvictionPolicy:  cache.LRU,
 		StatsEnabled:    true,
 	}

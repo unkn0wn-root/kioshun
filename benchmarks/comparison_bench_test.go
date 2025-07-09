@@ -13,8 +13,8 @@ import (
 
 	"github.com/allegro/bigcache/v3"
 	"github.com/coocood/freecache"
-	gocache "github.com/patrickmn/go-cache"
 	"github.com/dgraph-io/ristretto"
+	gocache "github.com/patrickmn/go-cache"
 )
 
 // Test data structures

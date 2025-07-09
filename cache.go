@@ -2,17 +2,17 @@ package cache
 
 import (
 	"container/heap"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
-    "errors"
 )
 
 const (
-    NoExpiration time.Duration = -1 // Never expires
-    DefaultExpiration time.Duration = 0 // Use default config value
+	NoExpiration      time.Duration = -1 // Never expires
+	DefaultExpiration time.Duration = 0  // Use default config value
 )
 
 var (

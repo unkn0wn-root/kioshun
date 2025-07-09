@@ -255,7 +255,8 @@ func main() {
 		cleared := 0
 
 		switch cacheType {
-		case "basic": basicMiddleware.Clear()
+		case "basic":
+			basicMiddleware.Clear()
 			cleared = 1
 		case "api":
 			apiMiddleware.Clear()
