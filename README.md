@@ -1,7 +1,13 @@
-# CaGo - In-Memory Cache for Go
-
-[![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+<div align="center">
+  <img src="assets/logo.JPG" alt="CaGo Logo" width="200"/>
+  
+  # CaGo - In-Memory Cache for Go
+  
+  [![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
+  [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+  
+  *High-performance, thread-safe, sharded in-memory cache for Go*
+</div>
 
 ## Features
 
