@@ -93,7 +93,7 @@ func TestHTTPCacheMiddleware_CachePolicy(t *testing.T) {
 
 	// Custom policy that only caches POST requests
 	middleware.SetCachePolicy(func(r *http.Request, statusCode int, headers http.Header, body []byte) (bool, time.Duration) {
-		return r.Method == "POST" && statusCode == 200, 1*time.Hour
+		return r.Method == "POST" && statusCode == 200, 1 * time.Hour
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -461,7 +461,7 @@ func TestCachePolicies(t *testing.T) {
 	t.Run("CacheByContentType", func(t *testing.T) {
 		rules := map[string]time.Duration{
 			"application/json": 10 * time.Minute,
-			"text/html":       5 * time.Minute,
+			"text/html":        5 * time.Minute,
 		}
 		policy := CacheByContentType(rules, 1*time.Minute)
 

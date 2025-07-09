@@ -21,14 +21,14 @@ type KeyGenerator func(*http.Request) string
 type CachePolicy func(*http.Request, int, http.Header, []byte) (shouldCache bool, ttl time.Duration)
 
 type HTTPCacheMiddleware struct {
-	cache       *InMemoryCache[string, *CachedResponse]
-	keyGen      KeyGenerator
-	policy      CachePolicy
-	onHit       func(string)
-	onMiss      func(string)
-	onSet       func(string, time.Duration)
-	hitHeader   string
-	missHeader  string
+	cache      *InMemoryCache[string, *CachedResponse]
+	keyGen     KeyGenerator
+	policy     CachePolicy
+	onHit      func(string)
+	onMiss     func(string)
+	onSet      func(string, time.Duration)
+	hitHeader  string
+	missHeader string
 }
 
 type MiddlewareConfig struct {
@@ -52,11 +52,11 @@ type MiddlewareConfig struct {
 
 func DefaultMiddlewareConfig() MiddlewareConfig {
 	return MiddlewareConfig{
-		MaxSize:         100000,
-		ShardCount:      16,
-		CleanupInterval: 5 * time.Minute,
-		DefaultTTL:      5 * time.Minute,
-		StatsEnabled:    true,
+		MaxSize:          100000,
+		ShardCount:       16,
+		CleanupInterval:  5 * time.Minute,
+		DefaultTTL:       5 * time.Minute,
+		StatsEnabled:     true,
 		CacheableMethods: []string{"GET", "HEAD"},
 		CacheableStatus:  []int{200, 201, 300, 301, 302, 304, 404, 410},
 		IgnoreHeaders:    []string{"Date", "Server", "X-Request-Id", "X-Trace-Id"},
@@ -139,8 +139,8 @@ func DefaultCachePolicy(config MiddlewareConfig) CachePolicy {
 		// cache-control headers
 		cacheControl := headers.Get("Cache-Control")
 		if strings.Contains(cacheControl, "no-cache") ||
-		   strings.Contains(cacheControl, "no-store") ||
-		   strings.Contains(cacheControl, "private") {
+			strings.Contains(cacheControl, "no-store") ||
+			strings.Contains(cacheControl, "private") {
 			return false, 0
 		}
 
@@ -178,10 +178,10 @@ func extractMaxAge(cacheControl string) time.Duration {
 	return 0
 }
 
-func (m *HTTPCacheMiddleware) SetKeyGenerator(keyGen KeyGenerator) { m.keyGen = keyGen }
-func (m *HTTPCacheMiddleware) SetCachePolicy(policy CachePolicy) { m.policy = policy }
-func (m *HTTPCacheMiddleware) OnHit(callback func(string)) { m.onHit = callback }
-func (m *HTTPCacheMiddleware) OnMiss(callback func(string)) { m.onMiss = callback }
+func (m *HTTPCacheMiddleware) SetKeyGenerator(keyGen KeyGenerator)        { m.keyGen = keyGen }
+func (m *HTTPCacheMiddleware) SetCachePolicy(policy CachePolicy)          { m.policy = policy }
+func (m *HTTPCacheMiddleware) OnHit(callback func(string))                { m.onHit = callback }
+func (m *HTTPCacheMiddleware) OnMiss(callback func(string))               { m.onMiss = callback }
 func (m *HTTPCacheMiddleware) OnSet(callback func(string, time.Duration)) { m.onSet = callback }
 
 type responseWriter struct {
@@ -195,8 +195,8 @@ func newResponseWriter(w http.ResponseWriter) *responseWriter {
 	return &responseWriter{
 		ResponseWriter: w,
 		statusCode:     200,
-		buf:           new(bytes.Buffer),
-		headers:       make(http.Header),
+		buf:            new(bytes.Buffer),
+		headers:        make(http.Header),
 	}
 }
 
@@ -273,7 +273,7 @@ func (m *HTTPCacheMiddleware) serveCached(w http.ResponseWriter, cached *CachedR
 }
 
 func (m *HTTPCacheMiddleware) Stats() Stats { return m.cache.Stats() }
-func (m *HTTPCacheMiddleware) Clear() { m.cache.Clear() }
+func (m *HTTPCacheMiddleware) Clear()       { m.cache.Clear() }
 
 func (m *HTTPCacheMiddleware) Invalidate(urlPattern string) int {
 	removed := 0

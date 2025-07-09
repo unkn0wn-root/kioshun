@@ -17,7 +17,7 @@
 ## Installation
 
 ```bash
-go get github.com/david0/cago
+go get github.com/unkn0wn-root/cago
 ```
 
 ## Quick Start
@@ -29,7 +29,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/david0/cago"
+    "github.com/unkn0wn-root/cago"
 )
 
 func main() {
@@ -127,7 +127,7 @@ const (
 ```
 goos: darwin
 goarch: arm64
-pkg: github.com/david0/cago
+pkg: github.com/unkn0wn-root/cago
 cpu: Apple M4 Max
 
 BenchmarkCacheSet-14            3,529,033    370.2 ns/op    77 B/op    6 allocs/op

@@ -9,7 +9,7 @@ GOVET=$(GOCMD) vet
 GOLINT=golint
 
 BINARY_NAME=cago
-PACKAGE_NAME=github.com/david0/cago
+PACKAGE_NAME=github.com/unkn0wn-root/cago
 
 .PHONY: all
 all: test build

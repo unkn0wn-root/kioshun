@@ -1,3 +1,3 @@
-module github.com/david0/cago
+module github.com/unkn0wn-root/cago
 
 go 1.21

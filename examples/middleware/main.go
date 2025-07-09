@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/david0/cago"
+	"github.com/unkn0wn-root/cago"
 )
 
 type APIResponse struct {
@@ -49,8 +49,8 @@ func main() {
 	contentMiddleware := cache.NewHTTPCacheMiddleware(contentConfig)
 	contentMiddleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Duration{
 		"application/json": 5 * time.Minute,
-		"text/html":       10 * time.Minute,
-		"image/":          1 * time.Hour,
+		"text/html":        10 * time.Minute,
+		"image/":           1 * time.Hour,
 	}, 2*time.Minute))
 	defer contentMiddleware.Close()
 
@@ -114,7 +114,7 @@ func main() {
 
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(APIResponse{
-			Message: "User not found",
+			Message:   "User not found",
 			Timestamp: time.Now(),
 		})
 	})))

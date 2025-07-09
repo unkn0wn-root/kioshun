@@ -128,4 +128,3 @@ func GetGlobalCacheStats() map[string]Stats {
 func CloseAllGlobalCaches() error {
 	return GlobalManager.CloseAll()
 }
-

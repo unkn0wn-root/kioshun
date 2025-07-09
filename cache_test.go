@@ -267,7 +267,7 @@ func TestCacheCallback(t *testing.T) {
 	if atomic.LoadInt32(&callbackCalled) != 1 {
 		t.Error("Expected callback to be called")
 	}
-	
+
 	mu.Lock()
 	defer mu.Unlock()
 	if callbackKey != "key1" || callbackValue != "value1" {

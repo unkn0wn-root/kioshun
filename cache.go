@@ -57,11 +57,11 @@ const (
 )
 
 type Config struct {
-	MaxSize         int64           // Maximum number of items (0 = unlimited)
-	ShardCount      int             // Number of shards (0 = auto-detect)
-	CleanupInterval time.Duration   // How often to run cleanup (0 = no cleanup)
-	DefaultTTL      time.Duration   // Default TTL for items (0 = no expiration)
-	EvictionPolicy  EvictionPolicy  // Eviction algorithm
+	MaxSize         int64          // Maximum number of items (0 = unlimited)
+	ShardCount      int            // Number of shards (0 = auto-detect)
+	CleanupInterval time.Duration  // How often to run cleanup (0 = no cleanup)
+	DefaultTTL      time.Duration  // Default TTL for items (0 = no expiration)
+	EvictionPolicy  EvictionPolicy // Eviction algorithm
 	StatsEnabled    bool           // Enable statistics collection
 }
 
@@ -89,14 +89,14 @@ type cacheItem[V any] struct {
 
 // shard represents a cache shard to reduce contention
 type shard[K comparable, V any] struct {
-	mu         sync.RWMutex
-	data       map[K]*cacheItem[V]
-	head       *cacheItem[V] // LRU head (most recent)
-	tail       *cacheItem[V] // LRU tail (least recent)
-	size       int64
-	hits       int64
-	misses     int64
-	evictions  int64
+	mu          sync.RWMutex
+	data        map[K]*cacheItem[V]
+	head        *cacheItem[V] // LRU head (most recent)
+	tail        *cacheItem[V] // LRU tail (least recent)
+	size        int64
+	hits        int64
+	misses      int64
+	evictions   int64
 	expirations int64
 }
 
@@ -497,7 +497,7 @@ func (c *InMemoryCache[K, V]) evictRandom(s *shard[K, V]) {
 	}
 
 	// get a random key (not cryptographically secure)
-    // @todo: should be?
+	// @todo: should be?
 	var randomKey K
 	count := 0
 	target := int(time.Now().UnixNano()) % len(s.data)

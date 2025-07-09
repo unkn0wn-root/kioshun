@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/david0/cago"
+	"github.com/unkn0wn-root/cago"
 )
 
 func main() {
