@@ -23,6 +23,7 @@ type Cache[K comparable, V any] interface {
 	Close() error
 }
 
+// Stats holds cache performance metrics
 type Stats struct {
 	Hits        int64
 	Misses      int64
@@ -34,7 +35,7 @@ type Stats struct {
 	Shards      int
 }
 
-// defines the eviction algorithm
+// EvictionPolicy defines the eviction algorithm
 type EvictionPolicy int
 
 const (
@@ -46,11 +47,11 @@ const (
 )
 
 const (
-    // gratio32 is the golden ratio multiplier for 32-bit integers
+	// gratio32 is the golden ratio multiplier for 32-bit integers
 	// (φ - 1) * 2^32, where φ = (1 + √5) / 2 (golden ratio)
 	gratio32 = 0x9e3779b9
 
-    // gratio64 is the same but for 64-bit integers
+	// gratio64 is the same but for 64-bit integers
 	// (φ - 1) * 2^64
 	gratio64 = 0x9e3779b97f4a7c15
 
@@ -62,12 +63,12 @@ const (
 )
 
 type Config struct {
-	MaxSize         int64 // Maximum number of items (0 = unlimited)
-	ShardCount      int // Number of shards (0 = auto-detect)
-	CleanupInterval time.Duration // How often to run cleanup (0 = no cleanup)
-	DefaultTTL      time.Duration // Default TTL for items (0 = no expiration)
+	MaxSize         int64          // Maximum number of items (0 = unlimited)
+	ShardCount      int            // Number of shards (0 = auto-detect)
+	CleanupInterval time.Duration  // How often to run cleanup (0 = no cleanup)
+	DefaultTTL      time.Duration  // Default TTL for items (0 = no expiration)
 	EvictionPolicy  EvictionPolicy // Eviction algorithm
-	StatsEnabled    bool // Enable statistics collection
+	StatsEnabled    bool           // Enable statistics collection
 }
 
 func DefaultConfig() Config {
@@ -81,83 +82,92 @@ func DefaultConfig() Config {
 	}
 }
 
+// cacheItem represents a single cache entry with metadata
 type cacheItem[V any] struct {
 	value      V
-	expireTime int64 // Unix nano timestamp
-	lastAccess int64 // Unix nano timestamp
-	frequency  int64
+	expireTime int64         // Unix nano timestamp
+	lastAccess int64         // Unix nano timestamp
+	frequency  int64         // Access count for LFU
 	prev       *cacheItem[V] // For LRU doubly-linked list
 	next       *cacheItem[V] // For LRU doubly-linked list
-	key        interface{}  // Store key for eviction
-	heapIndex  int // For LFU heap
+	key        interface{}   // Store key for eviction
+	heapIndex  int           // For LFU heap
 }
 
-// LFU heap for eviction
+// lfuHeap implements a min-heap for LFU eviction policy
 type lfuHeap[V any] []*cacheItem[V]
 
-func (h lfuHeap[V]) Len() int           { return len(h) }
+func (h lfuHeap[V]) Len() int { return len(h) }
+
+// Less compares items: primary by frequency, secondary by last access time
 func (h lfuHeap[V]) Less(i, j int) bool {
-	// primary: frequency (ascending)
 	if h[i].frequency != h[j].frequency {
 		return h[i].frequency < h[j].frequency
 	}
-	// secondary: last access time (ascending for LFU)
+	// Break ties with last access time (older items evicted first)
 	return h[i].lastAccess < h[j].lastAccess
 }
+
+// Swap exchanges two items and updates their heap indices
 func (h lfuHeap[V]) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
 	h[i].heapIndex = i
 	h[j].heapIndex = j
 }
 
+// Push adds an item to the heap
 func (h *lfuHeap[V]) Push(x interface{}) {
 	item := x.(*cacheItem[V])
 	item.heapIndex = len(*h)
 	*h = append(*h, item)
 }
 
+// Pop removes and returns the minimum item from the heap
 func (h *lfuHeap[V]) Pop() interface{} {
 	old := *h
 	n := len(old)
 	item := old[n-1]
-	item.heapIndex = -1
+	item.heapIndex = -1 // Mark as not in heap
 	*h = old[0 : n-1]
 	return item
 }
 
+// update rebalances the heap after an item's frequency changes
 func (h *lfuHeap[V]) update(item *cacheItem[V]) {
 	heap.Fix(h, item.heapIndex)
 }
 
-// shard represents a cache shard to reduce contention
+// shard represents a cache partition to reduce lock contention
 type shard[K comparable, V any] struct {
 	mu          sync.RWMutex
 	data        map[K]*cacheItem[V]
-	head        *cacheItem[V] // LRU head (most recent)
-	tail        *cacheItem[V] // LRU tail (least recent)
-	lfuHeap     *lfuHeap[V] // For LFU eviction
-	size        int64
+	head        *cacheItem[V] // LRU head (most recently used)
+	tail        *cacheItem[V] // LRU tail (least recently used)
+	lfuHeap     *lfuHeap[V]   // For LFU eviction
+	size        int64         // Current number of items
 	hits        int64
 	misses      int64
 	evictions   int64
 	expirations int64
 }
 
+// InMemoryCache is the main cache implementation using sharding
 type InMemoryCache[K comparable, V any] struct {
-	shards      []*shard[K, V]
-	shardMask   uint64
+	shards      []*shard[K, V] // Array of cache shards
+	shardMask   uint64         // Bitmask for fast shard selection
 	config      Config
 	globalStats Stats
 	statsMux    sync.RWMutex
 	cleanupCh   chan struct{}
 	closeCh     chan struct{}
 	closeOnce   sync.Once
-	closed      int32
-	itemPool    sync.Pool
+	closed      int32     // Atomic flag indicating cache is closed
+	itemPool    sync.Pool // Object pool for cache items
 }
 
+// New creates a new cache instance with the given configuration
 func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
-    // auto-detect optimal shard count
+	// Auto-detect optimal shard count based on CPU cores
 	shardCount := config.ShardCount
 	if shardCount <= 0 {
 		shardCount = runtime.NumCPU() * 4
@@ -166,7 +176,7 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		}
 	}
 
-    // Ensure shard count is power of 2 for masking
+	// Ensure shard count is power of 2 for masking
 	shardCount = nextPowerOf2(shardCount)
 
 	cache := &InMemoryCache[K, V]{
@@ -182,14 +192,14 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		},
 	}
 
-    // shards
+	// Initialize each shard
 	for i := 0; i < shardCount; i++ {
 		cache.shards[i] = &shard[K, V]{
 			data: make(map[K]*cacheItem[V]),
 		}
 		cache.initLRU(cache.shards[i])
 
-		// init LFU heap if needed
+		// Initialize LFU heap only if LFU policy is selected
 		if config.EvictionPolicy == LFU {
 			h := make(lfuHeap[V], 0)
 			cache.shards[i].lfuHeap = &h
@@ -197,6 +207,7 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		}
 	}
 
+	// Start cleanup worker if cleanup interval is configured
 	if config.CleanupInterval > 0 {
 		go cache.cleanupWorker()
 	}
@@ -204,11 +215,12 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	return cache
 }
 
+// NewWithDefaults creates a cache with default configuration
 func NewWithDefaults[K comparable, V any]() *InMemoryCache[K, V] {
 	return New[K, V](DefaultConfig())
 }
 
-// LRU doubly-linked list for a shard
+// initLRU initializes the doubly-linked list for LRU tracking
 func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
 	s.head = &cacheItem[V]{heapIndex: -1}
 	s.tail = &cacheItem[V]{heapIndex: -1}
@@ -216,7 +228,6 @@ func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
 	s.tail.prev = s.head
 }
 
-// The function uses different hashing strategies for each key type:
 // - Strings: FNV-1A
 // - Integers: Uses multiplicative hashing with golden ratio constants
 // - Other types: Converts to string then uses maphash - compatible with all comparable types
@@ -247,17 +258,19 @@ func (c *InMemoryCache[K, V]) hash(key K) uint64 {
 func fnvHash64(s string) uint64 {
 	h := uint64(fnvOffset64)
 	for i := 0; i < len(s); i++ {
-		h ^= uint64(s[i])
-		h *= fnvPrime64
+		h ^= uint64(s[i]) // XOR with byte
+		h *= fnvPrime64   // Multiply by prime
 	}
 	return h
 }
 
+// getShard returns the appropriate shard for a given key
 func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
 	hash := c.hash(key)
-	return c.shards[hash&c.shardMask]
+	return c.shards[hash&c.shardMask] // Use bitmask for fast modulo
 }
 
+// Set stores a key-value pair with the specified TTL
 func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
@@ -296,6 +309,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		atomic.AddInt64(&shard.size, -1)
 	}
 
+	// Check if eviction is needed before adding new item
 	maxShardSize := c.config.MaxSize / int64(len(c.shards))
 	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
 		c.evictItem(shard)
@@ -312,6 +326,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	return nil
 }
 
+// Get retrieves a value from the cache
 func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 	var zero V
 
@@ -364,6 +379,7 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 	return value, true
 }
 
+// Delete removes a key from the cache
 func (c *InMemoryCache[K, V]) Delete(key K) bool {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return false
@@ -388,6 +404,7 @@ func (c *InMemoryCache[K, V]) Delete(key K) bool {
 	return true
 }
 
+// Clear removes all items from the cache
 func (c *InMemoryCache[K, V]) Clear() {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return
@@ -408,6 +425,7 @@ func (c *InMemoryCache[K, V]) Clear() {
 	}
 }
 
+// Size returns the total number of items in the cache
 func (c *InMemoryCache[K, V]) Size() int64 {
 	var totalSize int64
 	for _, shard := range c.shards {
@@ -416,12 +434,14 @@ func (c *InMemoryCache[K, V]) Size() int64 {
 	return totalSize
 }
 
+// Stats returns cache performance statistics
 func (c *InMemoryCache[K, V]) Stats() Stats {
 	var stats Stats
 	stats.Size = c.Size()
 	stats.Capacity = c.config.MaxSize
 	stats.Shards = len(c.shards)
 
+	// Aggregate statistics from all shards
 	if c.config.StatsEnabled {
 		for _, shard := range c.shards {
 			stats.Hits += atomic.LoadInt64(&shard.hits)
@@ -439,6 +459,7 @@ func (c *InMemoryCache[K, V]) Stats() Stats {
 	return stats
 }
 
+// Close gracefully shuts down the cache
 func (c *InMemoryCache[K, V]) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
@@ -449,6 +470,7 @@ func (c *InMemoryCache[K, V]) Close() error {
 	return err
 }
 
+// addToLRUHead adds an item to the head of the LRU list
 func (c *InMemoryCache[K, V]) addToLRUHead(s *shard[K, V], item *cacheItem[V]) {
 	if s.head == nil || s.head.next == nil {
 		return
@@ -461,6 +483,7 @@ func (c *InMemoryCache[K, V]) addToLRUHead(s *shard[K, V], item *cacheItem[V]) {
 	s.head.next = item
 }
 
+// removeFromLRU removes an item from the LRU list
 func (c *InMemoryCache[K, V]) removeFromLRU(s *shard[K, V], item *cacheItem[V]) {
 	if item.prev != nil {
 		item.prev.next = item.next
@@ -472,11 +495,13 @@ func (c *InMemoryCache[K, V]) removeFromLRU(s *shard[K, V], item *cacheItem[V]) 
 	item.next = nil
 }
 
+// moveToLRUHead moves an item to the head of the LRU list
 func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) {
 	c.removeFromLRU(s, item)
 	c.addToLRUHead(s, item)
 }
 
+// evictItem removes an item based on the configured eviction policy
 func (c *InMemoryCache[K, V]) evictItem(s *shard[K, V]) {
 	switch c.config.EvictionPolicy {
 	case LRU:
@@ -494,11 +519,13 @@ func (c *InMemoryCache[K, V]) evictItem(s *shard[K, V]) {
 	}
 }
 
+// evictLRU removes the least recently used item
 func (c *InMemoryCache[K, V]) evictLRU(s *shard[K, V]) {
 	if s.tail.prev == s.head {
-		return
+		return // No items to evict
 	}
 
+	// Get the least recently used item (tail.prev)
 	lru := s.tail.prev
 	if lru != nil && lru.key != nil {
 		if key, ok := lru.key.(K); ok {
@@ -513,13 +540,13 @@ func (c *InMemoryCache[K, V]) evictLRU(s *shard[K, V]) {
 	}
 }
 
-// Improved LFU eviction - O(log n) instead of O(n)
+// evictLFU removes the least frequently used item using O(log n) heap op
 func (c *InMemoryCache[K, V]) evictLFU(s *shard[K, V]) {
 	if s.lfuHeap == nil || s.lfuHeap.Len() == 0 {
 		return
 	}
 
-	// Get the least frequently used item from heap
+	// Get the least frequently used item from heap root
 	lfu := heap.Pop(s.lfuHeap).(*cacheItem[V])
 
 	if lfu.key != nil {
@@ -535,16 +562,21 @@ func (c *InMemoryCache[K, V]) evictLFU(s *shard[K, V]) {
 	}
 }
 
+// evictFIFO removes the first item that was inserted (same as LRU tail)
 func (c *InMemoryCache[K, V]) evictFIFO(s *shard[K, V]) {
 	c.evictLRU(s)
 }
 
+// evictRandom removes a randomly selected item
 func (c *InMemoryCache[K, V]) evictRandom(s *shard[K, V]) {
 	if len(s.data) == 0 {
 		return
 	}
 
-	// Use a different approach for true randomness
+	// Collect all keys for random selection
+	// @todo: I know it isn't true randomness
+	// and I should definitly use something else but it covers 99%
+	// so i should maybe revisit it some day
 	keys := make([]K, 0, len(s.data))
 	for key := range s.data {
 		keys = append(keys, key)
@@ -554,7 +586,7 @@ func (c *InMemoryCache[K, V]) evictRandom(s *shard[K, V]) {
 		return
 	}
 
-	// Use current nanosecond time for better randomness
+	// Use nanosecond time for pseudo-randomness
 	randomIndex := int(time.Now().UnixNano()) % len(keys)
 	randomKey := keys[randomIndex]
 
@@ -573,10 +605,12 @@ func (c *InMemoryCache[K, V]) evictRandom(s *shard[K, V]) {
 }
 
 func (c *InMemoryCache[K, V]) evictTinyLFU(s *shard[K, V]) {
-	// Simplified TinyLFU - can be enhanced with bloom filters
+	// evictTinyLFU implements simplified TinyLFU (currently delegates to LFU)
+	// todo: can be enhanced with bloom filters
 	c.evictLFU(s)
 }
 
+// cleanupWorker runs periodic cleanup of expired items
 func (c *InMemoryCache[K, V]) cleanupWorker() {
 	ticker := time.NewTicker(c.config.CleanupInterval)
 	defer ticker.Stop()
@@ -593,6 +627,7 @@ func (c *InMemoryCache[K, V]) cleanupWorker() {
 	}
 }
 
+// cleanup removes expired items from all shards
 func (c *InMemoryCache[K, V]) cleanup() {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return
@@ -604,10 +639,12 @@ func (c *InMemoryCache[K, V]) cleanup() {
 	}
 }
 
+// cleanupShard removes expired items from a specific shard
 func (c *InMemoryCache[K, V]) cleanupShard(s *shard[K, V], now int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Collect expired keys to avoid modifying map during iteration
 	var keysToDelete []K
 	for key, item := range s.data {
 		if item.expireTime > 0 && now > item.expireTime {
@@ -631,6 +668,7 @@ func (c *InMemoryCache[K, V]) cleanupShard(s *shard[K, V], now int64) {
 	}
 }
 
+// TriggerCleanup manually triggers cleanup of expired items
 func (c *InMemoryCache[K, V]) TriggerCleanup() {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return
@@ -639,9 +677,11 @@ func (c *InMemoryCache[K, V]) TriggerCleanup() {
 	select {
 	case c.cleanupCh <- struct{}{}:
 	default:
+		// Channel is full, cleanup already scheduled
 	}
 }
 
+// GetWithTTL retrieves a value along with its remaining TTL
 func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 	var zero V
 
@@ -699,6 +739,7 @@ func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 	return value, ttl, true
 }
 
+// SetWithCallback sets a value and calls the callback when it expires
 func (c *InMemoryCache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
@@ -734,6 +775,7 @@ func (c *InMemoryCache[K, V]) SetWithCallback(key K, value V, ttl time.Duration,
 	return nil
 }
 
+// Exists checks if a key exists in the cache without updating access time
 func (c *InMemoryCache[K, V]) Exists(key K) bool {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return false
@@ -767,6 +809,7 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 	return true
 }
 
+// Keys returns all non-expired keys in the cache
 func (c *InMemoryCache[K, V]) Keys() []K {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return nil
@@ -789,6 +832,7 @@ func (c *InMemoryCache[K, V]) Keys() []K {
 	return keys
 }
 
+// nextPowerOf2 returns the next power of 2 greater than or equal to n
 func nextPowerOf2(n int) int {
 	if n <= 1 {
 		return 1
