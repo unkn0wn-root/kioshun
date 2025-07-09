@@ -1,4 +1,4 @@
-package cache
+package main_test
 
 import (
 	"fmt"
@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/unkn0wn-root/cago"
+	"github.com/unkn0wn-root/kioshun"
 )
 
 func BenchmarkCacheSet(b *testing.B) {

@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-// GlobalManager singleton cache manager
+// GlobalManager holds global cache instances
 var GlobalManager = NewManager()
 
 // Manager manages multiple named cache instances with different configurations

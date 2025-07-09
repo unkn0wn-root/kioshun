@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/unkn0wn-root/cago"
+	"github.com/unkn0wn-root/kioshun"
 )
 
 type User struct {

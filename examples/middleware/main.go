@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/unkn0wn-root/cago"
+	"github.com/unkn0wn-root/kioshun"
 )
 
 type APIResponse struct {
@@ -61,18 +61,18 @@ func main() {
 	defer conditionalMiddleware.Close()
 
 	basicMiddleware.OnHit(func(key string) {
-		fmt.Printf("🎯 BASIC CACHE HIT: %s\n", key[:8])
+		fmt.Printf(" + BASIC CACHE HIT: %s\n", key[:8])
 	})
 	basicMiddleware.OnMiss(func(key string) {
-		fmt.Printf("❌ BASIC CACHE MISS: %s\n", key[:8])
+		fmt.Printf(" - BASIC CACHE MISS: %s\n", key[:8])
 	})
 
 	apiMiddleware.OnHit(func(key string) {
-		fmt.Printf("🚀 API CACHE HIT: %s\n", key[:8])
+		fmt.Printf(" + API CACHE HIT: %s\n", key[:8])
 	})
 
 	userMiddleware.OnHit(func(key string) {
-		fmt.Printf("👤 USER CACHE HIT: %s\n", key[:8])
+		fmt.Printf(" - USER CACHE HIT: %s\n", key[:8])
 	})
 
 	users := []User{
@@ -255,8 +255,7 @@ func main() {
 		cleared := 0
 
 		switch cacheType {
-		case "basic":
-			basicMiddleware.Clear()
+		case "basic": basicMiddleware.Clear()
 			cleared = 1
 		case "api":
 			apiMiddleware.Clear()
@@ -305,34 +304,34 @@ func main() {
 	fmt.Println("  curl http://localhost:8080/basic/users")
 	fmt.Println("  curl http://localhost:8080/basic/user/1")
 
-	fmt.Println("\n🚀 API Caching (5min TTL, 32 shards):")
+	fmt.Println("\nAPI Caching (5min TTL, 32 shards):")
 	fmt.Println("  curl http://localhost:8080/api/products")
 	fmt.Println("  curl http://localhost:8080/api/search?q=laptop")
 
-	fmt.Println("\n👤 User-Specific Caching (10min TTL):")
+	fmt.Println("\nUser-Specific Caching (10min TTL):")
 	fmt.Println("  curl -H 'X-User-ID: 123' http://localhost:8080/user/profile")
 	fmt.Println("  curl -H 'X-User-ID: 456' http://localhost:8080/user/profile")
 
-	fmt.Println("\n🎯 Content-Type Based Caching:")
+	fmt.Println("\nContent-Type Based Caching:")
 	fmt.Println("  curl http://localhost:8080/content/json   # 5min TTL")
 	fmt.Println("  curl http://localhost:8080/content/html   # 10min TTL")
 	fmt.Println("  curl http://localhost:8080/content/image  # 1hour TTL")
 
-	fmt.Println("\n🔍 Size-Based Conditional Caching:")
+	fmt.Println("\nSize-Based Conditional Caching:")
 	fmt.Println("  curl http://localhost:8080/conditional/small  # Not cached (too small)")
 	fmt.Println("  curl http://localhost:8080/conditional/large  # Cached (large enough)")
 
-	fmt.Println("\n📊 Management & Statistics:")
+	fmt.Println("\nManagement & Statistics:")
 	fmt.Println("  curl http://localhost:8080/stats")
 	fmt.Println("  curl -X POST http://localhost:8080/cache/clear")
 	fmt.Println("  curl -X POST http://localhost:8080/cache/clear?type=api")
 
-	fmt.Println("\n🔄 Comparison:")
+	fmt.Println("\nComparison:")
 	fmt.Println("  curl http://localhost:8080/uncached/time  # Never cached")
 
-	fmt.Println("\n💡 Watch the console for cache hit/miss notifications")
-	fmt.Println("💡 You can call endpoints multiple times to see caching in action")
-	fmt.Println("💡 Check X-Cache headers: HIT/MISS, X-Cache-Date, X-Cache-Age")
+	fmt.Println("\nWatch the console for cache hit/miss notifications")
+	fmt.Println("You can call endpoints multiple times to see caching in action")
+	fmt.Println("Check X-Cache headers: HIT/MISS, X-Cache-Date, X-Cache-Age")
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

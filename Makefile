@@ -8,8 +8,8 @@ GOFMT=$(GOCMD) fmt
 GOVET=$(GOCMD) vet
 GOLINT=golint
 
-BINARY_NAME=cago
-PACKAGE_NAME=github.com/unkn0wn-root/cago
+BINARY_NAME=kioshun
+PACKAGE_NAME=github.com/unkn0wn-root/kioshun
 
 .PHONY: all
 all: test build
@@ -22,19 +22,27 @@ build:
 test:
 	$(GOTEST) -v -race -coverprofile=coverage.out ./...
 
+.PHONY: bench-deps
+bench-deps:
+	cd benchmarks && $(GOMOD) tidy && $(GOMOD) download
+
+.PHONY: bench-runner
+bench-runner: bench-deps
+	cd benchmarks && go run benchmark_runner.go
+
 .PHONY: bench
-bench:
-	$(GOTEST) -bench=. -benchmem -run=^$$ ./...
+bench: bench-deps
+	cd benchmarks && $(GOTEST) -bench=. -benchmem -run=^$$ ./...
 
 .PHONY: bench-full
-bench-full:
-	$(GOTEST) -bench=. -benchmem -benchtime=10s -run=^$$ ./...
+bench-full: bench-deps
+	cd benchmarks && $(GOTEST) -bench=. -benchmem -benchtime=10s -run=^$$ ./...
 
 .PHONY: bench-compare
-bench-compare:
+bench-compare: bench-deps
 	@echo "Running performance comparison..."
-	$(GOTEST) -bench=BenchmarkCacheShardComparison -benchmem -run=^$$ ./...
-	$(GOTEST) -bench=BenchmarkCacheEvictionPolicyComparison -benchmem -run=^$$ ./...
+	cd benchmarks && $(GOTEST) -bench=BenchmarkCacheShardComparison -benchmem -run=^$$ ./...
+	cd benchmarks && $(GOTEST) -bench=BenchmarkCacheEvictionPolicyComparison -benchmem -run=^$$ ./...
 
 .PHONY: lint
 lint:
@@ -62,14 +70,14 @@ deps:
 check: fmt lint test
 
 .PHONY: stress-test
-stress-test:
+stress-test: bench-deps
 	@echo "Running stress test..."
-	$(GOTEST) -bench=BenchmarkCacheScalability -benchmem -benchtime=30s -run=^$$ ./...
+	cd benchmarks && $(GOTEST) -bench=BenchmarkCacheScalability -benchmem -benchtime=30s -run=^$$ ./...
 
 .PHONY: mem-analysis
-mem-analysis:
+mem-analysis: bench-deps
 	@echo "Running memory usage analysis..."
-	$(GOTEST) -bench=BenchmarkCacheMemoryUsage -benchmem -run=^$$ ./...
+	cd benchmarks && $(GOTEST) -bench=BenchmarkCacheMemoryUsage -benchmem -run=^$$ ./...
 
 .PHONY: install-tools
 install-tools:

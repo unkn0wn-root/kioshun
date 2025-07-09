@@ -1,27 +1,165 @@
 <div align="center">
-  <img src="assets/logo.JPG" alt="CaGo Logo" width="200"/>
+  <img src="assets/logo.JPG" alt="Kioshun Logo" width="200"/>
 
-  # CaGo - In-Memory Cache for Go
+  # Kioshun - In-Memory Cache for Go
+
+  *"kee-oh-shoon" /kiːoʊʃuːn/*
 
   [![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-  *High-performance, thread-safe, sharded in-memory cache for Go*
+  *Fast, thread-safe, sharded in-memory cache for Go*
 </div>
 
-## Features
+## Table of Contents
 
-- **Performance**: 280-370ns per operation with 10M+ ops/sec throughput
-- **Sharded Architecture**: Automatic sharding to minimize lock contention
-- **Multiple Eviction Policies**: LRU, LFU, FIFO, Random, and TinyLFU algorithms
-- **Thread Safe**: Optimized for high-concurrency workloads
-- **HTTP Middleware**: HTTP response caching middleware
-- **Global Cache Manager**: Centralized management of multiple cache instances
+- [Benchmark Results](#benchmark-results-kioshun-vs-ristretto-go-cache-and-freecache)
+  - [Running Benchmarks](#running-benchmarks)
+  - [Core Operations](#core-operations)
+  - [Workload-Specific](#workload-specific)
+  - [Simulate 'Real-World' Workflow](#simulate-real-world-workflow)
+  - [Performance Characteristics](#performance-characteristics)
+  - [Stress Test Results](#stress-test-results)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+  - [Basic Configuration](#basic-configuration)
+  - [Predefined Configurations](#predefined-configurations)
+- [Architecture](#architecture)
+  - [Sharded Design](#sharded-design)
+  - [Hash Function Optimization](#hash-function-optimization)
+  - [Eviction Policy Implementation](#eviction-policy-implementation)
+  - [Concurrent Access Patterns](#concurrent-access-patterns)
+  - [Memory Management](#memory-management)
+  - [Eviction Policies](#eviction-policies)
+- [API Reference](#api-reference)
+- [HTTP Middleware](#http-middleware)
+
+### Benchmark Results Kioshun vs. Ristretto, go-cache and freecache
+
+### Running Benchmarks
+
+```bash
+# Run comparison benchmarks
+make bench-compare
+
+# Run stress tests
+make stress-test
+
+# Run all benchmarks with the benchmark runner
+make bench-runner
+
+# Run all benchmark tests
+make bench
+```
+
+Comparing kioshun against leading Go cache libraries:
+
+**Test Environment:**
+- **OS:** macOS (Darwin)
+- **Architecture:** ARM64
+- **CPU:** Apple M4 Max
+- **Go Version:** 1.21+
+
+#### Core Operations
+
+##### SET Operations
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Kioshun** | 52,143,810 | **74.79** | 56 | 4 |
+| **Ristretto** | 55,905,141 | **73.19** | 150 | 5 |
+| **go-cache** | 11,950,642 | 339.8 | 56 | 3 |
+| **freecache** | 8,166,033 | 517.7 | 956 | 2 |
+
+##### GET Operations
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Ristretto** | 182,913,994 | **19.54** | 31 | 2 |
+| **Kioshun** | 79,889,264 | **51.42** | 31 | 2 |
+| **freecache** | 43,043,793 | 83.97 | 1039 | 2 |
+| **go-cache** | 27,013,480 | 134.9 | 15 | 1 |
+
+#### Workload-Specific
+
+##### Mixed Operations (70% reads, 30% writes)
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Ristretto** | 50,880,874 | **60.69** | 69 | 3 |
+| **Kioshun** | 57,670,704 | **63.19** | 36 | 3 |
+| **go-cache** | 17,468,449 | 203.8 | 22 | 2 |
+| **freecache** | 13,021,879 | 274.9 | 1039 | 2 |
+
+##### High Contention Scenarios
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Kioshun** | 49,625,168 | **73.67** | 40 | 2 |
+| **Ristretto** | 15,899,757 | 229.7 | 83 | 3 |
+| **go-cache** | 16,982,012 | 234.8 | 32 | 1 |
+| **freecache** | 11,682,682 | 318.5 | 922 | 2 |
+
+##### Read-Heavy Workloads (90% reads, 10% writes)
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Ristretto** | 68,613,873 | **34.45** | 45 | 3 |
+| **Kioshun** | 41,003,152 | **57.62** | 33 | 3 |
+| **freecache** | 14,973,655 | 159.6 | 1039 | 2 |
+| **go-cache** | 12,914,514 | 186.6 | 18 | 2 |
+
+##### Write-Heavy Workloads (90% writes, 10% reads)
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Kioshun** | 34,513,875 | **69.29** | 46 | 3 |
+| **Ristretto** | 17,119,744 | 151.3 | 132 | 5 |
+| **go-cache** | 9,193,803 | 287.6 | 37 | 2 |
+| **freecache** | 6,132,829 | 377.0 | 1039 | 2 |
+
+#### Simulate 'Real-World' Workflow
+
+##### Real-World Workload Simulation
+| Cache Library | Ops/sec | ns/op | B/op | allocs/op |
+|---------------|---------|-------|------|-----------|
+| **Kioshun** | 39,203,995 | **63.04** | 53 | 3 |
+| **Ristretto** | 17,528,142 | 125.8 | 97 | 3 |
+| **go-cache** | 10,621,634 | 227.8 | 40 | 2 |
+| **freecache** | 6,302,244 | 382.0 | 1168 | 2 |
+
+##### Memory Efficiency
+| Cache Library | Ops/sec | ns/op | bytes/op |
+|---------------|---------|-------|----------|
+| **freecache** | 8,404,188 | 286.3 | **0.1641** |
+| **Ristretto** | 16,212,883 | 150.3 | **0.6158** |
+| **Kioshun** | 9,914,840 | 225.0 | **0.7055** |
+| **go-cache** | 10,193,031 | 318.3 | 105.3 |
+
+### Performance Characteristics
+
+- **19-75ns per operation** for most cache operations
+- **10+ million operations/sec** throughput
+
+### Stress Test Results
+
+#### Eviction Policy Performance
+| Policy | Ops/sec | ns/op | B/op | allocs/op |
+|--------|---------|-------|------|-----------|
+| **LRU** | 17,086,760 | **146.2** | 57 | 4 |
+| **FIFO** | 17,229,789 | **148.8** | 57 | 4 |
+| **LFU** | 14,558,103 | 173.3 | 56 | 4 |
+| **Random** | 13,789,909 | 183.0 | 132 | 4 |
+
+#### High Load Scenarios
+| Load Profile | Ops/sec | ns/op | B/op | allocs/op | Description |
+|-------------|---------|-------|------|-----------|-------------|
+| **Small + High Concurrency** | 32,651,302 | **71.60** | 31 | 2 | Many goroutines, small cache |
+| **Medium + Mixed Load** | 29,994,172 | **80.39** | 36 | 3 | Balanced read/write operations |
+| **Large + Read Heavy** | 34,459,508 | **70.79** | 40 | 3 | Large cache, mostly reads |
+| **XLarge + Write Heavy** | 26,019,538 | **87.39** | 51 | 3 | Very large cache, mostly writes |
+| **Extreme + Balanced** | 26,771,521 | **96.33** | 49 | 3 | Maximum scale, balanced ops |
+
 
 ## Installation
 
 ```bash
-go get github.com/unkn0wn-root/cago
+go get github.com/unkn0wn-root/kioshun
 ```
 
 ## Quick Start
@@ -33,7 +171,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/unkn0wn-root/cago"
+    "github.com/unkn0wn-root/kioshun"
 )
 
 func main() {
@@ -92,11 +230,11 @@ persistentCache := cache.New[string, interface{}](cache.PersistentCacheConfig())
 
 ### Sharded Design
 
-CaGo uses a sharded architecture to minimize lock contention:
+Kioshun uses a sharded architecture to minimize lock contention:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      CaGo Cache                             │
+│                      Kioshun Cache                          │
 ├─────────────┬─────────────┬─────────────┬───────────────────┤
 │   Shard 0   │   Shard 1   │   Shard 2   │   ...   │ Shard N │
 │  RWMutex    │  RWMutex    │  RWMutex    │         │ RWMutex │
@@ -170,106 +308,6 @@ const (
     Random                        // Random eviction
     TinyLFU                       // Tiny Least Frequently Used
 )
-```
-
-## Performance
-
-### Benchmark Results vs. Popular Go Caches
-
-Comprehensive benchmarks comparing CaGo against leading Go cache libraries:
-
-```
-goos: darwin
-goarch: arm64
-cpu: Apple M4 Max
-
-=== SET OPERATIONS ===
-BenchmarkCacheComparison_Set/cago-14             	52,143,810	  74.79 ns/op	56 B/op	4 allocs/op
-BenchmarkCacheComparison_Set/ristretto-14        	55,905,141	  73.19 ns/op	150 B/op	5 allocs/op
-BenchmarkCacheComparison_Set/go-cache-14         	11,950,642	  339.8 ns/op	56 B/op	3 allocs/op
-BenchmarkCacheComparison_Set/freecache-14        	 8,166,033	  517.7 ns/op	956 B/op	2 allocs/op
-
-=== GET OPERATIONS ===
-BenchmarkCacheComparison_Get/ristretto-14        	182,913,994	  19.54 ns/op	31 B/op	2 allocs/op
-BenchmarkCacheComparison_Get/cago-14             	 79,889,264	  51.42 ns/op	31 B/op	2 allocs/op
-BenchmarkCacheComparison_Get/freecache-14        	 43,043,793	  83.97 ns/op	1039 B/op	2 allocs/op
-BenchmarkCacheComparison_Get/go-cache-14         	 27,013,480	  134.9 ns/op	15 B/op	1 allocs/op
-
-=== MIXED OPERATIONS (70% reads, 30% writes) ===
-BenchmarkCacheComparison_Mixed/ristretto-14      	50,880,874	  60.69 ns/op	69 B/op	3 allocs/op
-BenchmarkCacheComparison_Mixed/cago-14           	57,670,704	  63.19 ns/op	36 B/op	3 allocs/op
-BenchmarkCacheComparison_Mixed/go-cache-14       	17,468,449	  203.8 ns/op	22 B/op	2 allocs/op
-BenchmarkCacheComparison_Mixed/freecache-14      	13,021,879	  274.9 ns/op	1039 B/op	2 allocs/op
-
-=== HIGH CONTENTION SCENARIOS ===
-BenchmarkCacheComparison_HighContention/cago-14          	49,625,168	  73.67 ns/op	40 B/op	2 allocs/op
-BenchmarkCacheComparison_HighContention/ristretto-14     	15,899,757	  229.7 ns/op	83 B/op	3 allocs/op
-BenchmarkCacheComparison_HighContention/go-cache-14      	16,982,012	  234.8 ns/op	32 B/op	1 allocs/op
-BenchmarkCacheComparison_HighContention/freecache-14     	11,682,682	  318.5 ns/op	922 B/op	2 allocs/op
-
-=== READ-HEAVY WORKLOADS (90% reads, 10% writes) ===
-BenchmarkCacheComparison_ReadHeavy/ristretto-14  	68,613,873	  34.45 ns/op	45 B/op	3 allocs/op
-BenchmarkCacheComparison_ReadHeavy/cago-14       	41,003,152	  57.62 ns/op	33 B/op	3 allocs/op
-BenchmarkCacheComparison_ReadHeavy/freecache-14  	14,973,655	  159.6 ns/op	1039 B/op	2 allocs/op
-BenchmarkCacheComparison_ReadHeavy/go-cache-14   	12,914,514	  186.6 ns/op	18 B/op	2 allocs/op
-
-=== WRITE-HEAVY WORKLOADS (90% writes, 10% reads) ===
-BenchmarkCacheComparison_WriteHeavy/cago-14      	34,513,875	  69.29 ns/op	46 B/op	3 allocs/op
-BenchmarkCacheComparison_WriteHeavy/ristretto-14 	17,119,744	  151.3 ns/op	132 B/op	5 allocs/op
-BenchmarkCacheComparison_WriteHeavy/go-cache-14  	 9,193,803	  287.6 ns/op	37 B/op	2 allocs/op
-BenchmarkCacheComparison_WriteHeavy/freecache-14 	 6,132,829	  377.0 ns/op	1039 B/op	2 allocs/op
-
-=== REAL-WORLD WORKLOAD ===
-BenchmarkCacheComparison_RealWorldWorkload/cago-14       	39,203,995	  63.04 ns/op	53 B/op	3 allocs/op
-BenchmarkCacheComparison_RealWorldWorkload/ristretto-14  	17,528,142	  125.8 ns/op	97 B/op	3 allocs/op
-BenchmarkCacheComparison_RealWorldWorkload/go-cache-14   	10,621,634	  227.8 ns/op	40 B/op	2 allocs/op
-BenchmarkCacheComparison_RealWorldWorkload/freecache-14  	 6,302,244	  382.0 ns/op	1168 B/op	2 allocs/op
-
-=== MEMORY EFFICIENCY ===
-BenchmarkCacheComparison_MemoryEfficiency/freecache-14   	 8,404,188	  286.3 ns/op	0.1641 bytes/op
-BenchmarkCacheComparison_MemoryEfficiency/ristretto-14   	16,212,883	  150.3 ns/op	0.6158 bytes/op
-BenchmarkCacheComparison_MemoryEfficiency/cago-14        	 9,914,840	  225.0 ns/op	0.7055 bytes/op
-BenchmarkCacheComparison_MemoryEfficiency/go-cache-14    	10,193,031	  318.3 ns/op	105.3 bytes/op
-```
-
-### Performance Characteristics
-
-- **19-75ns per operation** for most cache operations
-- **10+ million operations/sec** sustained throughput
-- **Superior performance** in high contention scenarios
-- **Excellent memory efficiency** with low allocation overhead
-- **Linear scalability** with CPU cores due to sharding
-- **Consistent performance** across all workload patterns
-
-### Stress Test Results
-
-```
-=== EVICTION POLICY PERFORMANCE ===
-BenchmarkCacheEvictionStress/Eviction_LRU-14     	17,086,760	  146.2 ns/op	57 B/op	4 allocs/op
-BenchmarkCacheEvictionStress/Eviction_FIFO-14    	17,229,789	  148.8 ns/op	57 B/op	4 allocs/op
-BenchmarkCacheEvictionStress/Eviction_LFU-14     	14,558,103	  173.3 ns/op	56 B/op	4 allocs/op
-BenchmarkCacheEvictionStress/Eviction_Random-14  	13,789,909	  183.0 ns/op	132 B/op	4 allocs/op
-
-=== EXTREME LOAD SCENARIOS ===
-BenchmarkCacheHeavyLoad/Small_HighConcurrency-14 	32,651,302	  71.60 ns/op	31 B/op	2 allocs/op
-BenchmarkCacheHeavyLoad/Medium_MixedLoad-14       	29,994,172	  80.39 ns/op	36 B/op	3 allocs/op
-BenchmarkCacheHeavyLoad/Large_ReadHeavy-14        	34,459,508	  70.79 ns/op	40 B/op	3 allocs/op
-BenchmarkCacheHeavyLoad/XLarge_WriteHeavy-14      	26,019,538	  87.39 ns/op	51 B/op	3 allocs/op
-BenchmarkCacheHeavyLoad/Extreme_Balanced-14       	26,771,521	  96.33 ns/op	49 B/op	3 allocs/op
-```
-
-### Running Benchmarks
-
-```bash
-# Run comparison benchmarks
-go test -bench=BenchmarkCacheComparison -benchmem -benchtime=3s ./benchmark/
-
-# Run stress tests
-go test -bench=BenchmarkCacheHeavyLoad -benchmem ./benchmark/
-go test -bench=BenchmarkCacheEvictionStress -benchmem ./benchmark/
-
-# Run all benchmarks with the benchmark runner
-go run benchmark/benchmark_runner.go
 ```
 
 ## API Reference
