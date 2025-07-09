@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+    "errors"
 )
 
 const (
@@ -15,7 +16,7 @@ const (
 )
 
 var (
-	ErrCacheClosed = fmt.Errorf("cache is closed")
+	ErrCacheClosed = errors.New("cache is closed")
 )
 
 type Cache[K comparable, V any] interface {
