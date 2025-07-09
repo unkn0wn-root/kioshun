@@ -8,11 +8,9 @@
 - **Performance**: 280-370ns per operation with 10M+ ops/sec throughput
 - **Sharded Architecture**: Automatic sharding to minimize lock contention
 - **Multiple Eviction Policies**: LRU, LFU, FIFO, Random, and TinyLFU algorithms
-- **TTL Support**: Configurable time-to-live with automatic expiration
 - **Thread Safe**: Optimized for high-concurrency workloads
 - **HTTP Middleware**: HTTP response caching middleware
 - **Global Cache Manager**: Centralized management of multiple cache instances
-- **Memory Efficient**: Object pooling
 
 ## Installation
 
