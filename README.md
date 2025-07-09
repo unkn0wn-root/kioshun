@@ -1,11 +1,11 @@
 <div align="center">
   <img src="assets/logo.JPG" alt="CaGo Logo" width="200"/>
-  
+
   # CaGo - In-Memory Cache for Go
-  
+
   [![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-  
+
   *High-performance, thread-safe, sharded in-memory cache for Go*
 </div>
 
@@ -415,40 +415,3 @@ The middleware automatically handles:
 - **Vary** headers for content negotiation
 - **X-Cache** headers (HIT/MISS status)
 - **X-Cache-Date** and **X-Cache-Age** headers
-
-## Global Cache Manager
-
-### Manager Usage
-
-```go
-// Create manager
-manager := cache.NewManager()
-defer manager.CloseAll()
-
-// Register cache configurations
-manager.RegisterCache("users", cache.UserCacheConfig())
-manager.RegisterCache("sessions", cache.SessionCacheConfig())
-
-// Get cache instances
-userCache, _ := cache.GetCache[string, User](manager, "users")
-sessionCache, _ := cache.GetCache[string, Session](manager, "sessions")
-
-// Get statistics for all caches
-stats := manager.GetCacheStats()
-```
-
-### Global Functions
-
-```go
-// Register global caches
-cache.RegisterGlobalCache("users", cache.UserCacheConfig())
-
-// Get global cache instances
-userCache, _ := cache.GetGlobalCache[string, User]("users")
-
-// Get global statistics
-stats := cache.GetGlobalCacheStats()
-
-// Close all global caches
-cache.CloseAllGlobalCaches()
-```
