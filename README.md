@@ -9,15 +9,6 @@
   *High-performance, thread-safe, sharded in-memory cache for Go*
 </div>
 
-## Features
-
-- **Performance**: 280-370ns per operation with 10M+ ops/sec throughput
-- **Sharded Architecture**: Automatic sharding to minimize lock contention
-- **Multiple Eviction Policies**: LRU, LFU, FIFO, Random, and TinyLFU algorithms
-- **Thread Safe**: Optimized for high-concurrency workloads
-- **HTTP Middleware**: HTTP response caching middleware
-- **Global Cache Manager**: Centralized management of multiple cache instances
-
 ## Installation
 
 ```bash
