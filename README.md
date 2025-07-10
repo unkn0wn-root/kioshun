@@ -652,12 +652,10 @@ func main() {
 - You need pattern-based invalidation
 - Query parameters don't affect response content
 - You want readable cache keys for debugging
-- Security is not a primary concern
 
 **Use `DefaultKeyGenerator` when:**
 - You don't need pattern invalidation
 - Query parameters affect response content
-- You need maximum cache key security
 - You only use `Clear()` for cache management
 
 **Trade-offs:**
