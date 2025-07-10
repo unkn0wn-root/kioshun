@@ -9,3 +9,9 @@ func nextPowerOf2(n int) int {
 	}
 	return 1 << bits.Len(uint(n-1))
 }
+
+func defaultPathExtractor(key string) string {
+	// Default implementation assumes the key contains the URL path
+	// For hashed keys, this won't work well - users should provide custom extractor
+	return ""
+}

@@ -19,16 +19,19 @@ type CachedResponse struct {
 
 type KeyGenerator func(*http.Request) string
 type CachePolicy func(*http.Request, int, http.Header, []byte) (shouldCache bool, ttl time.Duration)
+type PathExtractor func(string) string
 
 type HTTPCacheMiddleware struct {
-	cache      *InMemoryCache[string, *CachedResponse]
-	keyGen     KeyGenerator
-	policy     CachePolicy
-	onHit      func(string)
-	onMiss     func(string)
-	onSet      func(string, time.Duration)
-	hitHeader  string
-	missHeader string
+	cache       *InMemoryCache[string, *CachedResponse]
+	keyGen      KeyGenerator
+	policy      CachePolicy
+	onHit       func(string)
+	onMiss      func(string)
+	onSet       func(string, time.Duration)
+	hitHeader   string
+	missHeader  string
+	patternIdx  *patternIndex
+	pathExtract func(string) string
 }
 
 type MiddlewareConfig struct {
@@ -81,11 +84,13 @@ func NewHTTPCacheMiddleware(config MiddlewareConfig) *HTTPCacheMiddleware {
 	}
 
 	m := &HTTPCacheMiddleware{
-		cache:      New[string, *CachedResponse](cacheConfig),
-		keyGen:     DefaultKeyGenerator,
-		policy:     DefaultCachePolicy(config),
-		hitHeader:  config.HitHeader,
-		missHeader: config.MissHeader,
+		cache:       New[string, *CachedResponse](cacheConfig),
+		keyGen:      DefaultKeyGenerator,
+		policy:      DefaultCachePolicy(config),
+		hitHeader:   config.HitHeader,
+		missHeader:  config.MissHeader,
+		patternIdx:  newPatternIndex(),
+		pathExtract: defaultPathExtractor,
 	}
 
 	if m.hitHeader == "" {
@@ -97,6 +102,113 @@ func NewHTTPCacheMiddleware(config MiddlewareConfig) *HTTPCacheMiddleware {
 
 	return m
 }
+
+func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := m.keyGen(r)
+		if cached, found := m.cache.Get(key); found {
+			m.serveCached(w, cached, key)
+			return
+		}
+
+		// cache miss - call callback
+		if m.onMiss != nil {
+			m.onMiss(key)
+		}
+
+		// wrap response writer to capture data
+		rw := newResponseWriter(w)
+
+		next.ServeHTTP(rw, r)
+
+		body := rw.buf.Bytes()
+		if shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body); shouldCache {
+			cached := &CachedResponse{
+				StatusCode: rw.statusCode,
+				Headers:    rw.headers.Clone(),
+				Body:       make([]byte, len(body)),
+				CachedAt:   time.Now(),
+			}
+			copy(cached.Body, body)
+
+			m.cache.Set(key, cached, ttl)
+
+			// Add to pattern index
+			if path := m.pathExtract(key); path != "" {
+				m.patternIdx.addKey(path, key)
+			}
+
+			if m.onSet != nil {
+				m.onSet(key, ttl)
+			}
+		}
+
+		w.Header().Set(m.missHeader, "MISS")
+	})
+}
+
+func (m *HTTPCacheMiddleware) serveCached(w http.ResponseWriter, cached *CachedResponse, key string) {
+	if m.onHit != nil {
+		m.onHit(key)
+	}
+
+	for k, v := range cached.Headers {
+		w.Header()[k] = v
+	}
+
+	w.Header().Set(m.hitHeader, "HIT")
+	w.Header().Set("X-Cache-Date", cached.CachedAt.Format(time.RFC3339))
+	w.Header().Set("X-Cache-Age", time.Since(cached.CachedAt).String())
+
+	w.WriteHeader(cached.StatusCode)
+	w.Write(cached.Body)
+}
+
+func (m *HTTPCacheMiddleware) Stats() Stats { return m.cache.Stats() }
+func (m *HTTPCacheMiddleware) Clear() {
+	m.cache.Clear()
+	m.patternIdx.clear()
+}
+
+func (m *HTTPCacheMiddleware) Invalidate(urlPattern string) int {
+	removed := 0
+
+	matchingKeys := m.patternIdx.getMatchingKeys(urlPattern)
+	for _, key := range matchingKeys {
+		if m.cache.Delete(key) {
+			if path := m.pathExtract(key); path != "" {
+				m.patternIdx.removeKey(path, key)
+			}
+			removed++
+		}
+	}
+
+	return removed
+}
+
+func (m *HTTPCacheMiddleware) InvalidateByFunc(fn func(string) bool) int {
+	removed := 0
+	keys := m.cache.Keys()
+
+	for _, key := range keys {
+		if fn(key) && m.cache.Delete(key) {
+			removed++
+		}
+	}
+
+	return removed
+}
+
+func (m *HTTPCacheMiddleware) Close() error {
+	return m.cache.Close()
+}
+
+func (m *HTTPCacheMiddleware) SetKeyGenerator(keyGen KeyGenerator)        { m.keyGen = keyGen }
+func (m *HTTPCacheMiddleware) SetCachePolicy(policy CachePolicy)          { m.policy = policy }
+func (m *HTTPCacheMiddleware) SetPathExtractor(extractor PathExtractor)   { m.pathExtract = extractor }
+func (m *HTTPCacheMiddleware) OnHit(callback func(string))                { m.onHit = callback }
+func (m *HTTPCacheMiddleware) OnMiss(callback func(string))               { m.onMiss = callback }
+func (m *HTTPCacheMiddleware) OnSet(callback func(string, time.Duration)) { m.onSet = callback }
 
 func DefaultKeyGenerator(r *http.Request) string {
 	h := md5.New()
@@ -161,28 +273,9 @@ func DefaultCachePolicy(config MiddlewareConfig) CachePolicy {
 	}
 }
 
-func extractMaxAge(cacheControl string) time.Duration {
-	if cacheControl == "" {
-		return 0
-	}
-
-	parts := strings.Split(cacheControl, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "max-age=") {
-			if seconds, err := strconv.Atoi(part[8:]); err == nil && seconds > 0 {
-				return time.Duration(seconds) * time.Second
-			}
-		}
-	}
-	return 0
+func PathBasedKeyGenerator(r *http.Request) string {
+	return r.Method + ":" + r.URL.Path
 }
-
-func (m *HTTPCacheMiddleware) SetKeyGenerator(keyGen KeyGenerator)        { m.keyGen = keyGen }
-func (m *HTTPCacheMiddleware) SetCachePolicy(policy CachePolicy)          { m.policy = policy }
-func (m *HTTPCacheMiddleware) OnHit(callback func(string))                { m.onHit = callback }
-func (m *HTTPCacheMiddleware) OnMiss(callback func(string))               { m.onMiss = callback }
-func (m *HTTPCacheMiddleware) OnSet(callback func(string, time.Duration)) { m.onSet = callback }
 
 type responseWriter struct {
 	http.ResponseWriter
@@ -216,98 +309,6 @@ func (rw *responseWriter) Write(data []byte) (int, error) {
 	return rw.ResponseWriter.Write(data)
 }
 
-func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := m.keyGen(r)
-		if cached, found := m.cache.Get(key); found {
-			m.serveCached(w, cached, key)
-			return
-		}
-
-		// cache miss - call callback
-		if m.onMiss != nil {
-			m.onMiss(key)
-		}
-
-		// wrap response writer to capture data
-		rw := newResponseWriter(w)
-
-		next.ServeHTTP(rw, r)
-
-		body := rw.buf.Bytes()
-		if shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body); shouldCache {
-			cached := &CachedResponse{
-				StatusCode: rw.statusCode,
-				Headers:    rw.headers.Clone(),
-				Body:       make([]byte, len(body)),
-				CachedAt:   time.Now(),
-			}
-			copy(cached.Body, body)
-
-			m.cache.Set(key, cached, ttl)
-
-			if m.onSet != nil {
-				m.onSet(key, ttl)
-			}
-		}
-
-		w.Header().Set(m.missHeader, "MISS")
-	})
-}
-
-func (m *HTTPCacheMiddleware) serveCached(w http.ResponseWriter, cached *CachedResponse, key string) {
-	if m.onHit != nil {
-		m.onHit(key)
-	}
-
-	for k, v := range cached.Headers {
-		w.Header()[k] = v
-	}
-
-	w.Header().Set(m.hitHeader, "HIT")
-	w.Header().Set("X-Cache-Date", cached.CachedAt.Format(time.RFC3339))
-	w.Header().Set("X-Cache-Age", time.Since(cached.CachedAt).String())
-
-	w.WriteHeader(cached.StatusCode)
-	w.Write(cached.Body)
-}
-
-func (m *HTTPCacheMiddleware) Stats() Stats { return m.cache.Stats() }
-func (m *HTTPCacheMiddleware) Clear()       { m.cache.Clear() }
-
-func (m *HTTPCacheMiddleware) Invalidate(urlPattern string) int {
-	removed := 0
-	keys := m.cache.Keys()
-
-	for _, key := range keys {
-		// can't match URL patterns against hashed keys effectively
-		// this is a limitation of the hashing approach
-		// for pattern-based invalidation, consider using structured keys
-		if m.cache.Delete(key) {
-			removed++
-		}
-	}
-
-	return removed
-}
-
-func (m *HTTPCacheMiddleware) InvalidateByFunc(fn func(string) bool) int {
-	removed := 0
-	keys := m.cache.Keys()
-
-	for _, key := range keys {
-		if fn(key) && m.cache.Delete(key) {
-			removed++
-		}
-	}
-
-	return removed
-}
-
-func (m *HTTPCacheMiddleware) Close() error {
-	return m.cache.Close()
-}
-
 func KeyWithVaryHeaders(varyHeaders []string) KeyGenerator {
 	return func(r *http.Request) string {
 		h := md5.New()
@@ -326,6 +327,12 @@ func KeyWithVaryHeaders(varyHeaders []string) KeyGenerator {
 
 func KeyWithoutQuery() KeyGenerator {
 	return func(r *http.Request) string {
+		return r.Method + ":" + r.URL.Path
+	}
+}
+
+func KeyWithoutQueryHashed() KeyGenerator {
+	return func(r *http.Request) string {
 		h := md5.New()
 		h.Write([]byte(r.Method))
 		h.Write([]byte(r.URL.Path))
@@ -339,6 +346,15 @@ func KeyWithoutQuery() KeyGenerator {
 
 		return fmt.Sprintf("%x", h.Sum(nil))
 	}
+}
+
+func PathExtractorFromKey(key string) string {
+	// Extract path from "METHOD:PATH" format
+	parts := strings.SplitN(key, ":", 2)
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return key
 }
 
 func KeyWithUserID(userIDHeader string) KeyGenerator {
@@ -393,4 +409,21 @@ func CacheBySize(minSize, maxSize int64, ttl time.Duration) CachePolicy {
 		size := int64(len(body))
 		return size >= minSize && size <= maxSize, ttl
 	}
+}
+
+func extractMaxAge(cacheControl string) time.Duration {
+	if cacheControl == "" {
+		return 0
+	}
+
+	parts := strings.Split(cacheControl, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "max-age=") {
+			if seconds, err := strconv.Atoi(part[8:]); err == nil && seconds > 0 {
+				return time.Duration(seconds) * time.Second
+			}
+		}
+	}
+	return 0
 }

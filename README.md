@@ -34,6 +34,7 @@
   - [Eviction Policies](#eviction-policies)
 - [API Reference](#api-reference)
 - [HTTP Middleware](#http-middleware)
+- [Cache Invalidation Setup](#cache-invalidation-setup)
 
 ### Benchmark Results Kioshun vs. Ristretto, go-cache and freecache
 
@@ -388,6 +389,9 @@ config.ShardCount = 16
 middleware := cache.NewHTTPCacheMiddleware(config)
 defer middleware.Close()
 
+// ⚠️ IMPORTANT: Enable invalidation if needed
+// middleware.SetKeyGenerator(cache.KeyWithoutQuery())
+
 // Use with any HTTP framework
 http.Handle("/api/users", middleware.Middleware(usersHandler))
 ```
@@ -421,12 +425,18 @@ apiConfig.ShardCount = 32
 apiConfig.DefaultTTL = 10 * time.Minute
 apiConfig.MaxBodySize = 5 * 1024 * 1024 // 5MB
 
+apiMiddleware := cache.NewHTTPCacheMiddleware(apiConfig)
+// Enable invalidation for API endpoints
+apiMiddleware.SetKeyGenerator(cache.KeyWithoutQuery())
+
 // User-specific caching
 userMiddleware := cache.NewHTTPCacheMiddleware(config)
 userMiddleware.SetKeyGenerator(cache.KeyWithUserID("X-User-ID"))
+// Note: User-specific caching uses different key format - invalidation works differently
 
 // Content-type based caching with different TTLs
 contentMiddleware := cache.NewHTTPCacheMiddleware(config)
+contentMiddleware.SetKeyGenerator(cache.KeyWithoutQuery()) // Enable invalidation
 contentMiddleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Duration{
     "application/json": 5 * time.Minute,
     "text/html":       10 * time.Minute,
@@ -435,6 +445,7 @@ contentMiddleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Durati
 
 // Size-based conditional caching
 conditionalMiddleware := cache.NewHTTPCacheMiddleware(config)
+conditionalMiddleware.SetKeyGenerator(cache.KeyWithoutQuery()) // Enable invalidation
 conditionalMiddleware.SetCachePolicy(cache.CacheBySize(100, 1024*1024, 3*time.Minute))
 ```
 
@@ -511,6 +522,147 @@ middleware.InvalidateByFunc(func(key string) bool {
 // Close middleware
 middleware.Close()
 ```
+
+## Cache Invalidation Setup
+
+**Cache invalidation by URL pattern requires specific key generator configuration.**
+
+### The Problem
+
+The default key generator uses MD5 hashing which makes pattern-based invalidation impossible:
+
+```go
+// ❌ DEFAULT SETUP - Invalidation won't work
+config := cache.DefaultMiddlewareConfig()
+middleware := cache.NewHTTPCacheMiddleware(config)
+
+// This returns 0 removed entries because keys are hashed
+removed := middleware.Invalidate("/api/users/*") // Returns 0
+```
+
+**Why it fails:**
+- Default keys: `"a1b2c3d4e5f6..."` (MD5 hash)
+- Pattern matching needs: `"GET:/api/users/123"` (readable path)
+- Hash loses original URL information
+
+### The Solution
+
+Use path-based key generators for invalidation to work:
+
+```go
+// ✅ CORRECT SETUP - Invalidation works
+config := cache.DefaultMiddlewareConfig()
+middleware := cache.NewHTTPCacheMiddleware(config)
+
+// CRITICAL: Set path-based key generator
+middleware.SetKeyGenerator(cache.KeyWithoutQuery())
+
+// Now invalidation works
+removed := middleware.Invalidate("/api/users/*") // Returns actual count
+```
+
+### Key Generator Comparison
+
+| Key Generator | Example Key | Invalidation | Security | Use Case |
+|---------------|-------------|--------------|----------|----------|
+| `DefaultKeyGenerator` | `"a1b2c3d4..."` | ❌ **Broken** | ✅ High | No invalidation needed |
+| `KeyWithoutQuery()` | `"GET:/api/users"` | ✅ **Works** | ⚠️ Medium | **Recommended for invalidation** |
+| `PathBasedKeyGenerator` | `"GET:/api/users"` | ✅ **Works** | ⚠️ Medium | Simple path-based caching |
+| `KeyWithVaryHeaders()` | `"a1b2c3d4..."` | ❌ **Broken** | ✅ High | Custom headers + security |
+
+### Complete Working Example
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "time"
+
+    "github.com/unkn0wn-root/kioshun"
+)
+
+func main() {
+    // Setup middleware
+    config := cache.DefaultMiddlewareConfig()
+    config.DefaultTTL = 10 * time.Minute
+
+    middleware := cache.NewHTTPCacheMiddleware(config)
+    defer middleware.Close()
+
+    // ✅ CRITICAL: Enable invalidation
+    middleware.SetKeyGenerator(cache.KeyWithoutQuery())
+
+    // Setup handlers
+    http.Handle("/api/users", middleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "users": []string{"alice", "bob", "charlie"},
+            "cached_at": time.Now(),
+        })
+    })))
+
+    http.Handle("/api/users/", middleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "user": "user-data",
+            "cached_at": time.Now(),
+        })
+    })))
+
+    // Invalidation endpoint
+    http.HandleFunc("/admin/invalidate", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+
+        pattern := r.URL.Query().Get("pattern")
+        if pattern == "" {
+            http.Error(w, "pattern parameter required", http.StatusBadRequest)
+            return
+        }
+
+        // ✅ This now works!
+        removed := middleware.Invalidate(pattern)
+
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "message": fmt.Sprintf("Invalidated %d entries", removed),
+            "pattern": pattern,
+        })
+    })
+
+    fmt.Println("Server starting on :8080")
+    fmt.Println("\nTest caching:")
+    fmt.Println("  curl http://localhost:8080/api/users")
+    fmt.Println("  curl http://localhost:8080/api/users/123")
+    fmt.Println("\nTest invalidation:")
+    fmt.Println("  curl -X POST 'http://localhost:8080/admin/invalidate?pattern=/api/users/*'")
+
+    http.ListenAndServe(":8080", nil)
+}
+```
+
+### When to Use Each Approach
+
+**Use `KeyWithoutQuery()` when:**
+- You need pattern-based invalidation
+- Query parameters don't affect response content
+- You want readable cache keys for debugging
+- Security is not a primary concern
+
+**Use `DefaultKeyGenerator` when:**
+- You don't need pattern invalidation
+- Query parameters affect response content
+- You need maximum cache key security
+- You only use `Clear()` for cache management
+
+**Trade-offs:**
+- **Readable keys** = Enable invalidation + Easier debugging - Less secure
+- **Hashed keys** = More secure + Better for vary headers - No pattern invalidation
 
 ### HTTP Compliance
 
