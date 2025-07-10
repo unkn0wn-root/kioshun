@@ -3,6 +3,7 @@ package cache
 import (
 	"container/heap"
 	"errors"
+	"fmt"
 	"math/bits"
 	"runtime"
 	"sync"
@@ -17,6 +18,22 @@ const (
 
 var (
 	ErrCacheClosed = errors.New("cache is closed")
+)
+
+const (
+	// gratio32 is the golden ratio multiplier for 32-bit integers
+	// (φ - 1) * 2^32, where φ = (1 + √5) / 2 (golden ratio)
+	gratio32 = 0x9e3779b9
+
+	// gratio64 is the same but for 64-bit integers
+	// (φ - 1) * 2^64
+	gratio64 = 0x9e3779b97f4a7c15
+
+	// FNV-1a constants
+	fnvOffset32 = 2166136261
+	fnvPrime32  = 16777619
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
 )
 
 type Cache[K comparable, V any] interface {
@@ -130,6 +147,32 @@ func NewWithDefaults[K comparable, V any]() *InMemoryCache[K, V] {
 	return New[K, V](DefaultConfig())
 }
 
+// - Strings: FNV-1A
+// - Integers: Uses multiplicative hashing with golden ratio constants
+// - Other types: Converts to string then uses maphash - compatible with all comparable types
+func (c *InMemoryCache[K, V]) hash(key K) uint64 {
+	switch k := any(key).(type) {
+	case string:
+		return fnvHash64(k)
+	case int:
+		return uint64(k) * gratio32
+	case int32:
+		return uint64(k) * gratio32
+	case int64:
+		return uint64(k) * gratio64
+	case uint:
+		return uint64(k) * gratio32
+	case uint32:
+		return uint64(k) * gratio32
+	case uint64:
+		return k * gratio64
+	default:
+		// For other types, convert to string and hash
+		// this is unavoidable for arbitrary comparable types
+		return fnvHash64(fmt.Sprintf("%v", k))
+	}
+}
+
 // Set stores a key-value pair with the specified TTL
 func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
@@ -236,6 +279,12 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 		atomic.AddInt64(&shard.hits, 1)
 	}
 	return value, true
+}
+
+// getShard returns the appropriate shard for a given key
+func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
+	hash := c.hash(key)
+	return c.shards[hash&c.shardMask] // Use bitmask for fast modulo
 }
 
 // Delete removes a key from the cache
