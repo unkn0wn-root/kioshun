@@ -3,7 +3,6 @@ package cache
 import (
 	"container/heap"
 	"errors"
-	"fmt"
 	"math/bits"
 	"runtime"
 	"sync"
@@ -42,33 +41,6 @@ type Stats struct {
 	Shards      int
 }
 
-// EvictionPolicy defines the eviction algorithm
-type EvictionPolicy int
-
-const (
-	LRU EvictionPolicy = iota
-	LFU
-	FIFO
-	Random
-	TinyLFU
-)
-
-const (
-	// gratio32 is the golden ratio multiplier for 32-bit integers
-	// (φ - 1) * 2^32, where φ = (1 + √5) / 2 (golden ratio)
-	gratio32 = 0x9e3779b9
-
-	// gratio64 is the same but for 64-bit integers
-	// (φ - 1) * 2^64
-	gratio64 = 0x9e3779b97f4a7c15
-
-	// FNV-1a constants
-	fnvOffset32 = 2166136261
-	fnvPrime32  = 16777619
-	fnvOffset64 = 14695981039346656037
-	fnvPrime64  = 1099511628211
-)
-
 type Config struct {
 	MaxSize         int64          // Maximum number of items (0 = unlimited)
 	ShardCount      int            // Number of shards (0 = auto-detect)
@@ -87,75 +59,6 @@ func DefaultConfig() Config {
 		EvictionPolicy:  LRU,
 		StatsEnabled:    true,
 	}
-}
-
-// cacheItem represents a single cache entry with metadata
-type cacheItem[V any] struct {
-	value      V
-	expireTime int64         // Unix nano timestamp
-	lastAccess int64         // Unix nano timestamp
-	frequency  int64         // Access count for LFU
-	prev       *cacheItem[V] // For LRU doubly-linked list
-	next       *cacheItem[V] // For LRU doubly-linked list
-	key        interface{}   // Store key for eviction
-	heapIndex  int           // For LFU heap
-}
-
-// lfuHeap implements a min-heap for LFU eviction policy
-type lfuHeap[V any] []*cacheItem[V]
-
-func (h lfuHeap[V]) Len() int { return len(h) }
-
-// Less compares items: primary by frequency, secondary by last access time
-func (h lfuHeap[V]) Less(i, j int) bool {
-	if h[i].frequency != h[j].frequency {
-		return h[i].frequency < h[j].frequency
-	}
-	// Break ties with last access time (older items evicted first)
-	return h[i].lastAccess < h[j].lastAccess
-}
-
-// Swap exchanges two items and updates their heap indices
-func (h lfuHeap[V]) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].heapIndex = i
-	h[j].heapIndex = j
-}
-
-// Push adds an item to the heap
-func (h *lfuHeap[V]) Push(x interface{}) {
-	item := x.(*cacheItem[V])
-	item.heapIndex = len(*h)
-	*h = append(*h, item)
-}
-
-// Pop removes and returns the minimum item from the heap
-func (h *lfuHeap[V]) Pop() interface{} {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	item.heapIndex = -1 // Mark as not in heap
-	*h = old[0 : n-1]
-	return item
-}
-
-// update rebalances the heap after an item's frequency changes
-func (h *lfuHeap[V]) update(item *cacheItem[V]) {
-	heap.Fix(h, item.heapIndex)
-}
-
-// shard represents a cache partition to reduce lock contention
-type shard[K comparable, V any] struct {
-	mu          sync.RWMutex
-	data        map[K]*cacheItem[V]
-	head        *cacheItem[V] // LRU head (most recently used)
-	tail        *cacheItem[V] // LRU tail (least recently used)
-	lfuHeap     *lfuHeap[V]   // For LFU eviction
-	size        int64         // Current number of items
-	hits        int64
-	misses      int64
-	evictions   int64
-	expirations int64
 }
 
 // InMemoryCache is the main cache implementation using sharding
@@ -227,56 +130,6 @@ func NewWithDefaults[K comparable, V any]() *InMemoryCache[K, V] {
 	return New[K, V](DefaultConfig())
 }
 
-// initLRU initializes the doubly-linked list for LRU tracking
-func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
-	s.head = &cacheItem[V]{heapIndex: -1}
-	s.tail = &cacheItem[V]{heapIndex: -1}
-	s.head.next = s.tail
-	s.tail.prev = s.head
-}
-
-// - Strings: FNV-1A
-// - Integers: Uses multiplicative hashing with golden ratio constants
-// - Other types: Converts to string then uses maphash - compatible with all comparable types
-func (c *InMemoryCache[K, V]) hash(key K) uint64 {
-	switch k := any(key).(type) {
-	case string:
-		return fnvHash64(k)
-	case int:
-		return uint64(k) * gratio32
-	case int32:
-		return uint64(k) * gratio32
-	case int64:
-		return uint64(k) * gratio64
-	case uint:
-		return uint64(k) * gratio32
-	case uint32:
-		return uint64(k) * gratio32
-	case uint64:
-		return k * gratio64
-	default:
-		// For other types, convert to string and hash
-		// this is unavoidable for arbitrary comparable types
-		return fnvHash64(fmt.Sprintf("%v", k))
-	}
-}
-
-// FNV-1a hash
-func fnvHash64(s string) uint64 {
-	h := uint64(fnvOffset64)
-	for i := 0; i < len(s); i++ {
-		h ^= uint64(s[i]) // XOR with byte
-		h *= fnvPrime64   // Multiply by prime
-	}
-	return h ^ (h >> 32) // XOR-fold upper 32 bits with lower 32
-}
-
-// getShard returns the appropriate shard for a given key
-func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
-	hash := c.hash(key)
-	return c.shards[hash&c.shardMask] // Use bitmask for fast modulo
-}
-
 // Set stores a key-value pair with the specified TTL
 func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
@@ -336,7 +189,6 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 // Get retrieves a value from the cache
 func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 	var zero V
-
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return zero, false
 	}
@@ -477,146 +329,6 @@ func (c *InMemoryCache[K, V]) Close() error {
 	return err
 }
 
-// addToLRUHead adds an item to the head of the LRU list
-func (c *InMemoryCache[K, V]) addToLRUHead(s *shard[K, V], item *cacheItem[V]) {
-	if s.head == nil || s.head.next == nil {
-		return
-	}
-	item.next = s.head.next
-	item.prev = s.head
-	if s.head.next != nil {
-		s.head.next.prev = item
-	}
-	s.head.next = item
-}
-
-// removeFromLRU removes an item from the LRU list
-func (c *InMemoryCache[K, V]) removeFromLRU(s *shard[K, V], item *cacheItem[V]) {
-	if item.prev != nil {
-		item.prev.next = item.next
-	}
-	if item.next != nil {
-		item.next.prev = item.prev
-	}
-	item.prev = nil
-	item.next = nil
-}
-
-// moveToLRUHead moves an item to the head of the LRU list
-func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) {
-	c.removeFromLRU(s, item)
-	c.addToLRUHead(s, item)
-}
-
-// evictItem removes an item based on the configured eviction policy
-func (c *InMemoryCache[K, V]) evictItem(s *shard[K, V]) {
-	switch c.config.EvictionPolicy {
-	case LRU:
-		c.evictLRU(s)
-	case LFU:
-		c.evictLFU(s)
-	case FIFO:
-		c.evictFIFO(s)
-	case Random:
-		c.evictRandom(s)
-	case TinyLFU:
-		c.evictTinyLFU(s)
-	default:
-		c.evictLRU(s)
-	}
-}
-
-// evictLRU removes the least recently used item
-func (c *InMemoryCache[K, V]) evictLRU(s *shard[K, V]) {
-	if s.tail.prev == s.head {
-		return // No items to evict
-	}
-
-	// Get the least recently used item (tail.prev)
-	lru := s.tail.prev
-	if lru != nil && lru.key != nil {
-		if key, ok := lru.key.(K); ok {
-			delete(s.data, key)
-		}
-		c.removeFromLRU(s, lru)
-		c.itemPool.Put(lru)
-		atomic.AddInt64(&s.size, -1)
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&s.evictions, 1)
-		}
-	}
-}
-
-// evictLFU removes the least frequently used item using O(log n) heap op
-func (c *InMemoryCache[K, V]) evictLFU(s *shard[K, V]) {
-	if s.lfuHeap == nil || s.lfuHeap.Len() == 0 {
-		return
-	}
-
-	// Get the least frequently used item from heap root
-	lfu := heap.Pop(s.lfuHeap).(*cacheItem[V])
-
-	if lfu.key != nil {
-		if key, ok := lfu.key.(K); ok {
-			delete(s.data, key)
-		}
-		c.removeFromLRU(s, lfu)
-		c.itemPool.Put(lfu)
-		atomic.AddInt64(&s.size, -1)
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&s.evictions, 1)
-		}
-	}
-}
-
-// evictFIFO removes the first item that was inserted (same as LRU tail)
-func (c *InMemoryCache[K, V]) evictFIFO(s *shard[K, V]) {
-	c.evictLRU(s)
-}
-
-// evictRandom removes a randomly selected item
-func (c *InMemoryCache[K, V]) evictRandom(s *shard[K, V]) {
-	if len(s.data) == 0 {
-		return
-	}
-
-	// Collect all keys for random selection
-	// @todo: I know it isn't true randomness
-	// and I should definitly use something else but it covers 99%
-	// so i should maybe revisit it some day
-	keys := make([]K, 0, len(s.data))
-	for key := range s.data {
-		keys = append(keys, key)
-	}
-
-	if len(keys) == 0 {
-		return
-	}
-
-	// Use nanosecond time for pseudo-randomness
-	randomIndex := int(time.Now().UnixNano()) % len(keys)
-	randomKey := keys[randomIndex]
-
-	if item, exists := s.data[randomKey]; exists {
-		delete(s.data, randomKey)
-		c.removeFromLRU(s, item)
-		if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
-			heap.Remove(s.lfuHeap, item.heapIndex)
-		}
-		c.itemPool.Put(item)
-		atomic.AddInt64(&s.size, -1)
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&s.evictions, 1)
-		}
-	}
-}
-
-func (c *InMemoryCache[K, V]) evictTinyLFU(s *shard[K, V]) {
-	// evictTinyLFU implements simplified TinyLFU (currently delegates to LFU)
-	// todo: can be enhanced with bloom filters
-	c.evictLFU(s)
-}
-
 // cleanupWorker runs periodic cleanup of expired items
 func (c *InMemoryCache[K, V]) cleanupWorker() {
 	ticker := time.NewTicker(c.config.CleanupInterval)
@@ -631,60 +343,6 @@ func (c *InMemoryCache[K, V]) cleanupWorker() {
 		case <-c.closeCh:
 			return
 		}
-	}
-}
-
-// cleanup removes expired items from all shards
-func (c *InMemoryCache[K, V]) cleanup() {
-	if atomic.LoadInt32(&c.closed) == 1 {
-		return
-	}
-
-	now := time.Now().UnixNano()
-	for _, shard := range c.shards {
-		c.cleanupShard(shard, now)
-	}
-}
-
-// cleanupShard removes expired items from a specific shard
-func (c *InMemoryCache[K, V]) cleanupShard(s *shard[K, V], now int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Collect expired keys to avoid modifying map during iteration
-	var keysToDelete []K
-	for key, item := range s.data {
-		if item.expireTime > 0 && now > item.expireTime {
-			keysToDelete = append(keysToDelete, key)
-		}
-	}
-
-	for _, key := range keysToDelete {
-		if item, exists := s.data[key]; exists {
-			delete(s.data, key)
-			c.removeFromLRU(s, item)
-			if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
-				heap.Remove(s.lfuHeap, item.heapIndex)
-			}
-			c.itemPool.Put(item)
-			atomic.AddInt64(&s.size, -1)
-			if c.config.StatsEnabled {
-				atomic.AddInt64(&s.expirations, 1)
-			}
-		}
-	}
-}
-
-// TriggerCleanup manually triggers cleanup of expired items
-func (c *InMemoryCache[K, V]) TriggerCleanup() {
-	if atomic.LoadInt32(&c.closed) == 1 {
-		return
-	}
-
-	select {
-	case c.cleanupCh <- struct{}{}:
-	default:
-		// Channel is full, cleanup already scheduled
 	}
 }
 
@@ -837,6 +495,86 @@ func (c *InMemoryCache[K, V]) Keys() []K {
 	}
 
 	return keys
+}
+
+// TriggerCleanup manually triggers cleanup of expired items
+func (c *InMemoryCache[K, V]) TriggerCleanup() {
+	if atomic.LoadInt32(&c.closed) == 1 {
+		return
+	}
+
+	select {
+	case c.cleanupCh <- struct{}{}:
+	default:
+		// Channel is full, cleanup already scheduled
+	}
+}
+
+// cleanup removes expired items from all shards
+func (c *InMemoryCache[K, V]) cleanup() {
+	if atomic.LoadInt32(&c.closed) == 1 {
+		return
+	}
+
+	now := time.Now().UnixNano()
+	for _, shard := range c.shards {
+		c.cleanupShard(shard, now)
+	}
+}
+
+// cacheItem represents a single cache entry with metadata
+type cacheItem[V any] struct {
+	value      V
+	expireTime int64         // Unix nano timestamp
+	lastAccess int64         // Unix nano timestamp
+	frequency  int64         // Access count for LFU
+	prev       *cacheItem[V] // For LRU doubly-linked list
+	next       *cacheItem[V] // For LRU doubly-linked list
+	key        interface{}   // Store key for eviction
+	heapIndex  int           // For LFU heap
+}
+
+// lfuHeap implements a min-heap for LFU eviction policy
+type lfuHeap[V any] []*cacheItem[V]
+
+func (h lfuHeap[V]) Len() int { return len(h) }
+
+// Less compares items: primary by frequency, secondary by last access time
+func (h lfuHeap[V]) Less(i, j int) bool {
+	if h[i].frequency != h[j].frequency {
+		return h[i].frequency < h[j].frequency
+	}
+	// Break ties with last access time (older items evicted first)
+	return h[i].lastAccess < h[j].lastAccess
+}
+
+// Swap exchanges two items and updates their heap indices
+func (h lfuHeap[V]) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIndex = i
+	h[j].heapIndex = j
+}
+
+// Push adds an item to the heap
+func (h *lfuHeap[V]) Push(x interface{}) {
+	item := x.(*cacheItem[V])
+	item.heapIndex = len(*h)
+	*h = append(*h, item)
+}
+
+// Pop removes and returns the minimum item from the heap
+func (h *lfuHeap[V]) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	item.heapIndex = -1 // Mark as not in heap
+	*h = old[0 : n-1]
+	return item
+}
+
+// update rebalances the heap after an item's frequency changes
+func (h *lfuHeap[V]) update(item *cacheItem[V]) {
+	heap.Fix(h, item.heapIndex)
 }
 
 // nextPowerOf2 returns the next power of 2 greater than or equal to n
