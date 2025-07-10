@@ -7,7 +7,7 @@ require (
 	github.com/coocood/freecache v1.2.4
 	github.com/dgraph-io/ristretto v0.1.1
 	github.com/patrickmn/go-cache v2.1.0+incompatible
-	github.com/unkn0wn-root/kioshun v0.0.1
+	github.com/unkn0wn-root/kioshun v0.0.3
 )
 
 require (
