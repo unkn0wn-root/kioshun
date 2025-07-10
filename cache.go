@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
-	"math/bits"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -624,12 +623,4 @@ func (h *lfuHeap[V]) Pop() interface{} {
 // update rebalances the heap after an item's frequency changes
 func (h *lfuHeap[V]) update(item *cacheItem[V]) {
 	heap.Fix(h, item.heapIndex)
-}
-
-// nextPowerOf2 returns the next power of 2 greater than or equal to n
-func nextPowerOf2(n int) int {
-	if n <= 1 {
-		return 1
-	}
-	return 1 << bits.Len(uint(n-1))
 }
