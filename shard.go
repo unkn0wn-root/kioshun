@@ -59,12 +59,6 @@ func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) 
 	c.addToLRUHead(s, item)
 }
 
-// getShard returns the appropriate shard for a given key
-func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
-	hash := c.hash(key)
-	return c.shards[hash&c.shardMask] // Use bitmask for fast modulo
-}
-
 // cleanupShard removes expired items from a specific shard
 func (c *InMemoryCache[K, V]) cleanupShard(s *shard[K, V], now int64) {
 	s.mu.Lock()

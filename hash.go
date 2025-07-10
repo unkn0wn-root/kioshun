@@ -44,6 +44,12 @@ func (c *InMemoryCache[K, V]) hash(key K) uint64 {
 	}
 }
 
+// getShard returns the appropriate shard for a given key
+func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
+	hash := c.hash(key)
+	return c.shards[hash&c.shardMask] // Use bitmask for fast modulo
+}
+
 // FNV-1a hash
 func fnvHash64(s string) uint64 {
 	h := uint64(fnvOffset64)
