@@ -103,6 +103,7 @@ func NewHTTPCacheMiddleware(config MiddlewareConfig) *HTTPCacheMiddleware {
 	return m
 }
 
+// Middleware wraps HTTP handlers for response caching
 func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := m.keyGen(r)
@@ -118,7 +119,6 @@ func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
 
 		// wrap response writer to capture data
 		rw := newResponseWriter(w)
-
 		next.ServeHTTP(rw, r)
 
 		body := rw.buf.Bytes()
@@ -133,7 +133,7 @@ func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
 
 			m.cache.Set(key, cached, ttl)
 
-			// Add to pattern index
+			// add to pattern index
 			if path := m.pathExtract(key); path != "" {
 				m.patternIdx.addKey(path, key)
 			}
@@ -147,6 +147,7 @@ func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// serveCached writes a cached response
 func (m *HTTPCacheMiddleware) serveCached(w http.ResponseWriter, cached *CachedResponse, key string) {
 	if m.onHit != nil {
 		m.onHit(key)
@@ -164,12 +165,16 @@ func (m *HTTPCacheMiddleware) serveCached(w http.ResponseWriter, cached *CachedR
 	w.Write(cached.Body)
 }
 
+// Stats returns cache statistics
 func (m *HTTPCacheMiddleware) Stats() Stats { return m.cache.Stats() }
+
+// Clear removes all cached entries
 func (m *HTTPCacheMiddleware) Clear() {
 	m.cache.Clear()
 	m.patternIdx.clear()
 }
 
+// Invalidate removes cached entries matching a URL pattern
 func (m *HTTPCacheMiddleware) Invalidate(urlPattern string) int {
 	removed := 0
 
@@ -186,6 +191,7 @@ func (m *HTTPCacheMiddleware) Invalidate(urlPattern string) int {
 	return removed
 }
 
+// InvalidateByFunc removes cached entries matching a custom function
 func (m *HTTPCacheMiddleware) InvalidateByFunc(fn func(string) bool) int {
 	removed := 0
 	keys := m.cache.Keys()
@@ -199,6 +205,7 @@ func (m *HTTPCacheMiddleware) InvalidateByFunc(fn func(string) bool) int {
 	return removed
 }
 
+// Close releases middleware resources
 func (m *HTTPCacheMiddleware) Close() error {
 	return m.cache.Close()
 }
@@ -210,6 +217,7 @@ func (m *HTTPCacheMiddleware) OnHit(callback func(string))                { m.on
 func (m *HTTPCacheMiddleware) OnMiss(callback func(string))               { m.onMiss = callback }
 func (m *HTTPCacheMiddleware) OnSet(callback func(string, time.Duration)) { m.onSet = callback }
 
+// DefaultKeyGenerator creates MD5 hash from request method, URL, and vary headers
 func DefaultKeyGenerator(r *http.Request) string {
 	h := md5.New()
 	h.Write([]byte(r.Method))
@@ -226,6 +234,7 @@ func DefaultKeyGenerator(r *http.Request) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// DefaultCachePolicy creates policy respecting HTTP cache headers
 func DefaultCachePolicy(config MiddlewareConfig) CachePolicy {
 	cacheableMethods := make(map[string]bool, len(config.CacheableMethods))
 	for _, method := range config.CacheableMethods {
@@ -277,6 +286,7 @@ func PathBasedKeyGenerator(r *http.Request) string {
 	return r.Method + ":" + r.URL.Path
 }
 
+// responseWriter wraps http.ResponseWriter to capture response data
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -293,6 +303,7 @@ func newResponseWriter(w http.ResponseWriter) *responseWriter {
 	}
 }
 
+// WriteHeader captures status code and headers
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 
@@ -304,11 +315,13 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// Write captures response body while passing through
 func (rw *responseWriter) Write(data []byte) (int, error) {
 	rw.buf.Write(data)
 	return rw.ResponseWriter.Write(data)
 }
 
+// KeyWithVaryHeaders creates MD5 hash including custom vary headers
 func KeyWithVaryHeaders(varyHeaders []string) KeyGenerator {
 	return func(r *http.Request) string {
 		h := md5.New()
@@ -325,12 +338,14 @@ func KeyWithVaryHeaders(varyHeaders []string) KeyGenerator {
 	}
 }
 
+// KeyWithoutQuery creates simple keys ignoring query parameters
 func KeyWithoutQuery() KeyGenerator {
 	return func(r *http.Request) string {
 		return r.Method + ":" + r.URL.Path
 	}
 }
 
+// KeyWithoutQueryHashed creates MD5 hash from path and headers only
 func KeyWithoutQueryHashed() KeyGenerator {
 	return func(r *http.Request) string {
 		h := md5.New()
@@ -348,6 +363,7 @@ func KeyWithoutQueryHashed() KeyGenerator {
 	}
 }
 
+// PathExtractorFromKey extracts path from "METHOD:PATH" format keys
 func PathExtractorFromKey(key string) string {
 	// Extract path from "METHOD:PATH" format
 	parts := strings.SplitN(key, ":", 2)
@@ -357,6 +373,7 @@ func PathExtractorFromKey(key string) string {
 	return key
 }
 
+// KeyWithUserID creates MD5 hash including user ID from header
 func KeyWithUserID(userIDHeader string) KeyGenerator {
 	return func(r *http.Request) string {
 		h := md5.New()
@@ -400,6 +417,7 @@ func CacheByContentType(rules map[string]time.Duration, defaultTTL time.Duration
 	}
 }
 
+// CacheBySize caches responses within specified size range
 func CacheBySize(minSize, maxSize int64, ttl time.Duration) CachePolicy {
 	return func(r *http.Request, statusCode int, headers http.Header, body []byte) (bool, time.Duration) {
 		if statusCode < 200 || statusCode >= 300 {
@@ -411,6 +429,7 @@ func CacheBySize(minSize, maxSize int64, ttl time.Duration) CachePolicy {
 	}
 }
 
+// extractMaxAge parses max-age directive from Cache-Control header
 func extractMaxAge(cacheControl string) time.Duration {
 	if cacheControl == "" {
 		return 0
