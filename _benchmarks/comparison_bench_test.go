@@ -237,7 +237,12 @@ func createCaches() map[string]CacheInterface {
 
 	// BigCache
 	bigCacheConfig := bigcache.DefaultConfig(1 * time.Hour)
-	bigCacheConfig.Shards = runtime.NumCPU() * 4
+	// Find the next power of two that's >= runtime.NumCPU()
+	shards := 1
+	for shards < runtime.NumCPU() {
+		shards *= 2
+	}
+	bigCacheConfig.Shards = shards
 	bigCacheConfig.MaxEntriesInWindow = 100000
 	bigCacheConfig.MaxEntrySize = 64 * 1024
 	bigCacheConfig.Verbose = false
