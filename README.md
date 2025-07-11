@@ -389,7 +389,7 @@ config.ShardCount = 16
 middleware := cache.NewHTTPCacheMiddleware(config)
 defer middleware.Close()
 
-// ⚠️ IMPORTANT: Enable invalidation if needed
+// ⚠IMPORTANT: Enable invalidation if needed
 // middleware.SetKeyGenerator(cache.KeyWithoutQuery())
 
 // Use with any HTTP framework
@@ -532,7 +532,7 @@ middleware.Close()
 The default key generator uses MD5 hashing which makes pattern-based invalidation impossible:
 
 ```go
-// ❌ DEFAULT SETUP - Invalidation won't work
+// DEFAULT SETUP - Invalidation won't work
 config := cache.DefaultMiddlewareConfig()
 middleware := cache.NewHTTPCacheMiddleware(config)
 
@@ -550,7 +550,7 @@ removed := middleware.Invalidate("/api/users/*") // Returns 0
 Use path-based key generators for invalidation to work:
 
 ```go
-// ✅ CORRECT SETUP - Invalidation works
+// CORRECT SETUP - Invalidation works
 config := cache.DefaultMiddlewareConfig()
 middleware := cache.NewHTTPCacheMiddleware(config)
 
@@ -592,7 +592,7 @@ func main() {
     middleware := cache.NewHTTPCacheMiddleware(config)
     defer middleware.Close()
 
-    // ✅ CRITICAL: Enable invalidation
+    // Enable invalidation
     middleware.SetKeyGenerator(cache.KeyWithoutQuery())
 
     // Setup handlers
@@ -625,7 +625,7 @@ func main() {
             return
         }
 
-        // ✅ This now works!
+        // This now works!
         removed := middleware.Invalidate(pattern)
 
         w.Header().Set("Content-Type", "application/json")
@@ -658,9 +658,6 @@ func main() {
 - Query parameters affect response content
 - You only use `Clear()` for cache management
 
-**Trade-offs:**
-- **Readable keys** = Enable invalidation + Easier debugging - Less secure
-- **Hashed keys** = More secure + Better for vary headers - No pattern invalidation
 
 ### HTTP Compliance
 
