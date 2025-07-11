@@ -71,7 +71,7 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 func (m *Manager) GetCacheStats() map[string]Stats {
 	stats := make(map[string]Stats)
 
-	m.caches.Range(func(key, value interface{}) bool {
+	m.caches.Range(func(key, value any) bool {
 		if name, ok := key.(string); ok {
 			if cache, ok := value.(interface{ Stats() Stats }); ok {
 				stats[name] = cache.Stats()
@@ -88,7 +88,7 @@ func (m *Manager) CloseAll() error {
 	var errors []error
 
 	// Close all caches and collect any errors
-	m.caches.Range(func(key, value interface{}) bool {
+	m.caches.Range(func(key, value any) bool {
 		if cache, ok := value.(interface{ Close() error }); ok {
 			if err := cache.Close(); err != nil {
 				errors = append(errors, err)
@@ -97,7 +97,7 @@ func (m *Manager) CloseAll() error {
 		return true
 	})
 
-	m.caches.Range(func(key, value interface{}) bool {
+	m.caches.Range(func(key, value any) bool {
 		m.caches.Delete(key)
 		return true
 	})

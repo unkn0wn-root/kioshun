@@ -610,7 +610,6 @@ func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
 
 	wrappedHandler := middleware.Middleware(handler)
 
-
 	t.Run("DoubleInvalidation", func(t *testing.T) {
 		// Cache an item
 		req := httptest.NewRequest("GET", "/test/double", nil)
@@ -716,7 +715,6 @@ func TestHTTPCacheMiddleware_CacheHitMissVerification(t *testing.T) {
 		})
 	}
 }
-
 
 func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
 	config := DefaultMiddlewareConfig()

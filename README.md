@@ -220,7 +220,7 @@ config := cache.Config{
     StatsEnabled:    true,             // Enable statistics collection
 }
 
-cache := cache.New[string, interface{}](config)
+cache := cache.New[string, any](config)
 ```
 
 ### Predefined Configurations
@@ -233,10 +233,10 @@ sessionCache := cache.New[string, Session](cache.SessionCacheConfig())
 apiCache := cache.New[string, APIResponse](cache.APICacheConfig())
 
 // For temporary data
-tempCache := cache.New[string, interface{}](cache.TemporaryCacheConfig())
+tempCache := cache.New[string, any](cache.TemporaryCacheConfig())
 
 // For persistent data
-persistentCache := cache.New[string, interface{}](cache.PersistentCacheConfig())
+persistentCache := cache.New[string, any](cache.PersistentCacheConfig())
 ```
 
 ## Architecture
@@ -607,7 +607,7 @@ func main() {
     // Setup handlers
     http.Handle("/api/users", middleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]interface{}{
+        json.NewEncoder(w).Encode(map[string]any{
             "users": []string{"alice", "bob", "charlie"},
             "cached_at": time.Now(),
         })
@@ -615,7 +615,7 @@ func main() {
 
     http.Handle("/api/users/", middleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]interface{}{
+        json.NewEncoder(w).Encode(map[string]any{
             "user": "user-data",
             "cached_at": time.Now(),
         })
@@ -638,7 +638,7 @@ func main() {
         removed := middleware.Invalidate(pattern)
 
         w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]interface{}{
+        json.NewEncoder(w).Encode(map[string]any{
             "message": fmt.Sprintf("Invalidated %d entries", removed),
             "pattern": pattern,
         })

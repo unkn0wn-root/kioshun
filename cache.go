@@ -112,7 +112,7 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		cleanupCh: make(chan struct{}, 1),
 		closeCh:   make(chan struct{}),
 		itemPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return &cacheItem[V]{heapIndex: -1}
 			},
 		},
@@ -578,7 +578,7 @@ type cacheItem[V any] struct {
 	frequency  int64         // Access count for LFU
 	prev       *cacheItem[V] // For LRU doubly-linked list
 	next       *cacheItem[V] // For LRU doubly-linked list
-	key        interface{}   // Store key for eviction
+	key        any           // Store key for eviction
 	heapIndex  int           // For LFU heap
 }
 
@@ -604,14 +604,14 @@ func (h lfuHeap[V]) Swap(i, j int) {
 }
 
 // Push adds an item to the heap
-func (h *lfuHeap[V]) Push(x interface{}) {
+func (h *lfuHeap[V]) Push(x any) {
 	item := x.(*cacheItem[V])
 	item.heapIndex = len(*h)
 	*h = append(*h, item)
 }
 
 // Pop removes and returns the minimum item from the heap
-func (h *lfuHeap[V]) Pop() interface{} {
+func (h *lfuHeap[V]) Pop() any {
 	old := *h
 	n := len(old)
 	item := old[n-1]

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/unkn0wn-root/kioshun"
+	cache "github.com/unkn0wn-root/kioshun"
 )
 
 type APIResponse struct {
@@ -123,7 +123,7 @@ func main() {
 	http.Handle("/api/products", apiMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond) // simulate complex database query
 
-		products := []map[string]interface{}{
+		products := []map[string]any{
 			{"id": 1, "name": "Laptop Super Pro", "price": 1299.99, "category": "Electronics"},
 			{"id": 2, "name": "Wireless Flying Board", "price": 29.99, "category": "Electronics"},
 			{"id": 3, "name": "Coffee Machine But for Tea", "price": 12.99, "category": "Kitchen"},
@@ -187,7 +187,7 @@ func main() {
 	http.Handle("/content/json", contentMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"type": "json",
 			"ttl":  "5 minutes",
 			"time": time.Now(),
@@ -219,7 +219,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 
 		// Large response - will be cached
-		data := map[string]interface{}{
+		data := map[string]any{
 			"size":        "large",
 			"description": "This response is large enough to be cached by our size-based policy",
 			"timestamp":   time.Now(),
@@ -233,7 +233,7 @@ func main() {
 
 	// CACHE MANAGEMENT AND STATISTICS
 	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-		stats := map[string]interface{}{
+		stats := map[string]any{
 			"basic":       basicMiddleware.Stats(),
 			"api":         apiMiddleware.Stats(),
 			"user":        userMiddleware.Stats(),
