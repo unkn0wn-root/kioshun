@@ -20,7 +20,7 @@ type patternNode struct {
 
 // maintains a tree structure that maps URL paths to cache keys,
 type patternIndex struct {
-	mu   sync.RWMutex // Reader-writer mutex for concurrent access
+	mu   sync.RWMutex
 	root *patternNode // Root node of the path tree
 }
 
@@ -44,14 +44,21 @@ func normalizePath(path string) []string {
 		path = rootPath
 	}
 
-	// Remove leading and trailing slashes
+	// remove leading and trailing slashes
 	trimmed := strings.Trim(path, pathSeparator)
 	if trimmed == "" {
 		return []string{} // Root path results in empty segments
 	}
 
-	// Split path into individual segments
-	return strings.Split(trimmed, pathSeparator)
+	// split path into individual segments and filter out empty ones
+	segments := strings.Split(trimmed, pathSeparator)
+	result := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if segment != "" {
+			result = append(result, segment)
+		}
+	}
+	return result
 }
 
 // associates a cache key with a specific path in the tree.
