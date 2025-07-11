@@ -389,7 +389,7 @@ config.ShardCount = 16
 middleware := cache.NewHTTPCacheMiddleware(config)
 defer middleware.Close()
 
-// ⚠️ IMPORTANT: Enable invalidation if needed
+// ⚠IMPORTANT: Enable invalidation if needed
 // middleware.SetKeyGenerator(cache.KeyWithoutQuery())
 
 // Use with any HTTP framework
@@ -532,7 +532,7 @@ middleware.Close()
 The default key generator uses MD5 hashing which makes pattern-based invalidation impossible:
 
 ```go
-// ❌ DEFAULT SETUP - Invalidation won't work
+// DEFAULT SETUP - Invalidation won't work
 config := cache.DefaultMiddlewareConfig()
 middleware := cache.NewHTTPCacheMiddleware(config)
 
@@ -592,7 +592,8 @@ func main() {
     middleware := cache.NewHTTPCacheMiddleware(config)
     defer middleware.Close()
 
-    // CRITICAL: Enable invalidation
+
+    // Enable invalidation
     middleware.SetKeyGenerator(cache.KeyWithoutQuery())
 
     // Setup handlers
@@ -652,17 +653,12 @@ func main() {
 - You need pattern-based invalidation
 - Query parameters don't affect response content
 - You want readable cache keys for debugging
-- Security is not a primary concern
 
 **Use `DefaultKeyGenerator` when:**
 - You don't need pattern invalidation
 - Query parameters affect response content
-- You need maximum cache key security
 - You only use `Clear()` for cache management
 
-**Trade-offs:**
-- **Readable keys** = Enable invalidation + Easier debugging - Less secure
-- **Hashed keys** = More secure + Better for vary headers - No pattern invalidation
 
 ### HTTP Compliance
 
