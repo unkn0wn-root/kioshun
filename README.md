@@ -550,7 +550,7 @@ removed := middleware.Invalidate("/api/users/*") // Returns 0
 Use path-based key generators for invalidation to work:
 
 ```go
-// ✅ CORRECT SETUP - Invalidation works
+// CORRECT SETUP - Invalidation works
 config := cache.DefaultMiddlewareConfig()
 middleware := cache.NewHTTPCacheMiddleware(config)
 
@@ -563,12 +563,12 @@ removed := middleware.Invalidate("/api/users/*") // Returns actual count
 
 ### Key Generator Comparison
 
-| Key Generator | Example Key | Invalidation | Security | Use Case |
-|---------------|-------------|--------------|----------|----------|
-| `DefaultKeyGenerator` | `"a1b2c3d4..."` | ❌ **Broken** | ✅ High | No invalidation needed |
-| `KeyWithoutQuery()` | `"GET:/api/users"` | ✅ **Works** | ⚠️ Medium | **Recommended for invalidation** |
-| `PathBasedKeyGenerator` | `"GET:/api/users"` | ✅ **Works** | ⚠️ Medium | Simple path-based caching |
-| `KeyWithVaryHeaders()` | `"a1b2c3d4..."` | ❌ **Broken** | ✅ High | Custom headers + security |
+| Key Generator | Example Key | Invalidation | Use Case |
+|---------------|-------------|--------------|----------|
+| `DefaultKeyGenerator` | `"a1b2c3d4..."` | ❌ **Broken** | No invalidation needed |
+| `KeyWithoutQuery()` | `"GET:/api/users"` | ✅ **Works** | **Recommended for invalidation** |
+| `PathBasedKeyGenerator` | `"GET:/api/users"` | ✅ **Works** | Simple path-based caching |
+| `KeyWithVaryHeaders()` | `"a1b2c3d4..."` | ❌ **Broken** | Custom headers + security |
 
 ### Complete Working Example
 
@@ -592,7 +592,7 @@ func main() {
     middleware := cache.NewHTTPCacheMiddleware(config)
     defer middleware.Close()
 
-    // ✅ CRITICAL: Enable invalidation
+    // CRITICAL: Enable invalidation
     middleware.SetKeyGenerator(cache.KeyWithoutQuery())
 
     // Setup handlers
@@ -625,7 +625,7 @@ func main() {
             return
         }
 
-        // ✅ This now works!
+        // This now works!
         removed := middleware.Invalidate(pattern)
 
         w.Header().Set("Content-Type", "application/json")

@@ -24,25 +24,25 @@ test:
 
 .PHONY: bench-deps
 bench-deps:
-	cd benchmarks && $(GOMOD) tidy && $(GOMOD) download
+	cd _benchmarks && $(GOMOD) tidy && $(GOMOD) download
 
 .PHONY: bench-runner
 bench-runner: bench-deps
-	cd benchmarks && go run benchmark_runner.go
+	cd _benchmarks && go run benchmark_runner.go
 
 .PHONY: bench
 bench: bench-deps
-	cd benchmarks && $(GOTEST) -bench=. -benchmem -run=^$$ ./...
+	cd _benchmarks && $(GOTEST) -bench=. -benchmem -run=^$$ ./...
 
 .PHONY: bench-full
 bench-full: bench-deps
-	cd benchmarks && $(GOTEST) -bench=. -benchmem -benchtime=10s -run=^$$ ./...
+	cd _benchmarks && $(GOTEST) -bench=. -benchmem -benchtime=10s -run=^$$ ./...
 
 .PHONY: bench-compare
 bench-compare: bench-deps
 	@echo "Running performance comparison..."
-	cd benchmarks && $(GOTEST) -bench=BenchmarkCacheShardComparison -benchmem -run=^$$ ./...
-	cd benchmarks && $(GOTEST) -bench=BenchmarkCacheEvictionPolicyComparison -benchmem -run=^$$ ./...
+	cd _benchmarks && $(GOTEST) -bench=BenchmarkCacheShardComparison -benchmem -run=^$$ ./...
+	cd _benchmarks && $(GOTEST) -bench=BenchmarkCacheEvictionPolicyComparison -benchmem -run=^$$ ./...
 
 .PHONY: lint
 lint:
@@ -72,12 +72,12 @@ check: fmt lint test
 .PHONY: stress-test
 stress-test: bench-deps
 	@echo "Running stress test..."
-	cd benchmarks && $(GOTEST) -bench=BenchmarkCacheScalability -benchmem -benchtime=30s -run=^$$ ./...
+	cd _benchmarks && $(GOTEST) -bench=BenchmarkCacheScalability -benchmem -benchtime=30s -run=^$$ ./...
 
 .PHONY: mem-analysis
 mem-analysis: bench-deps
 	@echo "Running memory usage analysis..."
-	cd benchmarks && $(GOTEST) -bench=BenchmarkCacheMemoryUsage -benchmem -run=^$$ ./...
+	cd _benchmarks && $(GOTEST) -bench=BenchmarkCacheMemoryUsage -benchmem -run=^$$ ./...
 
 .PHONY: install-tools
 install-tools:
