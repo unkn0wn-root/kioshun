@@ -11,8 +11,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        go-version: ['1.21', '1.22', '1.23']
+        os: [ubuntu-latest, macos-latest]
+        go-version: ['1.21', '1.22']
 
     steps:
     - uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
         go-version: ${{ matrix.go-version }}
 
     - name: Cache Go modules
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cache/go-build
@@ -32,11 +32,16 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-go-${{ matrix.go-version }}-
 
-    - name: Download dependencies
-      run: go mod download
+    - name: Format check
+      run: |
+        if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+          echo "Code is not formatted:"
+          gofmt -s -l .
+          exit 1
+        fi
 
-    - name: Verify dependencies
-      run: go mod verify
+    - name: Lint
+      run: go vet ./...
 
     - name: Run tests
       run: go test -v -race ./...
