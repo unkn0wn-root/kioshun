@@ -30,15 +30,11 @@ func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
 
 // addToLRUHead adds an item to the head of the LRU list
 func (c *InMemoryCache[K, V]) addToLRUHead(s *shard[K, V], item *cacheItem[V]) {
-	if s.head == nil || s.head.next == nil {
-		return
-	}
-	item.next = s.head.next
-	item.prev = s.head
-	if s.head.next != nil {
-		s.head.next.prev = item
-	}
+	oldNext := s.head.next
 	s.head.next = item
+	item.prev = s.head
+	item.next = oldNext
+	oldNext.prev = item
 }
 
 // removeFromLRU removes an item from the LRU list
@@ -53,10 +49,27 @@ func (c *InMemoryCache[K, V]) removeFromLRU(s *shard[K, V], item *cacheItem[V]) 
 	item.next = nil
 }
 
-// moveToLRUHead moves an item to the head of the LRU list
+// moveToLRUHead moves item to head if not already there
 func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) {
-	c.removeFromLRU(s, item)
-	c.addToLRUHead(s, item)
+	// fast path: if item is already at head, do nothing
+	if s.head.next == item {
+		return
+	}
+
+	// remove from current position
+	if item.prev != nil {
+		item.prev.next = item.next
+	}
+	if item.next != nil {
+		item.next.prev = item.prev
+	}
+
+	// add to head
+	oldNext := s.head.next
+	s.head.next = item
+	item.prev = s.head
+	item.next = oldNext
+	oldNext.prev = item
 }
 
 // cleanupShard removes expired items from a specific shard
