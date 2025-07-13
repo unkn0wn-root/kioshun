@@ -87,8 +87,8 @@ type InMemoryCache[K comparable, V any] struct {
 	cleanupCh   chan struct{}
 	closeCh     chan struct{}
 	closeOnce   sync.Once
-	closed      int32     // Atomic flag indicating cache is closed
-	itemPool    sync.Pool // Object pool for cache items
+	closed      int32     // Flag indicating cache is closed
+	itemPool    sync.Pool // Object pool
 }
 
 // New creates a new cache instance with the given configuration
@@ -146,9 +146,10 @@ func NewWithDefaults[K comparable, V any]() *InMemoryCache[K, V] {
 	return New[K, V](DefaultConfig())
 }
 
+// Hash function optimized for different key types:
 // - Strings: FNV-1A
 // - Integers: Uses multiplicative hashing with golden ratio constants
-// - Other types: Converts to string then uses maphash - compatible with all comparable types
+// - Other types: Converts to string then uses FNV-1A - compatible with all comparable types
 func (c *InMemoryCache[K, V]) hash(key K) uint64 {
 	switch k := any(key).(type) {
 	case string:
@@ -186,10 +187,17 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 	}
 
 	shard := c.getShard(key)
-	now := time.Now().UnixNano()
 
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
+	// LRU/FIFO policies need to update access order on reads
+	needsUpdate := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == FIFO
+
+	if needsUpdate {
+		shard.mu.Lock()
+		defer shard.mu.Unlock()
+	} else {
+		shard.mu.RLock()
+		defer shard.mu.RUnlock()
+	}
 
 	item, exists := shard.data[key]
 	if !exists {
@@ -199,7 +207,26 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 		return zero, false
 	}
 
-	if item.expireTime > 0 && now > item.expireTime {
+	if item.expireTime == 0 {
+		value := item.value
+
+		if needsUpdate {
+			c.moveToLRUHead(shard, item)
+		}
+
+		if c.config.EvictionPolicy == LFU {
+			atomic.AddInt64(&item.frequency, 1)
+		}
+
+		if c.config.StatsEnabled {
+			atomic.AddInt64(&shard.hits, 1)
+		}
+		return value, true
+	}
+
+	now := time.Now().UnixNano()
+	if now > item.expireTime {
+		// Item is expired, remove it
 		delete(shard.data, key)
 		c.removeFromLRU(shard, item)
 		if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
@@ -214,15 +241,15 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 		return zero, false
 	}
 
-	item.lastAccess = now
-	atomic.AddInt64(&item.frequency, 1)
 	value := item.value
 
-	if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
-		shard.lfuHeap.update(item)
+	if needsUpdate {
+		c.moveToLRUHead(shard, item)
 	}
 
-	c.moveToLRUHead(shard, item)
+	if c.config.EvictionPolicy == LFU {
+		atomic.AddInt64(&item.frequency, 1)
+	}
 
 	if c.config.StatsEnabled {
 		atomic.AddInt64(&shard.hits, 1)
@@ -230,7 +257,7 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 	return value, true
 }
 
-// GetWithTTL retrieves a value along with its remaining TTL
+// GetWithTTL returns value with remaining TTL (-1 for no expiration)
 func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 	var zero V
 
@@ -239,10 +266,15 @@ func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 	}
 
 	shard := c.getShard(key)
-	now := time.Now().UnixNano()
+	needsUpdate := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == FIFO
 
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
+	if needsUpdate {
+		shard.mu.Lock()
+		defer shard.mu.Unlock()
+	} else {
+		shard.mu.RLock()
+		defer shard.mu.RUnlock()
+	}
 
 	item, exists := shard.data[key]
 	if !exists {
@@ -252,7 +284,25 @@ func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 		return zero, 0, false
 	}
 
-	if item.expireTime > 0 && now > item.expireTime {
+	if item.expireTime == 0 {
+		value := item.value
+
+		if needsUpdate {
+			c.moveToLRUHead(shard, item)
+		}
+
+		if c.config.EvictionPolicy == LFU {
+			atomic.AddInt64(&item.frequency, 1)
+		}
+
+		if c.config.StatsEnabled {
+			atomic.AddInt64(&shard.hits, 1)
+		}
+		return value, -1, true
+	}
+
+	now := time.Now().UnixNano()
+	if now > item.expireTime {
 		delete(shard.data, key)
 		c.removeFromLRU(shard, item)
 		if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
@@ -267,20 +317,16 @@ func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 		return zero, 0, false
 	}
 
-	item.lastAccess = now
-	atomic.AddInt64(&item.frequency, 1)
 	value := item.value
+	ttl := time.Duration(item.expireTime - now)
 
-	var ttl time.Duration
-	if item.expireTime > 0 {
-		ttl = time.Duration(item.expireTime - now)
+	if needsUpdate {
+		c.moveToLRUHead(shard, item)
 	}
 
-	if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
-		shard.lfuHeap.update(item)
+	if c.config.EvictionPolicy == LFU {
+		atomic.AddInt64(&item.frequency, 1)
 	}
-
-	c.moveToLRUHead(shard, item)
 
 	if c.config.StatsEnabled {
 		atomic.AddInt64(&shard.hits, 1)
@@ -327,7 +373,6 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		atomic.AddInt64(&shard.size, -1)
 	}
 
-	// Check if eviction is needed before adding new item
 	maxShardSize := c.config.MaxSize / int64(len(c.shards))
 	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
 		c.evictItem(shard)
@@ -344,7 +389,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	return nil
 }
 
-// SetWithCallback sets a value and calls the callback when it expires
+// SetWithCallback calls callback func when the item expires
 func (c *InMemoryCache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
@@ -362,6 +407,7 @@ func (c *InMemoryCache[K, V]) SetWithCallback(key K, value V, ttl time.Duration,
 
 			select {
 			case <-timer.C:
+				// Check if the item still exists
 				shard := c.getShard(key)
 				shard.mu.RLock()
 				item, exists := shard.data[key]
@@ -433,30 +479,41 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 	}
 
 	shard := c.getShard(key)
-	now := time.Now().UnixNano()
-
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
+	shard.mu.RLock()
 
 	item, exists := shard.data[key]
 	if !exists {
+		shard.mu.RUnlock()
 		return false
 	}
 
-	if item.expireTime > 0 && now > item.expireTime {
-		delete(shard.data, key)
-		c.removeFromLRU(shard, item)
-		if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
-			heap.Remove(shard.lfuHeap, item.heapIndex)
+	if item.expireTime == 0 {
+		shard.mu.RUnlock()
+		return true
+	}
+
+	now := time.Now().UnixNano()
+	if now > item.expireTime {
+		shard.mu.RUnlock()
+		shard.mu.Lock()
+		item, exists = shard.data[key]
+		if exists && item.expireTime > 0 && now > item.expireTime {
+			delete(shard.data, key)
+			c.removeFromLRU(shard, item)
+			if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
+				heap.Remove(shard.lfuHeap, item.heapIndex)
+			}
+			c.itemPool.Put(item)
+			atomic.AddInt64(&shard.size, -1)
+			if c.config.StatsEnabled {
+				atomic.AddInt64(&shard.expirations, 1)
+			}
 		}
-		c.itemPool.Put(item)
-		atomic.AddInt64(&shard.size, -1)
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&shard.expirations, 1)
-		}
+		shard.mu.Unlock()
 		return false
 	}
 
+	shard.mu.RUnlock()
 	return true
 }
 
@@ -528,6 +585,19 @@ func (c *InMemoryCache[K, V]) Close() error {
 	return err
 }
 
+// TriggerCleanup manually triggers cleanup of expired items
+func (c *InMemoryCache[K, V]) TriggerCleanup() {
+	if atomic.LoadInt32(&c.closed) == 1 {
+		return
+	}
+
+	select {
+	case c.cleanupCh <- struct{}{}:
+	default:
+		// Channel is full, cleanup already scheduled
+	}
+}
+
 // cleanupWorker runs periodic cleanup of expired items
 func (c *InMemoryCache[K, V]) cleanupWorker() {
 	ticker := time.NewTicker(c.config.CleanupInterval)
@@ -542,19 +612,6 @@ func (c *InMemoryCache[K, V]) cleanupWorker() {
 		case <-c.closeCh:
 			return
 		}
-	}
-}
-
-// TriggerCleanup manually triggers cleanup of expired items
-func (c *InMemoryCache[K, V]) TriggerCleanup() {
-	if atomic.LoadInt32(&c.closed) == 1 {
-		return
-	}
-
-	select {
-	case c.cleanupCh <- struct{}{}:
-	default:
-		// Channel is full, cleanup already scheduled
 	}
 }
 
