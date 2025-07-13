@@ -207,7 +207,6 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 		return zero, false
 	}
 
-	// Fast path for non-expiring items
 	if item.expireTime == 0 {
 		value := item.value
 
@@ -285,7 +284,6 @@ func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 		return zero, 0, false
 	}
 
-	// Fast path for non-expiring items
 	if item.expireTime == 0 {
 		value := item.value
 
@@ -489,7 +487,6 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 		return false
 	}
 
-	// fast path: for non-expiring items
 	if item.expireTime == 0 {
 		shard.mu.RUnlock()
 		return true
