@@ -11,7 +11,7 @@ const (
 	wildcardChar  = "*" // Wildcard character for pattern matching
 )
 
-// represents a single node in the path tree.
+// Represents a single node in the path tree.
 // Each node can store multiple cache keys and child nodes for deeper path segments.
 type patternNode struct {
 	children map[string]*patternNode // Child nodes indexed by path segment
@@ -37,20 +37,36 @@ func newPatternNode() *patternNode {
 	}
 }
 
-// normalizePath converts a URL path into a slice of path segments for tree traversal.
+// normalizePath converts a URL path into a normalized slice of path segments
+// Empty path handling:
+// - Empty string converts to root path ("/")
+// - Ensures all paths have a canonical representation
+//
+// Path cleaning process:
+// 1. Trim leading and trailing slashes to remove "/path/" -> "path"
+// 2. After trimming, empty result indicates root path (returns empty slice)
+// 3. Split remaining path by separator into individual segments
+// 4. Filter out empty segments caused by double slashes ("//") or malformed paths
+//
+// Examples:
+// - "" -> []
+// - "/" -> []
+// - "/api/v1/" -> ["api", "v1"]
+// - "//api//v1//" -> ["api", "v1"]
+// - "api/v1" -> ["api", "v1"]
+//
+// This normalization ensures that equivalent paths (with different slash patterns)
+// map to the same tree location, preventing duplicate entries
 func normalizePath(path string) []string {
-	// Convert empty path to root
 	if path == "" {
 		path = rootPath
 	}
 
-	// remove leading and trailing slashes
 	trimmed := strings.Trim(path, pathSeparator)
 	if trimmed == "" {
 		return []string{} // Root path results in empty segments
 	}
 
-	// split path into individual segments and filter out empty ones
 	segments := strings.Split(trimmed, pathSeparator)
 	result := make([]string, 0, len(segments))
 	for _, segment := range segments {
@@ -61,17 +77,23 @@ func normalizePath(path string) []string {
 	return result
 }
 
-// associates a cache key with a specific path in the tree.
-// creates intermediate nodes as needed when traversing the path.
+// addKey associates a cache key with a specific path in the trie, creating intermediate nodes as needed
+//
+// Path processing:
+// 1. Normalizes the input path into segments using normalizePath()
+// 2. Starts traversal from the root node of the trie
+// 3. For each path segment, checks if child node exists
+//
+// Lazy node creation:
+// - If child node doesn't exist for a segment, creates new patternNode on-demand
+// - This ensures the tree only grows as paths are actually added
 func (pi *patternIndex) addKey(path, key string) {
 	pi.mu.Lock()
 	defer pi.mu.Unlock()
 
-	// convert path to segments for tree traversal
-	segments := normalizePath(path)
 	node := pi.root
 
-	// traverse or create path in the tree
+	segments := normalizePath(path)
 	for _, segment := range segments {
 		if node.children[segment] == nil {
 			node.children[segment] = newPatternNode()
@@ -95,8 +117,19 @@ func (pi *patternIndex) removeKey(path, key string) {
 	}
 }
 
-// returns all cache keys that match the given pattern.
-// supports exact path matching and wildcard patterns ending with '*'.
+// getMatchingKeys returns all cache keys that match the given pattern
+//
+// Exact path matching:
+// - Pattern without '*' suffix matches only keys stored at that exact path
+// - Uses findNode() to locate the specific tree node
+// - Collects only keys stored directly at the target node
+// - Example: "/api/users" matches keys at exactly "/api/users"
+//
+// Wildcard pattern matching:
+// - Pattern ending with '*' enables prefix-based subtree matching
+// - Strips the '*' suffix and finds the base path node
+// - Recursively collects keys from the base node and all descendant nodes
+// - Example: "/api/*" matches keys at "/api", "/api/users", "/api/users/123", etc.
 func (pi *patternIndex) getMatchingKeys(pattern string) []string {
 	pi.mu.RLock()
 	defer pi.mu.RUnlock()
@@ -117,17 +150,25 @@ func (pi *patternIndex) getMatchingKeys(pattern string) []string {
 	}
 
 	if isWildcard {
-		return pi.collectAllKeys(node) // collect from this node and all children
+		return pi.collectAllKeys(node) // all children
 	}
-	return pi.collectDirectKeys(node) // collect only from this node
+	return pi.collectDirectKeys(node) // this node
 }
 
-// traverses the tree to find the node at the specified path segments.
+// findNode traverses the trie to locate the node corresponding to the given path segments
+//
+// 1. Starts at root node and iterates through each path segment
+// 2. For each segment, checks if corresponding child node exists
+// 3. If child exists, moves to that node and continues
+// 4. If child doesn't exist, immediately returns nil (path not found)
+//
+// - Stops traversal as soon as a missing path segment is encountered
+// - O(d) time complexity where d is depth to first missing segment
 func (pi *patternIndex) findNode(segments []string) *patternNode {
 	node := pi.root
 	for _, segment := range segments {
 		if node.children[segment] == nil {
-			return nil // Path doesn't exist
+			return nil
 		}
 		node = node.children[segment]
 	}
@@ -147,8 +188,15 @@ func (pi *patternIndex) collectDirectKeys(node *patternNode) []string {
 	return keys
 }
 
-// collects all keys from the given node and all its descendants.
-// used for wildcard pattern matching to gather keys from entire subtrees.
+// collectAllKeys recursively gathers all cache keys from a node and its entire subtree
+//
+// 1. Collects all keys stored directly at the current node
+// 2. Recursively visits each child node to collect their keys
+// 3. Combines all collected keys into a single flat slice
+//
+// - Depth-first approach ensures complete subtree coverage
+// - No specific ordering of keys (map iteration order is not guaranteed)
+// - O(n) where n is total number of keys in subtree
 func (pi *patternIndex) collectAllKeys(node *patternNode) []string {
 	var keys []string
 
