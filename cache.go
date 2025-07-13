@@ -401,7 +401,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	return nil
 }
 
-// SetWithCallback calls callback when the item expires
+// SetWithCallback calls callback func when the item expires
 func (c *InMemoryCache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
@@ -482,8 +482,8 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 	}
 
 	shard := c.getShard(key)
-
 	shard.mu.RLock()
+
 	item, exists := shard.data[key]
 	if !exists {
 		shard.mu.RUnlock()
