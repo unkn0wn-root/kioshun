@@ -21,6 +21,16 @@ type shard[K comparable, V any] struct {
 }
 
 // initLRU initializes the doubly-linked list for LRU tracking
+//
+// Creates a circular list with sentinel nodes:
+// - head: sentinel node representing the most recently used position
+// - tail: sentinel node representing the least recently used position
+// - Connects head.next -> tail and tail.prev -> head to form empty list
+//
+// - head.next always points to the MRU item (or tail if empty)
+// - tail.prev always points to the LRU item (or head if empty)
+//
+// heapIndex is set to -1 to indicate sentinel nodes are not part of LFU heap
 func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
 	s.head = &cacheItem[V]{heapIndex: -1}
 	s.tail = &cacheItem[V]{heapIndex: -1}
@@ -28,7 +38,17 @@ func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
 	s.tail.prev = s.head
 }
 
-// addToLRUHead adds an item to the head of the LRU list
+// addToLRUHead inserts an item as the most recently used item in the LRU list
+//
+// Performs list insertion after the head sentinel:
+// 1. Save current first item (head.next) as oldNext
+// 2. Link head -> item: head.next = item, item.prev = head
+// 3. Link item -> oldNext: item.next = oldNext, oldNext.prev = item
+//
+// This maintains the LRU ordering where:
+// - Items closest to head are most recently used
+// - Items closest to tail are least recently used
+// - New items are always inserted at head position (most recent)
 func (c *InMemoryCache[K, V]) addToLRUHead(s *shard[K, V], item *cacheItem[V]) {
 	oldNext := s.head.next
 	s.head.next = item
@@ -37,7 +57,11 @@ func (c *InMemoryCache[K, V]) addToLRUHead(s *shard[K, V], item *cacheItem[V]) {
 	oldNext.prev = item
 }
 
-// removeFromLRU removes an item from the LRU list
+// removeFromLRU removes an item from the LRU
+//
+// 1. If item has previous node: link prev.next to item.next (bypass item)
+// 2. If item has next node: link next.prev to item.prev (bypass item)
+// 3. Clear item's prev/next pointers to prevent memory leaks and dangling references
 func (c *InMemoryCache[K, V]) removeFromLRU(s *shard[K, V], item *cacheItem[V]) {
 	if item.prev != nil {
 		item.prev.next = item.next
@@ -49,14 +73,19 @@ func (c *InMemoryCache[K, V]) removeFromLRU(s *shard[K, V], item *cacheItem[V]) 
 	item.next = nil
 }
 
-// moveToLRUHead moves item to head if not already there
+// moveToLRUHead promotes an item to most recently used position
+// - Checks if item is already at head position (most recently used)
+// - If so, returns immediately without any list manipulation
+// - Avoids unnecessary pointer updates
+//
+// Promotion logic (when item is not at head):
+// 1. Remove item from current position by updating neighboring nodes' pointers
+// 2. Insert item at head position
 func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) {
-	// fast path: if item is already at head, do nothing
 	if s.head.next == item {
 		return
 	}
 
-	// remove from current position
 	if item.prev != nil {
 		item.prev.next = item.next
 	}
@@ -64,7 +93,6 @@ func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) 
 		item.next.prev = item.prev
 	}
 
-	// add to head
 	oldNext := s.head.next
 	s.head.next = item
 	item.prev = s.head
@@ -73,11 +101,22 @@ func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) 
 }
 
 // cleanupShard removes expired items from a specific shard
+// Phase 1: Collection
+// - Iterates through shard's hash map to identify expired items
+// - Collects keys of expired items into a separate slice
+// - Uses provided timestamp (now)
+// - No modifications to data structures during this phase
+//
+// Phase 2: Removal
+// - Iterates through collected keys and removes each expired item
+// - Double-checks existence and expiration under lock
+// - Removes item: map, LRU list, LFU heap
+// - Returns item to object pool
+// - Updates shard size and expiration statistics
 func (c *InMemoryCache[K, V]) cleanupShard(s *shard[K, V], now int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Collect expired keys to avoid modifying map during iteration
 	var keysToDelete []K
 	for key, item := range s.data {
 		if item.expireTime > 0 && now > item.expireTime {
