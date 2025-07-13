@@ -142,6 +142,7 @@ make bench
 
 - **18-79ns per operation** for most cache operations
 - **10+ million operations/sec** throughput
+- **Timestamp Caching**: expiration checks use cached timestamps updated every 100ms (default) instead of expensive `time.Now()` calls
 
 ### Stress Test Results
 
