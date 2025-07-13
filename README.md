@@ -7,6 +7,8 @@
 
   [![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+  ![CI](https://github.com/unkn0wn-root/kioshun/actions/workflows/test.yml/badge.svg)
+
 
   *Fast, thread-safe, sharded in-memory cache for Go*
 </div>
