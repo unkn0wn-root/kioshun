@@ -39,19 +39,19 @@ func (h hasher[K]) hash(key K) uint64 {
 	case string:
 		return h.hashString(k) // FNV-1a for strings
 	case int:
-		return h.hashInteger(uint64(k), gratio32) // Golden ratio for int
+		return h.hashInteger(uint64(k), gratio32)
 	case int32:
-		return h.hashInteger(uint64(k), gratio32) // Golden ratio for int32
+		return h.hashInteger(uint64(k), gratio32)
 	case int64:
-		return h.hashInteger(uint64(k), gratio64) // Golden ratio for int64
+		return h.hashInteger(uint64(k), gratio64)
 	case uint:
-		return h.hashInteger(uint64(k), gratio32) // Golden ratio for uint
+		return h.hashInteger(uint64(k), gratio32)
 	case uint32:
-		return h.hashInteger(uint64(k), gratio32) // Golden ratio for uint32
+		return h.hashInteger(uint64(k), gratio32)
 	case uint64:
-		return h.hashInteger(k, gratio64) // Golden ratio for uint64
+		return h.hashInteger(k, gratio64)
 	default:
-		return h.hashString(fmt.Sprintf("%v", k)) // Fallback: convert to string
+		return h.hashString(fmt.Sprintf("%v", k))
 	}
 }
 
@@ -62,5 +62,5 @@ func (h hasher[K]) hashString(s string) uint64 {
 
 // hashInteger computes multiplicative hash for integer keys
 func (h hasher[K]) hashInteger(value uint64, ratio uint64) uint64 {
-	return value * ratio // Multiplicative hashing with golden ratio
+	return value * ratio
 }
