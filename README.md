@@ -321,7 +321,6 @@ const (
     LFU                           // Least Frequently Used
     FIFO                          // First In, First Out
     Random                        // Random eviction
-    TinyLFU                       // Tiny Least Frequently Used
 )
 ```
 
