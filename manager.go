@@ -42,7 +42,7 @@ func (m *Manager) RegisterCache(name string, config Config) error {
 	defer m.configMu.Unlock()
 
 	if _, exists := m.configs[name]; exists {
-		return fmt.Errorf("cache '%s' already exists", name)
+		return newCacheError("register", name, ErrCacheExists)
 	}
 
 	m.configs[name] = config
@@ -70,7 +70,7 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 		if cache, ok := cached.(*InMemoryCache[K, V]); ok {
 			return cache, nil
 		}
-		return nil, fmt.Errorf("cache '%s' exists but with different types", name)
+		return nil, newCacheError("get", name, ErrTypeMismatch)
 	}
 
 	m.configMu.RLock()
@@ -87,7 +87,7 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 		if existingCache, ok := actual.(*InMemoryCache[K, V]); ok {
 			return existingCache, nil
 		}
-		return nil, fmt.Errorf("cache '%s' exists but with different types", name)
+		return nil, newCacheError("get", name, ErrTypeMismatch)
 	}
 
 	return cache, nil
@@ -121,13 +121,17 @@ func (m *Manager) GetCacheStats() map[string]Stats {
 
 // CloseAll performs shutdown of all managed cache instances
 func (m *Manager) CloseAll() error {
-	var errors []error
+	var closeErrors []error
 
 	// Close all caches and collect any errors
 	m.caches.Range(func(key, value any) bool {
 		if cache, ok := value.(interface{ Close() error }); ok {
 			if err := cache.Close(); err != nil {
-				errors = append(errors, err)
+				if name, ok := key.(string); ok {
+					closeErrors = append(closeErrors, newCacheError("close", name, err))
+				} else {
+					closeErrors = append(closeErrors, wrapError("close", err))
+				}
 			}
 		}
 		return true
@@ -138,8 +142,8 @@ func (m *Manager) CloseAll() error {
 		return true
 	})
 
-	if len(errors) > 0 {
-		return fmt.Errorf("errors closing caches: %v", errors)
+	if len(closeErrors) > 0 {
+		return fmt.Errorf("errors closing caches: %v", closeErrors)
 	}
 
 	return nil

@@ -31,7 +31,7 @@ type shard[K comparable, V any] struct {
 // - tail.prev always points to the LRU item (or head if empty)
 //
 // heapIndex is set to -1 to indicate sentinel nodes are not part of LFU heap
-func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
+func (s *shard[K, V]) initLRU() {
 	s.head = &cacheItem[V]{heapIndex: -1}
 	s.tail = &cacheItem[V]{heapIndex: -1}
 	s.head.next = s.tail
@@ -49,7 +49,9 @@ func (c *InMemoryCache[K, V]) initLRU(s *shard[K, V]) {
 // - Items closest to head are most recently used
 // - Items closest to tail are least recently used
 // - New items are always inserted at head position (most recent)
-func (c *InMemoryCache[K, V]) addToLRUHead(s *shard[K, V], item *cacheItem[V]) {
+//
+// Time complexity: O(1) - constant time insertion
+func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext := s.head.next
 	s.head.next = item
 	item.prev = s.head
@@ -57,12 +59,13 @@ func (c *InMemoryCache[K, V]) addToLRUHead(s *shard[K, V], item *cacheItem[V]) {
 	oldNext.prev = item
 }
 
-// removeFromLRU removes an item from the LRU
+// removeFromLRU removes an item from the LRU doubly-linked list
 //
+// Performs standard doubly-linked list deletion:
 // 1. If item has previous node: link prev.next to item.next (bypass item)
 // 2. If item has next node: link next.prev to item.prev (bypass item)
 // 3. Clear item's prev/next pointers to prevent memory leaks and dangling references
-func (c *InMemoryCache[K, V]) removeFromLRU(s *shard[K, V], item *cacheItem[V]) {
+func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
 	if item.prev != nil {
 		item.prev.next = item.next
 	}
@@ -73,31 +76,19 @@ func (c *InMemoryCache[K, V]) removeFromLRU(s *shard[K, V], item *cacheItem[V]) 
 	item.next = nil
 }
 
-// moveToLRUHead promotes an item to most recently used position
-// - Checks if item is already at head position (most recently used)
-// - If so, returns immediately without any list manipulation
-// - Avoids unnecessary pointer updates
+// moveToLRUHead promotes an item to the most recently used position
 //
-// Promotion logic (when item is not at head):
-// 1. Remove item from current position by updating neighboring nodes' pointers
-// 2. Insert item at head position
-func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) {
-	if s.head.next == item {
-		return
-	}
-
-	if item.prev != nil {
-		item.prev.next = item.next
-	}
-	if item.next != nil {
-		item.next.prev = item.prev
-	}
-
-	oldNext := s.head.next
-	s.head.next = item
-	item.prev = s.head
-	item.next = oldNext
-	oldNext.prev = item
+// This is the key operation for LRU cache maintenance - whenever an item
+// is accessed (read or written), it must be moved to the head of the LRU list
+// to mark it as the most recently used.
+//
+// Implementation strategy:
+// - Use composition of existing operations for simplicity and correctness
+// - removeFromLRU(item): removes item from its current position
+// - addToLRUHead(item): inserts item at the head (most recent position)
+func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
+	s.removeFromLRU(item)
+	s.addToLRUHead(item)
 }
 
 // cleanupShard removes expired items from a specific shard
@@ -113,7 +104,7 @@ func (c *InMemoryCache[K, V]) moveToLRUHead(s *shard[K, V], item *cacheItem[V]) 
 // - Removes item: map, LRU list, LFU heap
 // - Returns item to object pool
 // - Updates shard size and expiration statistics
-func (c *InMemoryCache[K, V]) cleanupShard(s *shard[K, V], now int64) {
+func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool *sync.Pool, statsEnabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -127,13 +118,13 @@ func (c *InMemoryCache[K, V]) cleanupShard(s *shard[K, V], now int64) {
 	for _, key := range keysToDelete {
 		if item, exists := s.data[key]; exists {
 			delete(s.data, key)
-			c.removeFromLRU(s, item)
-			if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
+			s.removeFromLRU(item)
+			if evictionPolicy == LFU && item.heapIndex != -1 {
 				heap.Remove(s.lfuHeap, item.heapIndex)
 			}
-			c.itemPool.Put(item)
+			itemPool.Put(item)
 			atomic.AddInt64(&s.size, -1)
-			if c.config.StatsEnabled {
+			if statsEnabled {
 				atomic.AddInt64(&s.expirations, 1)
 			}
 		}
