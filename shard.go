@@ -78,12 +78,9 @@ func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
 
 // moveToLRUHead promotes an item to the most recently used position
 //
-// This is the key operation for LRU cache maintenance - whenever an item
-// is accessed (read or written), it must be moved to the head of the LRU list
-// to mark it as the most recently used.
+// Whenever an item is accessed (read or written),
+// it must be moved to the head of the LRU list to mark it as the most recently used.
 //
-// Implementation strategy:
-// - Use composition of existing operations for simplicity and correctness
 // - removeFromLRU(item): removes item from its current position
 // - addToLRUHead(item): inserts item at the head (most recent position)
 func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
