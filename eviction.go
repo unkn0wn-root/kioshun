@@ -122,15 +122,53 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 	return false
 }
 
+// fifoEvictor implements First In, First Out eviction policy
+//
+// FIFO evicts the item that was inserted earliest (oldest insertion time).
+// Since the LRU list maintains insertion order when items aren't accessed,
+// FIFO behavior is achieved by delegating to LRU eviction.
 type fifoEvictor[K comparable, V any] struct{}
 
+// evict removes the first inserted item from the shard
+//
+// FIFO eviction process:
+// 1. Delegate to LRU evictor since LRU list maintains insertion order
+// 2. The tail of the LRU list contains the oldest inserted item
+// 3. This achieves FIFO behavior without separate tracking
+//
+// FIFO reuses LRU infrastructure because in a cache where items
+// are only inserted (not accessed for reordering), the LRU list
+// naturally maintains FIFO order with oldest items at the tail.
 func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	lruEv := lruEvictor[K, V]{}
 	return lruEv.evict(s, itemPool, statsEnabled)
 }
 
+// randomEvictor implements Random eviction policy
+//
+// Random evicts a randomly selected item from the cache.
+// This provides unpredictable eviction behavior that doesn't favor
+// any particular access pattern.
 type randomEvictor[K comparable, V any] struct{}
 
+// evict removes a randomly selected item from the shard
+//
+// Random eviction process:
+// 1. Check if shard is empty
+// 2. Collect all keys from the hash map
+// 3. Select a random key using current time as seed
+// 4. Remove item from all data structures:
+//   - Hash map (for key lookup)
+//   - LRU linked list (for access ordering)
+//   - LFU heap (if present and item is indexed)
+//
+// 5. Return item to object pool
+// 6. Update size and statistics
+//
+// Randomization strategy:
+// Uses time.Now().UnixNano() as pseudo-random seed to select
+// an index from the keys slice. This provides sufficient
+// randomness for cache eviction purposes.
 func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	if len(s.data) == 0 {
 		return false
@@ -150,9 +188,11 @@ func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEna
 	if item, exists := s.data[randomKey]; exists {
 		delete(s.data, randomKey)
 		s.removeFromLRU(item)
+
 		if s.lfuHeap != nil && item.heapIndex != -1 {
 			heap.Remove(s.lfuHeap, item.heapIndex)
 		}
+
 		itemPool.Put(item)
 		atomic.AddInt64(&s.size, -1)
 		if statsEnabled {
