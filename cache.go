@@ -555,6 +555,13 @@ func (c *InMemoryCache[K, V]) TriggerCleanup() {
 		return
 	}
 
+	// If no background worker is running, do cleanup directly
+	if c.config.CleanupInterval <= 0 {
+		c.cleanup()
+		return
+	}
+
+	// Otherwise, signal the background worker
 	select {
 	case c.cleanupCh <- struct{}{}:
 	default:
