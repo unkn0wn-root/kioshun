@@ -49,8 +49,6 @@ func (s *shard[K, V]) initLRU() {
 // - Items closest to head are most recently used
 // - Items closest to tail are least recently used
 // - New items are always inserted at head position (most recent)
-//
-// Time complexity: O(1) - constant time insertion
 func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext := s.head.next
 	s.head.next = item
@@ -81,11 +79,25 @@ func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
 // Whenever an item is accessed (read or written),
 // it must be moved to the head of the LRU list to mark it as the most recently used.
 //
-// - removeFromLRU(item): removes item from its current position
-// - addToLRUHead(item): inserts item at the head (most recent position)
+// Check if item is already at head position (most recently used)
+// If so, returns immediately without any list manipulation to avoid unnecessary pointer updates
 func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
-	s.removeFromLRU(item)
-	s.addToLRUHead(item)
+	if s.head.next == item {
+		return
+	}
+
+	if item.prev != nil {
+		item.prev.next = item.next
+	}
+	if item.next != nil {
+		item.next.prev = item.prev
+	}
+
+	oldNext := s.head.next
+	s.head.next = item
+	item.prev = s.head
+	item.next = oldNext
+	oldNext.prev = item
 }
 
 // cleanupShard removes expired items from a specific shard
