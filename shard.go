@@ -20,17 +20,8 @@ type shard[K comparable, V any] struct {
 	expirations int64
 }
 
-// initLRU initializes the doubly-linked list for LRU tracking
-//
-// Creates a circular list with sentinel nodes:
-// - head: sentinel node representing the most recently used position
-// - tail: sentinel node representing the least recently used position
-// - Connects head.next -> tail and tail.prev -> head to form empty list
-//
-// - head.next always points to the MRU item (or tail if empty)
-// - tail.prev always points to the LRU item (or head if empty)
-//
-// heapIndex is set to -1 to indicate sentinel nodes are not part of LFU heap
+// initLRU initializes the doubly-linked list for LRU tracking.
+// Creates a circular list with sentinel head and tail nodes.
 func (s *shard[K, V]) initLRU() {
 	s.head = &cacheItem[V]{heapIndex: -1}
 	s.tail = &cacheItem[V]{heapIndex: -1}
@@ -38,17 +29,7 @@ func (s *shard[K, V]) initLRU() {
 	s.tail.prev = s.head
 }
 
-// addToLRUHead inserts an item as the most recently used item in the LRU list
-//
-// Performs list insertion after the head sentinel:
-// 1. Save current first item (head.next) as oldNext
-// 2. Link head -> item: head.next = item, item.prev = head
-// 3. Link item -> oldNext: item.next = oldNext, oldNext.prev = item
-//
-// This maintains the LRU ordering where:
-// - Items closest to head are most recently used
-// - Items closest to tail are least recently used
-// - New items are always inserted at head position (most recent)
+// addToLRUHead inserts an item as the most recently used item.
 func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext := s.head.next
 	s.head.next = item
@@ -57,12 +38,7 @@ func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext.prev = item
 }
 
-// removeFromLRU removes an item from the LRU doubly-linked list
-//
-// Performs standard doubly-linked list deletion:
-// 1. If item has previous node: link prev.next to item.next (bypass item)
-// 2. If item has next node: link next.prev to item.prev (bypass item)
-// 3. Clear item's prev/next pointers to prevent memory leaks and dangling references
+// removeFromLRU removes an item from the LRU doubly-linked list.
 func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
 	if item.prev != nil {
 		item.prev.next = item.next
@@ -74,14 +50,9 @@ func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
 	item.next = nil
 }
 
-// moveToLRUHead promotes an item to the most recently used position
-//
-// Whenever an item is accessed (read or written),
-// it must be moved to the head of the LRU list to mark it as the most recently used.
-//
-// Check if item is already at head position (most recently used)
-// If so, returns immediately without any list manipulation to avoid unnecessary pointer updates
+// moveToLRUHead promotes an item to the most recently used position.
 func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
+	// skip if already at head
 	if s.head.next == item {
 		return
 	}
@@ -100,23 +71,14 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
 	oldNext.prev = item
 }
 
-// cleanupShard removes expired items from a specific shard
-// Phase 1: Collection
-// - Iterates through shard's hash map to identify expired items
-// - Collects keys of expired items into a separate slice
-// - Uses provided timestamp (now)
-// - No modifications to data structures during this phase
-//
-// Phase 2: Removal
-// - Iterates through collected keys and removes each expired item
-// - Double-checks existence and expiration under lock
-// - Removes item: map, LRU list, LFU heap
-// - Returns item to object pool
-// - Updates shard size and expiration statistics
+// cleanup removes expired items from this shard.
+// Items are identified and removed in two phases to avoid
+// modifying the map while iterating over it.
 func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool *sync.Pool, statsEnabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 1: Collect expired keys
 	var keysToDelete []K
 	for key, item := range s.data {
 		if item.expireTime > 0 && now > item.expireTime {
@@ -124,6 +86,7 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 		}
 	}
 
+	// 2: Remove collected items
 	for _, key := range keysToDelete {
 		if item, exists := s.data[key]; exists {
 			delete(s.data, key)

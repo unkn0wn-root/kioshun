@@ -7,52 +7,24 @@ import (
 	"time"
 )
 
-// evictor defines the interface for cache eviction policies
-//
-// Each eviction policy implements a strategy for selecting which item
-// to remove when the cache reaches capacity. The interface provides
-// a unified way to handle different eviction algorithms.
-//
-// Parameters:
-// - s: the shard to evict from
-// - itemPool: object pool for returning evicted items
-// - statsEnabled: whether to update eviction statistics
-//
-// Returns:
-// - bool: true if an item was evicted, false if shard was empty
+// evictor defines the interface for cache eviction policies.
+// Select which item to remove when the cache reaches capacity.
 type evictor[K comparable, V any] interface {
 	evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool
 }
 
-// lruEvictor implements Least Recently Used eviction policy
-//
-// LRU evicts the item that was accessed (read or written) least recently.
-// Always evict the item at the tail of the LRU list
+// lruEvictor implements Least Recently Used eviction policy.
 type lruEvictor[K comparable, V any] struct{}
 
-// evict removes the least recently used item from the shard
-//
-// LRU eviction process:
-// 1. Check if shard is empty (tail.prev == head)
-// 2. Get the LRU item (item at tail.prev)
-// 3. Remove item from all data structures:
-//   - Hash map (for key lookup)
-//   - LRU linked list (for access ordering)
-//
-// 4. Return item to object pool
-// 5. Update size and statistics
-//
-// The LRU item is always at tail.prev because:
-// - New/accessed items are added to head
-// - Older items naturally move toward tail
-// - tail.prev is the oldest accessed item
+// evict removes the least recently used item from the shard.
+// The LRU item is always at tail.prev in the 2-linked list.
 func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	// Check if shard is empty (only sentinel nodes remain)
 	if s.tail.prev == s.head {
 		return false
 	}
 
-	// Get the least recently used item (at tail)
+	// Get the LRU item (at tail of list)
 	lru := s.tail.prev
 	if lru != nil && lru.key != nil {
 		if key, ok := lru.key.(K); ok {
@@ -64,44 +36,25 @@ func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 
 		atomic.AddInt64(&s.size, -1)
 		if statsEnabled {
-			atomic.AddInt64(&s.evictions, 1) // Track eviction event
+			atomic.AddInt64(&s.evictions, 1)
 		}
 		return true
 	}
 	return false
 }
 
-// lfuEvictor implements Least Frequently Used eviction policy
-//
-// LFU evicts the item with the lowest access frequency.
-// Evict the item at the root of the min-heap (lowest frequency)
-// When items have the same frequency, evict the one
-// with the oldest lastAccess time (LRU among equals)
+// lfuEvictor implements Least Frequently Used eviction policy.
 type lfuEvictor[K comparable, V any] struct{}
 
-// evict removes the least frequently used item from the shard
-//
-// LFU eviction process:
-// 1. Check if heap is empty or uninitialized
-// 2. Pop the root item from min-heap (lowest frequency)
-// 3. Remove item from all data structures:
-//   - Hash map (for key lookup)
-//   - LRU linked list (for access ordering)
-//   - LFU heap (already removed by Pop)
-//
-// 4. Return item to object pool
-// 5. Update size and statistics
-//
-// The heap root contains the LFU item because:
-// - Min-heap keeps lowest frequency at root
-// - Frequency is incremented on each access
-// - Ties are broken by lastAccess time (older = higher priority for eviction)
+// evict removes the least frequently used item from the shard.
+// The LFU item is always at the root of the min-heap.
 func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
+	// Check if heap is empty
 	if s.lfuHeap == nil || s.lfuHeap.Len() == 0 {
 		return false
 	}
 
-	// Pop the least frequently used item from heap
+	// Remove the LFU item from heap
 	lfu := heap.Pop(s.lfuHeap).(*cacheItem[V])
 	if lfu.key != nil {
 		if key, ok := lfu.key.(K); ok {
@@ -109,9 +62,7 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 		}
 
 		s.removeFromLRU(lfu)
-
 		itemPool.Put(lfu)
-
 		atomic.AddInt64(&s.size, -1)
 
 		if statsEnabled {
@@ -122,58 +73,26 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 	return false
 }
 
-// fifoEvictor implements First In, First Out eviction policy
-//
-// FIFO evicts the item that was inserted earliest (oldest insertion time).
-// Since the LRU list maintains insertion order when items aren't accessed,
-// FIFO behavior is achieved by delegating to LRU eviction.
+// fifoEvictor implements First In, First Out eviction policy.
 type fifoEvictor[K comparable, V any] struct{}
 
-// evict removes the first inserted item from the shard
-//
-// FIFO eviction process:
-// 1. Delegate to LRU evictor since LRU list maintains insertion order
-// 2. The tail of the LRU list contains the oldest inserted item
-// 3. This achieves FIFO behavior without separate tracking
-//
-// FIFO reuses LRU infrastructure because in a cache where items
-// are only inserted (not accessed for reordering), the LRU list
-// naturally maintains FIFO order with oldest items at the tail.
+// evict removes the first inserted item from the shard.
 func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	lruEv := lruEvictor[K, V]{}
 	return lruEv.evict(s, itemPool, statsEnabled)
 }
 
-// randomEvictor implements Random eviction policy
-//
-// Random evicts a randomly selected item from the cache.
-// This provides unpredictable eviction behavior that doesn't favor
-// any particular access pattern.
+// randomEvictor implements Random eviction policy.
 type randomEvictor[K comparable, V any] struct{}
 
-// evict removes a randomly selected item from the shard
-//
-// Random eviction process:
-// 1. Check if shard is empty
-// 2. Collect all keys from the hash map
-// 3. Select a random key using current time as seed
-// 4. Remove item from all data structures:
-//   - Hash map (for key lookup)
-//   - LRU linked list (for access ordering)
-//   - LFU heap (if present and item is indexed)
-//
-// 5. Return item to object pool
-// 6. Update size and statistics
-//
-// Randomization strategy:
-// Uses time.Now().UnixNano() as pseudo-random seed to select
-// an index from the keys slice. This provides sufficient
-// randomness for cache eviction purposes.
+// evict removes a randomly selected item from the shard.
+// Uses current time as a pseudo-random seed for key selection.
 func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	if len(s.data) == 0 {
 		return false
 	}
 
+	// Collect all keys for random selection
 	keys := make([]K, 0, len(s.data))
 	for key := range s.data {
 		keys = append(keys, key)
@@ -183,6 +102,7 @@ func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEna
 		return false
 	}
 
+	// Select random key using time as seed
 	randomIndex := int(time.Now().UnixNano()) % len(keys)
 	randomKey := keys[randomIndex]
 	if item, exists := s.data[randomKey]; exists {
@@ -203,7 +123,7 @@ func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEna
 	return false
 }
 
-// createEvictor returns an evictor implementation based on the specified policy
+// createEvictor returns an evictor implementation based on the specified policy.
 func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	switch policy {
 	case LRU:
