@@ -5,13 +5,17 @@ import (
 	"math/bits"
 )
 
-// xxHash64 prime for avalanche properties.
+// xxHash64 algorithm constants
 const (
 	prime64_1 = 0x9E3779B185EBCA87
 	prime64_2 = 0xC2B2AE3D27D4EB4F
 	prime64_3 = 0x165667B19E3779F9
 	prime64_4 = 0x85EBCA77C2B2AE63
 	prime64_5 = 0x27D4EB2F165667C5
+
+	// init seeds for accumulator processing
+	seed64_1 = 0x60EA27EEADC0B5D6
+	seed64_4 = 0x61C8864E7A143579
 )
 
 // xxHash64 computes a 64-bit hash of the input string.
@@ -31,12 +35,12 @@ func xxHash64(input string) uint64 {
 	return xxHash64Avalanche(h64)
 }
 
-// xxHash64Large processes input data >= 32 bytes using accumulation.
+// xxHash64Large processes input data >= 32 bytes.
 func xxHash64Large(data []byte, length uint64) uint64 {
-	v1 := uint64(0x60EA27EEADC0B5D6)
-	v2 := uint64(prime64_2)
+	v1 := seed64_1
+	v2 := prime64_2
 	v3 := uint64(0)
-	v4 := uint64(0x61C8864E7A143579)
+	v4 := seed64_4
 
 	for len(data) >= 32 {
 		v1 = xxHash64Round(v1, binary.LittleEndian.Uint64(data[0:8]))
@@ -65,7 +69,6 @@ func xxHash64Small(data []byte, h64 uint64) uint64 {
 }
 
 // xxHash64Round performs a single round of the xxHash algorithm.
-// Combines multiplication, rotation, and addition ops
 func xxHash64Round(acc, input uint64) uint64 {
 	acc += input * prime64_2
 	acc = bits.RotateLeft64(acc, 31)
