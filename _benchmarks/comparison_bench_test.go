@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/unkn0wn-root/kioshun"
+	cache "github.com/unkn0wn-root/kioshun"
 
 	"github.com/allegro/bigcache/v3"
 	"github.com/coocood/freecache"
@@ -230,8 +230,8 @@ func createCaches() map[string]CacheInterface {
 		ShardCount:      runtime.NumCPU() * 4,
 		CleanupInterval: 5 * time.Minute,
 		DefaultTTL:      1 * time.Hour,
-		EvictionPolicy:  cache.LRU,
-		StatsEnabled:    true,
+		EvictionPolicy:  cache.FIFO,
+		StatsEnabled:    false,
 	}
 	caches["kioshun"] = &KioshunWrapper{cache: cache.New[string, []byte](kioshuConfig)}
 
