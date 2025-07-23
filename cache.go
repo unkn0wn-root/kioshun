@@ -143,20 +143,17 @@ func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
 	return c.shards[hash&c.shardMask] // Use bitmask for fast modulo
 }
 
-// Get retrieves a value from the cache.
-// The method acquires different lock types based on eviction policy:
+// get acquires different lock types based on eviction policy:
 // LRU/LFU need write locks to update access order/frequency, FIFO/Random use read locks.
-func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
-	var zero V
+func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	if atomic.LoadInt32(&c.closed) == 1 {
-		return zero, false
+		return nil, 0, false
 	}
 
 	shard := c.getShard(key)
 
 	// LRU and LFU need write locks
 	needsWriteLock := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
-
 	if needsWriteLock {
 		shard.mu.Lock()
 		defer shard.mu.Unlock()
@@ -170,37 +167,12 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 		if c.config.StatsEnabled {
 			atomic.AddInt64(&shard.misses, 1)
 		}
-		return zero, false
+		return nil, 0, false
 	}
 
-	// Items with no expiration
-	if item.expireTime == 0 {
-		// Update based on eviction policy
-		switch c.config.EvictionPolicy {
-		case LRU:
-			shard.moveToLRUHead(item)
-		case LFU:
-			item.lastAccess = time.Now().UnixNano()
-			atomic.AddInt64(&item.frequency, 1)
-			if item.heapIndex != -1 {
-				shard.lfuHeap.update(item)
-			}
-		case FIFO:
-			// FIFO doesn't update on access - maintain insertion order
-		case Random:
-			// Random doesn't need any update
-		}
-
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&shard.hits, 1)
-		}
-
-		return item.value, true
-	}
-
-	// Check if item has expired
+	// Check expiration
 	now := time.Now().UnixNano()
-	if now > item.expireTime {
+	if item.expireTime > 0 && now > item.expireTime {
 		delete(shard.data, key)
 		shard.removeFromLRU(item)
 		if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
@@ -214,7 +186,7 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 			atomic.AddInt64(&shard.misses, 1)
 		}
 
-		return zero, false
+		return nil, now, false
 	}
 
 	// Update based on eviction policy
@@ -227,102 +199,41 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 		if item.heapIndex != -1 {
 			shard.lfuHeap.update(item)
 		}
-	case FIFO:
-	case Random:
+	case FIFO, Random:
+		// FIFO doesn't update on access - maintain insertion order
+		// Random doesn't need any update
 	}
 
 	if c.config.StatsEnabled {
 		atomic.AddInt64(&shard.hits, 1)
 	}
 
+	return item, now, true
+}
+
+// Get retrieves a value from the cache
+func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
+	var zero V
+	item, _, ok := c.get(key)
+	if !ok {
+		return zero, false
+	}
 	return item.value, true
 }
 
 // GetWithTTL retrieves a value along with its remaining TTL
 func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 	var zero V
-	if atomic.LoadInt32(&c.closed) == 1 {
-		return zero, 0, false
-	}
-
-	shard := c.getShard(key)
-
-	needsWriteLock := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
-
-	if needsWriteLock {
-		shard.mu.Lock()
-		defer shard.mu.Unlock()
-	} else {
-		shard.mu.RLock()
-		defer shard.mu.RUnlock()
-	}
-
-	item, exists := shard.data[key]
-	if !exists {
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&shard.misses, 1)
-		}
+	item, now, ok := c.get(key)
+	if !ok {
 		return zero, 0, false
 	}
 
 	if item.expireTime == 0 {
-		switch c.config.EvictionPolicy {
-		case LRU:
-			shard.moveToLRUHead(item)
-		case LFU:
-			item.lastAccess = time.Now().UnixNano()
-			atomic.AddInt64(&item.frequency, 1)
-			if item.heapIndex != -1 {
-				shard.lfuHeap.update(item)
-			}
-		case FIFO:
-		case Random:
-		}
-
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&shard.hits, 1)
-		}
-
 		return item.value, -1, true
 	}
 
-	now := time.Now().UnixNano()
-	if now > item.expireTime {
-		delete(shard.data, key)
-		shard.removeFromLRU(item)
-		if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
-			heap.Remove(shard.lfuHeap, item.heapIndex)
-		}
-		c.itemPool.Put(item)
-		atomic.AddInt64(&shard.size, -1)
-
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&shard.expirations, 1)
-			atomic.AddInt64(&shard.misses, 1)
-		}
-
-		return zero, 0, false
-	}
-
 	ttl := time.Duration(item.expireTime - now)
-
-	switch c.config.EvictionPolicy {
-	case LRU:
-		shard.moveToLRUHead(item)
-	case LFU:
-		item.lastAccess = now
-		atomic.AddInt64(&item.frequency, 1)
-		if item.heapIndex != -1 {
-			shard.lfuHeap.update(item)
-		}
-	case FIFO:
-	case Random:
-	}
-
-	if c.config.StatsEnabled {
-		atomic.AddInt64(&shard.hits, 1)
-	}
-
 	return item.value, ttl, true
 }
 
