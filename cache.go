@@ -23,22 +23,6 @@ const (
 	Random
 )
 
-const (
-	// gratio32 is the golden ratio multiplier for 32-bit integers
-	// (φ - 1) * 2^32, where φ = (1 + √5) / 2 (golden ratio)
-	gratio32 = 0x9e3779b9
-
-	// gratio64 is the same but for 64-bit integers
-	// (φ - 1) * 2^64
-	gratio64 = 0x9e3779b97f4a7c15
-
-	// FNV-1a constants
-	fnvOffset32 = 2166136261
-	fnvPrime32  = 16777619
-	fnvOffset64 = 14695981039346656037
-	fnvPrime64  = 1099511628211
-)
-
 type Cache[K comparable, V any] interface {
 	Set(key K, value V, ttl time.Duration) error
 	Get(key K) (V, bool)

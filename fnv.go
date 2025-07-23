@@ -1,5 +1,11 @@
 package cache
 
+const (
+	// FNV-1a constants
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
+
 // fnvHash64 implements a custom FNV-1a hash algorithm with additional XOR-folding
 //
 // Standard FNV-1a algorithm:
