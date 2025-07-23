@@ -46,10 +46,5 @@ func (h hasher[K]) hashString(s string) uint64 {
 
 // hashInteger computes a 64-bit hash for integer keys using xxHash avalanche mixing.
 func (h hasher[K]) hashInteger(value uint64) uint64 {
-	value ^= value >> 33
-	value *= prime64_2
-	value ^= value >> 29
-	value *= prime64_3
-	value ^= value >> 32
-	return value
+	return xxHash64Avalanche(value)
 }
