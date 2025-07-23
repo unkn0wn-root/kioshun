@@ -78,8 +78,32 @@ type fifoEvictor[K comparable, V any] struct{}
 
 // evict removes the first inserted item from the shard.
 func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
-	lruEv := lruEvictor[K, V]{}
-	return lruEv.evict(s, itemPool, statsEnabled)
+	// Check if shard is empty (only sentinel nodes remain)
+	if s.tail.prev == s.head {
+		return false
+	}
+
+	// Get the oldest item (at tail of list)
+	oldest := s.tail.prev
+	if oldest != nil && oldest.key != nil {
+		if key, ok := oldest.key.(K); ok {
+			delete(s.data, key)
+		}
+		s.removeFromLRU(oldest)
+
+		// Clean up LFU heap if present
+		if s.lfuHeap != nil && oldest.heapIndex != -1 {
+			heap.Remove(s.lfuHeap, oldest.heapIndex)
+		}
+
+		itemPool.Put(oldest)
+		atomic.AddInt64(&s.size, -1)
+		if statsEnabled {
+			atomic.AddInt64(&s.evictions, 1)
+		}
+		return true
+	}
+	return false
 }
 
 // randomEvictor implements Random eviction policy.
