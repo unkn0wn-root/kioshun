@@ -267,9 +267,9 @@ Kioshun uses a sharded architecture to minimize lock contention:
 - **Memory Efficiency**: Object pooling to reduce GC pressure
 
 ### Hash Function Optimization
-- **Integer Keys**: Multiplicative hashing with golden ratio constants
-- **String Keys**: FNV-1a algorithm for fast, lock-free hashing
-- **Other Types**: Fallback to string conversion with FNV-1a
+- **Integer Keys**: xxHash avalanche mixing
+- **String Keys**: Hybrid approach - FNV-1a for short strings (≤8 bytes), xxHash64 for longer strings
+- **Other Types**: Fallback to string conversion with hybrid string hashing
 
 ### Eviction Policy Implementation
 
