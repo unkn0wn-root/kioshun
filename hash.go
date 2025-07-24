@@ -2,6 +2,9 @@ package cache
 
 import "fmt"
 
+// max string byte length for FNV
+const stringByteLength = 8
+
 // hasher provides type-specific hash functions for cache keys.
 type hasher[K comparable] struct{}
 
@@ -19,32 +22,27 @@ func (h hasher[K]) hash(key K) uint64 {
 	case string:
 		return h.hashString(k)
 	case int:
-		return h.hashInteger(uint64(k))
+		return xxHash64Avalanche(uint64(k))
 	case int32:
-		return h.hashInteger(uint64(k))
+		return xxHash64Avalanche(uint64(k))
 	case int64:
-		return h.hashInteger(uint64(k))
+		return xxHash64Avalanche(uint64(k))
 	case uint:
-		return h.hashInteger(uint64(k))
+		return xxHash64Avalanche(uint64(k))
 	case uint32:
-		return h.hashInteger(uint64(k))
+		return xxHash64Avalanche(uint64(k))
 	case uint64:
-		return h.hashInteger(k)
+		return xxHash64Avalanche(k)
 	default:
 		return h.hashString(fmt.Sprintf("%v", k))
 	}
 }
 
 // hashString computes a 64-bit hash for string keys.
-// Short strings (≤8 bytes) use FNV-1a, while longer use xxHash64
+// Short strings use FNV-1a, while longer use xxHash64
 func (h hasher[K]) hashString(s string) uint64 {
-	if len(s) <= 8 {
+	if len(s) <= stringByteLength {
 		return fnvHash64(s)
 	}
 	return xxHash64(s)
-}
-
-// hashInteger computes a 64-bit hash for integer keys using xxHash avalanche mixing.
-func (h hasher[K]) hashInteger(value uint64) uint64 {
-	return xxHash64Avalanche(value)
 }
