@@ -373,3 +373,94 @@ type User struct {
 	Email     string    `json:"email"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// Test that verifies the new Set method's in-place update behavior
+func TestSetInPlaceUpdate(t *testing.T) {
+	config := Config{
+		MaxSize:         100,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      0,
+		EvictionPolicy:  LRU,
+		StatsEnabled:    true,
+	}
+	cache := New[string, string](config)
+	defer cache.Close()
+
+	// Set initial value
+	cache.Set("key1", "value1", time.Hour)
+
+	// Verify initial state
+	if value, found := cache.Get("key1"); !found || value != "value1" {
+		t.Errorf("Expected initial value 'value1', got '%s', found: %v", value, found)
+	}
+
+	// Get the item pointer before update (if we could access it)
+	shard := cache.getShard("key1")
+	shard.mu.RLock()
+	originalItem := shard.data["key1"]
+	shard.mu.RUnlock()
+
+	// Update the same key - should reuse the item
+	cache.Set("key1", "value2", time.Hour)
+
+	// Verify update worked
+	if value, found := cache.Get("key1"); !found || value != "value2" {
+		t.Errorf("Expected updated value 'value2', got '%s', found: %v", value, found)
+	}
+
+	// Check that item was reused (same pointer)
+	shard.mu.RLock()
+	updatedItem := shard.data["key1"]
+	shard.mu.RUnlock()
+
+	if originalItem != updatedItem {
+		t.Error("Expected in-place update to reuse the same cacheItem, but got different pointers")
+	}
+
+	// Verify size didn't change (no new allocation)
+	stats := cache.Stats()
+	if stats.Size != 1 {
+		t.Errorf("Expected size 1 after update, got %d", stats.Size)
+	}
+}
+
+// Test LFU frequency reset behavior on Set
+func TestSetLFUFrequencyReset(t *testing.T) {
+	config := Config{
+		MaxSize:         3,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      0,
+		EvictionPolicy:  LFU,
+		StatsEnabled:    true,
+	}
+	cache := New[string, int](config)
+	defer cache.Close()
+
+	// Add items
+	cache.Set("a", 1, time.Hour)
+	cache.Set("b", 2, time.Hour)
+	cache.Set("c", 3, time.Hour)
+
+	// Access "a" multiple times to increase frequency
+	for i := 0; i < 10; i++ {
+		cache.Get("a")
+	}
+
+	// Access other items less
+	cache.Get("b")
+	cache.Get("c")
+
+	// Update "a" with new value - frequency should reset to 1
+	cache.Set("a", 999, time.Hour)
+
+	// Now add a new item to trigger eviction
+	// "a" should now be evicted since its frequency was reset
+	cache.Set("d", 4, time.Hour)
+
+	// Verify that "a" was evicted (due to frequency reset)
+	if _, found := cache.Get("a"); found {
+		t.Error("Item 'a' should have been evicted after frequency reset")
+	}
+}

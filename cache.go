@@ -238,13 +238,11 @@ func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 }
 
 // Set stores a key-value pair with the specified TTL.
-// The method handles item replacement, capacity management, and eviction policy updates.
 func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
 	}
 
-	// Normalize TTL: 0 means use default
 	if ttl == 0 {
 		ttl = c.config.DefaultTTL
 	}
@@ -252,38 +250,48 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	shard := c.getShard(key)
 	now := time.Now().UnixNano()
 
+	var expireTime int64
+	if ttl > 0 {
+		expireTime = now + ttl.Nanoseconds()
+	}
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if existing, exists := shard.data[key]; exists {
+		// In-place update - reuse existing item
+		existing.value = value
+		existing.lastAccess = now
+		existing.expireTime = expireTime
+
+		switch c.config.EvictionPolicy {
+		case LRU:
+			shard.moveToLRUHead(existing)
+		case LFU:
+			existing.frequency = 1 // Reset frequency for new value
+			if existing.heapIndex != -1 {
+				shard.lfuHeap.update(existing)
+			}
+		case FIFO:
+		case Random:
+		}
+		return nil
+	}
+
+	// Pre-check capacity and evict if needed before allocation
+	maxShardSize := c.config.MaxSize / int64(len(c.shards))
+	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
+		c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
+	}
+
+	// Allocate new item after eviction
 	item := c.itemPool.Get().(*cacheItem[V])
 	item.value = value
 	item.lastAccess = now
 	item.frequency = 1
 	item.key = key
 	item.heapIndex = -1
-
-	if ttl > 0 {
-		item.expireTime = now + ttl.Nanoseconds()
-	} else {
-		item.expireTime = 0
-	}
-
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	// Remove existing item if present
-	if existing, exists := shard.data[key]; exists {
-		shard.removeFromLRU(existing)
-		if c.config.EvictionPolicy == LFU && existing.heapIndex != -1 {
-			heap.Remove(shard.lfuHeap, existing.heapIndex)
-		}
-		c.itemPool.Put(existing)
-		atomic.AddInt64(&shard.size, -1)
-	}
-
-	// Evict if shard exceeds capacity
-	maxShardSize := c.config.MaxSize / int64(len(c.shards))
-	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
-		c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
-	}
-
+	item.expireTime = expireTime
 	shard.data[key] = item
 	shard.addToLRUHead(item)
 
