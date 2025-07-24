@@ -272,8 +272,6 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 			if existing.heapIndex != -1 {
 				shard.lfuHeap.update(existing)
 			}
-		case FIFO:
-		case Random:
 		}
 		return nil
 	}
