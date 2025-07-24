@@ -28,7 +28,7 @@ bench-deps:
 
 .PHONY: bench-runner
 bench-runner: bench-deps
-	cd _benchmarks && go run benchmark_runner.go
+	cd _benchmarks && timeout 600 go run benchmark_runner.go
 
 .PHONY: bench
 bench: bench-deps
