@@ -10,7 +10,7 @@
   [![CI](https://github.com/unkn0wn-root/kioshun/actions/workflows/test.yml/badge.svg)](https://github.com/unkn0wn-root/kioshun/actions)
 
 
-  *Fast, thread-safe, sharded in-memory cache for Go*
+  *(Very) Fast, thread-safe, sharded in-memory cache for Go*
 </div>
 
 ## Table of Contents
