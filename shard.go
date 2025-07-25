@@ -6,6 +6,11 @@ import (
 	"sync/atomic"
 )
 
+const (
+	// sentinel index for LRU list head/tail nodes
+	sentinelIndex = -1
+)
+
 // shard represents a cache partition to reduce lock contention
 type shard[K comparable, V any] struct {
 	mu          sync.RWMutex
@@ -23,8 +28,8 @@ type shard[K comparable, V any] struct {
 // initLRU initializes the doubly-linked list for LRU tracking.
 // Creates a circular list with sentinel head and tail nodes.
 func (s *shard[K, V]) initLRU() {
-	s.head = &cacheItem[V]{heapIndex: noHeapIndex}
-	s.tail = &cacheItem[V]{heapIndex: noHeapIndex}
+	s.head = &cacheItem[V]{heapIndex: sentinelIndex}
+	s.tail = &cacheItem[V]{heapIndex: sentinelIndex}
 	s.head.next = s.tail
 	s.tail.prev = s.head
 }
