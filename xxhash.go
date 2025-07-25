@@ -17,8 +17,8 @@ const (
 	seed64_1 = 0x60EA27EEADC0B5D6
 	seed64_4 = 0x61C8864E7A143579
 
-	// chunk sizes and thresholds
-	largeInputThreshold = 32 // minimum bytes for multi-accumulator
+	// minimum bytes for multi-accumulator
+	largeInputThreshold = 32
 
 	// Rotation amounts for hash mixing
 	roundRotation = 31 // rotation in xxHash64Round
