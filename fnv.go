@@ -1,23 +1,22 @@
 package cache
 
 const (
-	// FNV-1a constants
+	// FNV-1a
 	fnvOffset64 = 14695981039346656037
 	fnvPrime64  = 1099511628211
 )
 
-// fnvHash64 implements a custom FNV-1a hash algorithm with additional XOR-folding
+// fnvHash64 implements FNV-1a hash algorithm with XOR-folding.
 //
 // Standard FNV-1a algorithm:
-// 1. Initialize hash with FNV offset basis (14695981039346656037 for 64-bit)
-// 2. For each byte in input: XOR byte with current hash, then multiply by FNV prime (1099511628211)
-// 3. The XOR-before-multiply order distinguishes FNV-1a from FNV-1 (multiply-before-XOR)
+// 1. Initialize hash with FNV offset basis
+// 2. For each byte: XOR byte with current hash, then multiply by FNV prime
+// 3. XOR-before-multiply order distinguishes FNV-1a from FNV-1
 //
-// Kioshun adds XOR-folding:
-// - Final step: h ^ (h >> 32) combines upper and lower 32 bits
-// - Improves distribution when hash is used in smaller address spaces
-// - Reduces clustering with power-of-2 sizes
-// - Efficient (in our case) for cache shard selection (uses bitmask on lower bits)
+// Kioshun XOR-folding:
+// - Combines upper and lower 32 bits via h ^ (h >> 32)
+// - Better hash distribution for shard selection
+// - Reduces clustering when using power-of-2 table sizes
 func fnvHash64(s string) uint64 {
 	h := uint64(fnvOffset64)
 	for i := 0; i < len(s); i++ {

@@ -2,7 +2,7 @@ package cache
 
 import "fmt"
 
-// max string byte length for FNV
+// threshold for choosing between FNV and xxHash algorithms  
 const stringByteLength = 8
 
 // hasher provides type-specific hash functions for cache keys.

@@ -11,6 +11,16 @@ import (
 const (
 	NoExpiration      time.Duration = -1 // Never expires
 	DefaultExpiration time.Duration = 0  // Use default config value
+
+	// default configuration values
+	defaultMaxSize         = 10000
+	defaultCleanupInterval = 5 * time.Minute
+	defaultTTL             = 30 * time.Minute
+	maxShardCount          = 256
+	shardMultiplier        = 4
+
+	// heap index item is not in heap
+	noHeapIndex = -1
 )
 
 // EvictionPolicy defines the eviction algorithm
@@ -56,10 +66,10 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		MaxSize:         10000,
+		MaxSize:         defaultMaxSize,
 		ShardCount:      0,
-		CleanupInterval: 5 * time.Minute,
-		DefaultTTL:      30 * time.Minute,
+		CleanupInterval: defaultCleanupInterval,
+		DefaultTTL:      defaultTTL,
 		EvictionPolicy:  LRU,
 		StatsEnabled:    true,
 	}
@@ -87,10 +97,10 @@ type InMemoryCache[K comparable, V any] struct {
 func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	shardCount := config.ShardCount
 	if shardCount <= 0 {
-		// Auto-detect based on CPU cores, capped at 256
-		shardCount = runtime.NumCPU() * 4
-		if shardCount > 256 {
-			shardCount = 256
+		// Auto-detect based on CPU cores, capped at maximum
+		shardCount = runtime.NumCPU() * shardMultiplier
+		if shardCount > maxShardCount {
+			shardCount = maxShardCount
 		}
 	}
 
@@ -104,7 +114,7 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		closeCh:   make(chan struct{}),
 		itemPool: sync.Pool{
 			New: func() any {
-				return &cacheItem[V]{heapIndex: -1}
+				return &cacheItem[V]{heapIndex: noHeapIndex}
 			},
 		},
 	}
@@ -143,8 +153,9 @@ func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
 	return c.shards[hash&c.shardMask] // Use bitmask for fast modulo
 }
 
-// get acquires different lock types based on eviction policy:
-// LRU/LFU need write locks to update access order/frequency, FIFO/Random use read locks.
+// get retrieves an item from the cache.
+// LRU/LFU policies require write locks to update access metadata,
+// while FIFO/Random policies only need read locks for retrieval.
 func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return nil, 0, false
@@ -175,7 +186,7 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	if item.expireTime > 0 && now > item.expireTime {
 		delete(shard.data, key)
 		shard.removeFromLRU(item)
-		if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
+		if c.config.EvictionPolicy == LFU && item.heapIndex != noHeapIndex {
 			heap.Remove(shard.lfuHeap, item.heapIndex)
 		}
 		c.itemPool.Put(item)
@@ -196,7 +207,7 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	case LFU:
 		item.lastAccess = now
 		atomic.AddInt64(&item.frequency, 1)
-		if item.heapIndex != -1 {
+		if item.heapIndex != noHeapIndex {
 			shard.lfuHeap.update(item)
 		}
 	case FIFO, Random:
@@ -288,7 +299,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	item.lastAccess = now
 	item.frequency = 1
 	item.key = key
-	item.heapIndex = -1
+	item.heapIndex = noHeapIndex
 	item.expireTime = expireTime
 	shard.data[key] = item
 	shard.addToLRUHead(item)
@@ -354,7 +365,7 @@ func (c *InMemoryCache[K, V]) Delete(key K) bool {
 
 	delete(shard.data, key)
 	shard.removeFromLRU(item)
-	if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
+	if c.config.EvictionPolicy == LFU && item.heapIndex != noHeapIndex {
 		heap.Remove(shard.lfuHeap, item.heapIndex)
 	}
 	c.itemPool.Put(item)
@@ -403,7 +414,7 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 	if item.expireTime > 0 && now > item.expireTime {
 		delete(shard.data, key)
 		shard.removeFromLRU(item)
-		if c.config.EvictionPolicy == LFU && item.heapIndex != -1 {
+		if c.config.EvictionPolicy == LFU && item.heapIndex != noHeapIndex {
 			heap.Remove(shard.lfuHeap, item.heapIndex)
 		}
 		c.itemPool.Put(item)
@@ -581,7 +592,7 @@ func (h *lfuHeap[V]) Pop() any {
 	old := *h
 	n := len(old)
 	item := old[n-1]
-	item.heapIndex = -1
+	item.heapIndex = noHeapIndex
 	*h = old[0 : n-1]
 	return item
 }

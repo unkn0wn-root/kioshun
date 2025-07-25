@@ -23,8 +23,8 @@ type shard[K comparable, V any] struct {
 // initLRU initializes the doubly-linked list for LRU tracking.
 // Creates a circular list with sentinel head and tail nodes.
 func (s *shard[K, V]) initLRU() {
-	s.head = &cacheItem[V]{heapIndex: -1}
-	s.tail = &cacheItem[V]{heapIndex: -1}
+	s.head = &cacheItem[V]{heapIndex: noHeapIndex}
+	s.tail = &cacheItem[V]{heapIndex: noHeapIndex}
 	s.head.next = s.tail
 	s.tail.prev = s.head
 }
@@ -71,9 +71,9 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
 	oldNext.prev = item
 }
 
-// cleanup removes expired items from this shard.
-// Items are identified and removed in two phases to avoid
-// modifying the map while iterating over it.
+// cleanup removes expired items from this shard using a two-phase approach.
+// Phase 1: Collect expired keys to avoid concurrent modification during iteration.
+// Phase 2: Remove collected items and update data structures.
 func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool *sync.Pool, statsEnabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -91,7 +91,7 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 		if item, exists := s.data[key]; exists {
 			delete(s.data, key)
 			s.removeFromLRU(item)
-			if evictionPolicy == LFU && item.heapIndex != -1 {
+			if evictionPolicy == LFU && item.heapIndex != noHeapIndex {
 				heap.Remove(s.lfuHeap, item.heapIndex)
 			}
 			itemPool.Put(item)

@@ -92,7 +92,7 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 		s.removeFromLRU(oldest)
 
 		// Clean up LFU heap if present
-		if s.lfuHeap != nil && oldest.heapIndex != -1 {
+		if s.lfuHeap != nil && oldest.heapIndex != noHeapIndex {
 			heap.Remove(s.lfuHeap, oldest.heapIndex)
 		}
 
@@ -133,7 +133,7 @@ func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEna
 		delete(s.data, randomKey)
 		s.removeFromLRU(item)
 
-		if s.lfuHeap != nil && item.heapIndex != -1 {
+		if s.lfuHeap != nil && item.heapIndex != noHeapIndex {
 			heap.Remove(s.lfuHeap, item.heapIndex)
 		}
 
