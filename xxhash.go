@@ -19,8 +19,6 @@ const (
 
 	// chunk sizes and thresholds
 	largeInputThreshold = 32 // minimum bytes for multi-accumulator
-	chunkSize8          = 8  // 8-byte chunk in finalization
-	chunkSize4          = 4  // 4-byte chunk
 
 	// Rotation amounts for hash mixing
 	roundRotation = 31 // rotation in xxHash64Round
@@ -111,19 +109,19 @@ func xxHash64MergeRound(h64, val uint64) uint64 {
 // Handles 8-byte, 4-byte, and single-byte chunks sequentially,
 // ensuring all input data contributes to the final hash value.
 func xxHash64Finalize(data []byte, h64 uint64) uint64 {
-	for len(data) >= chunkSize8 {
-		k1 := binary.LittleEndian.Uint64(data[0:chunkSize8])
+	for len(data) >= 8 {
+		k1 := binary.LittleEndian.Uint64(data[0:8])
 		k1 = xxHash64Round(0, k1)
 		h64 ^= k1
 		h64 = bits.RotateLeft64(h64, mergeRotation)*prime64_1 + prime64_4
-		data = data[chunkSize8:]
+		data = data[8:]
 	}
 
-	if len(data) >= chunkSize4 {
-		k1 := uint64(binary.LittleEndian.Uint32(data[0:chunkSize4]))
+	if len(data) >= 4 {
+		k1 := uint64(binary.LittleEndian.Uint32(data[0:4]))
 		h64 ^= k1 * prime64_1
 		h64 = bits.RotateLeft64(h64, smallRotation)*prime64_2 + prime64_3
-		data = data[chunkSize4:]
+		data = data[4:]
 	}
 
 	for len(data) > 0 {
