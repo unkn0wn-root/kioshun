@@ -2,7 +2,7 @@ package cache
 
 import "fmt"
 
-// threshold for choosing between FNV and xxHash algorithms  
+// threshold for choosing between FNV and xxHash algorithms
 const stringByteLength = 8
 
 // hasher provides type-specific hash functions for cache keys.
