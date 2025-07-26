@@ -92,12 +92,13 @@ type InMemoryCache[K comparable, V any] struct {
 }
 
 // New creates a new cache instance with the given configuration.
-// Shard count is auto-detected based on CPU cores if not specified,
+// Shard count is auto-detected based on CPU cores (if not specified),
 // and is rounded to the next power of 2 for hash distribution.
 func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	shardCount := config.ShardCount
 	if shardCount <= 0 {
-		// Auto-detect based on CPU cores, capped at maximum
+		// auto-detect based on CPU cores, capped at maximum
+		// multiplier provides more shards than cores to reduce lock contention
 		shardCount = runtime.NumCPU() * shardMultiplier
 		if shardCount > maxShardCount {
 			shardCount = maxShardCount
@@ -105,10 +106,9 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	}
 
 	shardCount = nextPowerOf2(shardCount)
-
 	cache := &InMemoryCache[K, V]{
 		shards:    make([]*shard[K, V], shardCount),
-		shardMask: uint64(shardCount - 1),
+		shardMask: uint64(shardCount - 1), // hash & (shardCount-1) ≡ hash % shardCount
 		config:    config,
 		cleanupCh: make(chan struct{}, 1),
 		closeCh:   make(chan struct{}),
@@ -126,8 +126,10 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		cache.shards[i] = &shard[K, V]{
 			data: make(map[K]*cacheItem[V]),
 		}
+		// LRU list is used for all eviction policies to maintain insertion order
 		cache.shards[i].initLRU()
 
+		// LFU policy requires additional min-heap for frequency-based eviction
 		if config.EvictionPolicy == LFU {
 			h := make(lfuHeap[V], 0)
 			cache.shards[i].lfuHeap = &h
@@ -147,10 +149,11 @@ func NewWithDefaults[K comparable, V any]() *InMemoryCache[K, V] {
 	return New[K, V](DefaultConfig())
 }
 
-// getShard returns the shard for a given key using hash distribution
+// getShard returns the shard for a given key using hash distribution.
+// shardCount is always a power of 2, making shardMask = shardCount-1.
 func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
 	hash := c.hasher.hash(key)
-	return c.shards[hash&c.shardMask] // Use bitmask for fast modulo
+	return c.shards[hash&c.shardMask] // hash & (2^n - 1) ≡ hash % 2^n
 }
 
 // get retrieves an item from the cache.
@@ -163,7 +166,8 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 
 	shard := c.getShard(key)
 
-	// LRU and LFU need write locks
+	// LRU/LFU policies require write access to update metadata,
+	// while FIFO/Random use read locks since they don't update on access
 	needsWriteLock := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
 	if needsWriteLock {
 		shard.mu.Lock()
@@ -181,11 +185,12 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 		return nil, 0, false
 	}
 
-	// Check expiration
+	// Lazy expiration: remove expired items during access instead of background scan
 	now := time.Now().UnixNano()
 	if item.expireTime > 0 && now > item.expireTime {
 		delete(shard.data, key)
 		shard.removeFromLRU(item)
+		// Remove from LFU heap if present (heapIndex tracks heap membership)
 		if c.config.EvictionPolicy == LFU && item.heapIndex != noHeapIndex {
 			heap.Remove(shard.lfuHeap, item.heapIndex)
 		}
@@ -200,19 +205,17 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 		return nil, now, false
 	}
 
-	// Update based on eviction policy
 	switch c.config.EvictionPolicy {
 	case LRU:
+		// Move to head (most recently used position)
 		shard.moveToLRUHead(item)
 	case LFU:
 		item.lastAccess = now
 		atomic.AddInt64(&item.frequency, 1)
+		// Reheapify to maintain min-heap property after frequency change
 		if item.heapIndex != noHeapIndex {
 			shard.lfuHeap.update(item)
 		}
-	case FIFO, Random:
-		// FIFO doesn't update on access - maintain insertion order
-		// Random doesn't need any update
 	}
 
 	if c.config.StatsEnabled {
@@ -275,11 +278,16 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		existing.lastAccess = now
 		existing.expireTime = expireTime
 
+		// Update access patterns for in-place value replacement
 		switch c.config.EvictionPolicy {
 		case LRU:
+			// promote to most recently used position
 			shard.moveToLRUHead(existing)
 		case LFU:
-			existing.frequency = 1 // Reset frequency for new value
+			// reset frequency counter for new value.
+			// we do not want to preserve last frequanency since this is a new value
+			// reusing the same key so set freq. to 1
+			existing.frequency = 1
 			if existing.heapIndex != -1 {
 				shard.lfuHeap.update(existing)
 			}
@@ -287,23 +295,26 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		return nil
 	}
 
-	// Pre-check capacity and evict if needed before allocation
+	// Proactive eviction: check capacity before allocation to prevent oversized shards
+	// Distribute total capacity evenly across shards
 	maxShardSize := c.config.MaxSize / int64(len(c.shards))
 	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
 		c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
 	}
 
-	// Allocate new item after eviction
+	// Allocate from pool after eviction to ensure space availability
 	item := c.itemPool.Get().(*cacheItem[V])
 	item.value = value
 	item.lastAccess = now
-	item.frequency = 1
+	item.frequency = 1 // Start with access count of 1
 	item.key = key
-	item.heapIndex = noHeapIndex
+	item.heapIndex = noHeapIndex // Will be set by heap.Push if needed
 	item.expireTime = expireTime
-	shard.data[key] = item
-	shard.addToLRUHead(item)
 
+	shard.data[key] = item
+	shard.addToLRUHead(item) // Add to LRU list head (most recently used position)
+
+	// For LFU policy, also add to min-heap for frequency-based eviction
 	if c.config.EvictionPolicy == LFU {
 		heap.Push(shard.lfuHeap, item)
 	}
