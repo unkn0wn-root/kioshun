@@ -39,11 +39,12 @@ func (m *Manager) RegisterCache(name string, config Config) error {
 // GetCache retrieves an existing cache or creates a new one with the registered
 // configuration. If no configuration is registered, uses DefaultConfig().
 func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V], error) {
-	// Fast path: return existing cache if found
+	// Fast path: return existing cache if found (most common case)
 	if cached, ok := m.caches.Load(name); ok {
 		if cache, ok := cached.(*InMemoryCache[K, V]); ok {
 			return cache, nil
 		}
+		// Type mismatch: cache exists but with different generic parameters
 		return nil, newCacheError("get", name, ErrTypeMismatch)
 	}
 
@@ -57,10 +58,13 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 
 	// Slow path: create new cache
 	cache := New[K, V](config)
-	// Handle race condition where another goroutine creates the same cache
+	// Atomic LoadOrStore handles race condition where multiple goroutines
+	// attempt to create the same cache simultaneously
 	if actual, loaded := m.caches.LoadOrStore(name, cache); loaded {
-		// Another goroutine won the race, close our cache and use theirs
+		// Another goroutine created the cache first
+		// Clean up our unused cache to prevent resource leaks
 		cache.Close()
+		// Return the winner's cache if types match
 		if existingCache, ok := actual.(*InMemoryCache[K, V]); ok {
 			return existingCache, nil
 		}
@@ -87,9 +91,11 @@ func (m *Manager) GetCacheStats() map[string]Stats {
 }
 
 // CloseAll closes all managed cache instances and returns any errors encountered.
+// Uses two-phase approach: first close all caches, then clear the registry.
 func (m *Manager) CloseAll() error {
 	var closeErrors []error
 
+	// Phase 1: Close all cache instances
 	m.caches.Range(func(key, value any) bool {
 		if cache, ok := value.(interface{ Close() error }); ok {
 			if err := cache.Close(); err != nil {
@@ -100,12 +106,13 @@ func (m *Manager) CloseAll() error {
 				}
 			}
 		}
-		return true
+		return true // Continue iteration
 	})
 
+	// Phase 2: Clear all registry entries
 	m.caches.Range(func(key, value any) bool {
 		m.caches.Delete(key)
-		return true
+		return true // Continue iteration
 	})
 
 	if len(closeErrors) > 0 {
@@ -116,7 +123,9 @@ func (m *Manager) CloseAll() error {
 }
 
 // RemoveCache removes and closes the named cache instance.
+// Removes from registry and cleans up both runtime and configuration state.
 func (m *Manager) RemoveCache(name string) error {
+	// Atomically remove from active cache registry
 	if cached, ok := m.caches.LoadAndDelete(name); ok {
 		if cache, ok := cached.(interface{ Close() error }); ok {
 			return cache.Close()

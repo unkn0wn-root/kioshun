@@ -27,41 +27,50 @@ type shard[K comparable, V any] struct {
 
 // initLRU initializes the doubly-linked list for LRU tracking.
 // Creates a circular list with sentinel head and tail nodes.
+// Sentinel nodes eliminate null pointer checks during insertion/removal operations.
 func (s *shard[K, V]) initLRU() {
 	s.head = &cacheItem[V]{heapIndex: sentinelIndex}
 	s.tail = &cacheItem[V]{heapIndex: sentinelIndex}
+	// Initialize circular structure: head <-> tail
 	s.head.next = s.tail
 	s.tail.prev = s.head
 }
 
 // addToLRUHead inserts an item as the most recently used item.
+// Performs doubly-linked list insertion between head sentinel and first real node.
 func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext := s.head.next
+	// Update forward pointers: head -> item -> oldNext
 	s.head.next = item
-	item.prev = s.head
 	item.next = oldNext
+	// Update backward pointers: head <- item <- oldNext
+	item.prev = s.head
 	oldNext.prev = item
 }
 
 // removeFromLRU removes an item from the LRU doubly-linked list.
+// Updates adjacent nodes to bypass the removed item, maintaining list integrity.
 func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
+	// Bridge the gap: prev -> next (skip item)
 	if item.prev != nil {
 		item.prev.next = item.next
 	}
 	if item.next != nil {
 		item.next.prev = item.prev
 	}
+	// Clear item's pointers to prevent memory leaks and stale references
 	item.prev = nil
 	item.next = nil
 }
 
 // moveToLRUHead promotes an item to the most recently used position.
+// skip operation if item is already at head.
 func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
-	// skip if already at head
 	if s.head.next == item {
 		return
 	}
 
+	// Step 1: Remove item from current position
 	if item.prev != nil {
 		item.prev.next = item.next
 	}
@@ -69,6 +78,7 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
 		item.next.prev = item.prev
 	}
 
+	// Step 2: Insert at head position
 	oldNext := s.head.next
 	s.head.next = item
 	item.prev = s.head

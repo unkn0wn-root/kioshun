@@ -15,8 +15,8 @@ func newHasher[K comparable]() hasher[K] {
 }
 
 // hash returns a 64-bit hash value for the given key based on its type.
-// String keys are processed using xxHash64, integer types use avalanche mixing,
-// and other comparable types are converted to strings before hashing.
+// integers get avalanche mixing for distribution,
+// strings use length-based algorithm selection, others fall back to string conversion.
 func (h hasher[K]) hash(key K) uint64 {
 	switch k := any(key).(type) {
 	case string:
@@ -38,8 +38,9 @@ func (h hasher[K]) hash(key K) uint64 {
 	}
 }
 
-// hashString computes a 64-bit hash for string keys.
-// Short strings use FNV-1a, while longer use xxHash64
+// hashString computes a 64-bit hash for string keys using length-based selection.
+// Short strings (≤8 bytes): FNV-1a is faster due to simpler operations
+// Long strings (>8 bytes): xxHash64 provides better collision resistance and parallelism
 func (h hasher[K]) hashString(s string) uint64 {
 	if len(s) <= stringByteLength {
 		return fnvHash64(s)

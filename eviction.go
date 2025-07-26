@@ -17,24 +17,24 @@ type evictor[K comparable, V any] interface {
 type lruEvictor[K comparable, V any] struct{}
 
 // evict removes the least recently used item from the shard.
-// The LRU item is always at tail.prev in the 2-linked list.
+// LRU policy: the item at tail.prev is least recently accessed.
 func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	// Check if shard is empty (only sentinel nodes remain)
 	if s.tail.prev == s.head {
 		return false
 	}
 
-	// Get the LRU item (at tail of list)
+	// Get the LRU item (closest to tail sentinel)
 	lru := s.tail.prev
 	if lru != nil && lru.key != nil {
 		if key, ok := lru.key.(K); ok {
 			delete(s.data, key)
 		}
+
 		s.removeFromLRU(lru)
-
 		itemPool.Put(lru)
-
 		atomic.AddInt64(&s.size, -1)
+
 		if statsEnabled {
 			atomic.AddInt64(&s.evictions, 1)
 		}
@@ -47,14 +47,14 @@ func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 type lfuEvictor[K comparable, V any] struct{}
 
 // evict removes the least frequently used item from the shard.
-// The LFU item is always at the root of the min-heap.
+// LFU policy: min-heap root contains the item with lowest access frequency.
 func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	// Check if heap is empty
 	if s.lfuHeap == nil || s.lfuHeap.Len() == 0 {
 		return false
 	}
 
-	// Remove the LFU item from heap
+	// Pop minimum frequency item (heap root)
 	lfu := heap.Pop(s.lfuHeap).(*cacheItem[V])
 	if lfu.key != nil {
 		if key, ok := lfu.key.(K); ok {
@@ -77,13 +77,14 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 type fifoEvictor[K comparable, V any] struct{}
 
 // evict removes the first inserted item from the shard.
+// FIFO policy: treats the LRU list as insertion-order queue (oldest at tail).
 func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	// Check if shard is empty (only sentinel nodes remain)
 	if s.tail.prev == s.head {
 		return false
 	}
 
-	// Get the oldest item (at tail of list)
+	// Get the oldest item (first inserted, now at tail)
 	oldest := s.tail.prev
 	if oldest != nil && oldest.key != nil {
 		if key, ok := oldest.key.(K); ok {
@@ -91,7 +92,7 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 		}
 		s.removeFromLRU(oldest)
 
-		// Clean up LFU heap if present
+		// Clean up LFU heap (if exist)
 		if s.lfuHeap != nil && oldest.heapIndex != noHeapIndex {
 			heap.Remove(s.lfuHeap, oldest.heapIndex)
 		}
@@ -110,13 +111,13 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 type randomEvictor[K comparable, V any] struct{}
 
 // evict removes a randomly selected item from the shard.
-// Uses current time as a pseudo-random seed for key selection.
+// Random policy: uses time-based pseudo-randomness for cache-oblivious eviction.
 func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	if len(s.data) == 0 {
 		return false
 	}
 
-	// Collect all keys for random selection
+	// Collect all keys for random selection - (O(n) space/time)
 	keys := make([]K, 0, len(s.data))
 	for key := range s.data {
 		keys = append(keys, key)
@@ -126,7 +127,8 @@ func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEna
 		return false
 	}
 
-	// Select random key using time as seed
+	// "Pseudo-random" selection using nanosecond timestamp
+	// @todo- could we do this better?
 	randomIndex := int(time.Now().UnixNano()) % len(keys)
 	randomKey := keys[randomIndex]
 	if item, exists := s.data[randomKey]; exists {
