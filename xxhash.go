@@ -7,7 +7,6 @@ import (
 
 // xxHash64 algorithm constants
 const (
-	// Prime constants - large odd primes for multiplication mixing
 	prime64_1 = 0x9E3779B185EBCA87 // Primary mixing prime
 	prime64_2 = 0xC2B2AE3D27D4EB4F // 2nd prime for different bit patterns
 	prime64_3 = 0x165667B19E3779F9 // 3rd prime for avalanche mixing
@@ -25,18 +24,15 @@ const (
 
 	largeInputThreshold = 32 // Switches to 4-accumulator mode for inputs ≥32 bytes
 
-	// Rotation amounts
 	roundRotation = 31 // Primary mixing rotation in accumulator rounds
 	mergeRotation = 27 // Merge phase rotation for 8-byte chunks
 	smallRotation = 23 // Finalization rotation for 4-byte chunks
 	tinyRotation  = 11 // Single-byte processing rotation
 
-	// Multi-stage avalanche XOR-shifts eliminate linear dependencies
 	avalancheShift1 = 33 // 1st XOR-shift destroys high-bit patterns
 	avalancheShift2 = 29 // 2nd XOR-shift affects middle bits
 	avalancheShift3 = 32 // Final shift ensures low-bit mixing
 
-	// Accumulator combination rotation amounts
 	v1Rotation = 1  // Rotation for v1 when combining accumulators
 	v2Rotation = 7  // Rotation for v2 when combining accumulators
 	v3Rotation = 12 // Rotation for v3 when combining accumulators
@@ -122,7 +118,6 @@ func xxHash64MergeRound(h64, val uint64) uint64 {
 // Uses different processing patterns for 8-byte, 4-byte, and 1-byte chunks
 // to ensure all input bits contribute to the final hash value.
 func xxHash64Finalize(data []byte, h64 uint64) uint64 {
-	// 8-byte chunks
 	for len(data) >= 8 {
 		k1 := binary.LittleEndian.Uint64(data[0:8])
 		k1 = xxHash64Round(0, k1)
@@ -131,7 +126,6 @@ func xxHash64Finalize(data []byte, h64 uint64) uint64 {
 		data = data[8:]
 	}
 
-	// 4-byte chunk
 	if len(data) >= 4 {
 		k1 := uint64(binary.LittleEndian.Uint32(data[0:4]))
 		h64 ^= k1 * prime64_1

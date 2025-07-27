@@ -272,7 +272,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	defer shard.mu.Unlock()
 
 	if existing, exists := shard.data[key]; exists {
-		// reuse existing item
+		// in-place update: reuse existing item
 		existing.value = value
 		existing.lastAccess = now
 		existing.expireTime = expireTime
