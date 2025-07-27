@@ -64,7 +64,7 @@ func HPCacheConfig() Config {
 		CleanupInterval: 1 * time.Hour,
 		DefaultTTL:      6 * time.Hour,
 		EvictionPolicy:  LRU,
-		StatsEnabled:    true,
+		StatsEnabled:    false,
 	}
 }
 

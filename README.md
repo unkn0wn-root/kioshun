@@ -208,30 +208,30 @@ import (
     "fmt"
     "time"
 
-    "github.com/unkn0wn-root/kioshun"
+    cache "github.com/unkn0wn-root/kioshun"
 )
 
 func main() {
     // Create cache with default configuration
-    cache := cache.NewWithDefaults[string, string]()
-    defer cache.Close()
+    c := cache.NewWithDefaults[string, string]()
+    defer c.Close()
 
     // Set with default TTL (30 min)
-    cache.Set("user:123", "David Nice", kioshun.DefaultExpiration)
+    c.Set("user:123", "David Nice", cache.DefaultExpiration)
 
     // Set with no expiration
-    cache.Set("user:123", "David Nice", kioshun.NoExpiration)
+    c.Set("user:123", "David Nice", cache.NoExpiration)
 
     // Set value with custom TTL
-    cache.Set("user:123", "David Nice", 5*time.Minute)
+    c.Set("user:123", "David Nice", 5*time.Minute)
 
     // Get value
-    if value, found := cache.Get("user:123"); found {
+    if value, found := c.Get("user:123"); found {
         fmt.Printf("User: %s\n", value)
     }
 
     // Get cache statistics
-    stats := cache.Stats()
+    stats := c.Stats()
     fmt.Printf("Hit ratio: %.2f%%\n", stats.HitRatio*100)
 }
 ```
@@ -255,6 +255,8 @@ cache := cache.New[string, any](config)
 
 ### Predefined Configurations
 
+Kioshun provides several preset configurations for common use cases. These presets combine appropriate settings for cache size, shard count, cleanup intervals, TTL, and eviction policies based on typical usage patterns.
+
 ```go
 // For session storage
 sessionCache := cache.New[string, Session](cache.SessionCacheConfig())
@@ -267,6 +269,15 @@ tempCache := cache.New[string, any](cache.TemporaryCacheConfig())
 
 // For persistent data
 persistentCache := cache.New[string, any](cache.PersistentCacheConfig())
+
+// For user data caching
+userCache := cache.New[string, User](cache.UserCacheConfig())
+
+// For high-performance scenarios
+hpCache := cache.New[string, any](cache.HPCacheConfig())
+
+// For memory-constrained env.
+lowMemCache := cache.New[string, any](cache.LowMemoryCacheConfig())
 ```
 
 ## Architecture
@@ -295,8 +306,8 @@ Kioshun uses a sharded architecture to minimize lock contention:
 - **Memory Efficiency**: Object pooling to reduce GC pressure
 
 ### Hash Function Optimization
-- **Integer Keys**: xxHash avalanche mixing
-- **String Keys**: Hybrid approach - FNV-1a for short strings (≤8 bytes), xxHash64 for longer strings
+- **Integer Keys**: xxHash64 avalanche mixing for optimal distribution
+- **String Keys**: FNV-1a for short strings (≤8 bytes), xxHash64 for longer strings (>8 bytes)
 - **Other Types**: Fallback to string conversion with hybrid string hashing
 
 ### Eviction Policy Implementation
@@ -321,13 +332,24 @@ Uses min-heap for efficient frequency-based eviction:
 Items      Items        Items        Items
 ```
 
+#### FIFO (First In, First Out)
+- **Access**: No updates required on access
+- **Eviction**: Remove oldest item (at tail) in O(1)
+- **Memory**: Minimal overhead per item
+
+#### Random Eviction
+- **Access**: No updates required on access
+- **Eviction**: Randomly select item using time-based pseudo-randomness in O(n)
+- **Memory**: No additional overhead per item
+- **Algorithm**: Uses `time.Now().UnixNano() % len(keys)` for selection
+
 **Eviction Algorithm Comparison:**
-| Policy | Access Time | Eviction Time | Memory Overhead |
-|--------|-------------|---------------|-----------------|
-| LRU    | O(1)        | O(1)          | Low            |
-| LFU    | O(log n)    | O(log n)      | Medium         |
-| FIFO   | O(1)        | O(1)          | Low            |
-| Random | O(1)        | O(1)          | Low            |
+| Policy | Access Time | Eviction Time | Memory Overhead | Best Use Case |
+|--------|-------------|---------------|-----------------|---------------|
+| LRU    | O(1)        | O(1)          | Low            | General purpose |
+| LFU    | O(log n)    | O(log n)      | Medium         | Frequency-based access |
+| FIFO   | O(1)        | O(1)          | Low            | Simple time-based |
+| Random | O(1)        | O(n)          | Low            | Cache-oblivious workloads |
 
 ### Concurrent Access Patterns
 The sharded design enables high-throughput concurrent access:
@@ -369,7 +391,7 @@ cache.GetWithTTL(key) (value, ttl time.Duration, found bool)
 // Delete removes a key
 cache.Delete(key) bool
 
-// Exists checks if a key exists
+// Exists checks if a key exists without updating access time
 cache.Exists(key) bool
 
 // Clear removes all items
@@ -385,11 +407,11 @@ cache.Stats() Stats
 cache.Close() error
 ```
 
-### Other
+### Advanced
 
 ```go
 // Set with expiration callback
-cache.SetWithCallback(key, value, ttl, callback func(key, value))
+cache.SetWithCallback(key, value, ttl, callback func(key, value)) error
 
 // Get all keys (expensive operation)
 cache.Keys() []K
@@ -426,7 +448,7 @@ config.ShardCount = 16
 middleware := cache.NewHTTPCacheMiddleware(config)
 defer middleware.Close()
 
-// ⚠IMPORTANT: Enable invalidation if needed
+// IMPORTANT: Enable invalidation if needed
 // middleware.SetKeyGenerator(cache.KeyWithoutQuery())
 
 // Use with any HTTP framework
