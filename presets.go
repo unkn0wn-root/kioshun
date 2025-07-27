@@ -63,7 +63,7 @@ func HPCacheConfig() Config {
 		ShardCount:      64,
 		CleanupInterval: 1 * time.Hour,
 		DefaultTTL:      6 * time.Hour,
-		EvictionPolicy:  LRU,
+		EvictionPolicy:  SampledLFU,
 		StatsEnabled:    false,
 	}
 }

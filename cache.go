@@ -31,6 +31,7 @@ const (
 	LFU
 	FIFO
 	Random
+	SampledLFU
 )
 
 type Cache[K comparable, V any] interface {
@@ -56,22 +57,24 @@ type Stats struct {
 }
 
 type Config struct {
-	MaxSize         int64          // Maximum number of items (0 = unlimited)
-	ShardCount      int            // Number of shards (0 = auto-detect)
-	CleanupInterval time.Duration  // How often to run cleanup (0 = no cleanup)
-	DefaultTTL      time.Duration  // Default TTL for items (0 = no expiration)
-	EvictionPolicy  EvictionPolicy // Eviction algorithm
-	StatsEnabled    bool           // Enable statistics collection
+	MaxSize                int64          // Maximum number of items (0 = unlimited)
+	ShardCount             int            // Number of shards (0 = auto-detect)
+	CleanupInterval        time.Duration  // How often to run cleanup (0 = no cleanup)
+	DefaultTTL             time.Duration  // Default TTL for items (0 = no expiration)
+	EvictionPolicy         EvictionPolicy // Eviction algorithm
+	StatsEnabled           bool           // Enable statistics collection
+	AdmissionResetInterval time.Duration  // Timeout for SampledLFU
 }
 
 func DefaultConfig() Config {
 	return Config{
-		MaxSize:         defaultMaxSize,
-		ShardCount:      0,
-		CleanupInterval: defaultCleanupInterval,
-		DefaultTTL:      defaultTTL,
-		EvictionPolicy:  LRU,
-		StatsEnabled:    true,
+		MaxSize:                defaultMaxSize,
+		ShardCount:             0,
+		CleanupInterval:        defaultCleanupInterval,
+		DefaultTTL:             defaultTTL,
+		EvictionPolicy:         LRU,
+		StatsEnabled:           true,
+		AdmissionResetInterval: 1 * time.Minute,
 	}
 }
 
@@ -122,6 +125,8 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	cache.hasher = newHasher[K]()
 	cache.evictor = createEvictor[K, V](config.EvictionPolicy)
 
+	shardMaxSize := config.MaxSize / int64(shardCount)
+
 	for i := 0; i < shardCount; i++ {
 		cache.shards[i] = &shard[K, V]{
 			data: make(map[K]*cacheItem[V]),
@@ -134,6 +139,20 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 			h := make(lfuHeap[V], 0)
 			cache.shards[i].lfuHeap = &h
 			heap.Init(cache.shards[i].lfuHeap)
+		}
+
+		if config.EvictionPolicy == SampledLFU && shardMaxSize > 0 {
+			// Each shard gets proportional bloom filter size
+			bloomBits := uint64(shardMaxSize * 10) // 10 bits per item for ~1% FPR
+			if bloomBits < 1024 {
+				bloomBits = 1024 // Minimum 1KB per shard
+			}
+
+			resetInterval := config.AdmissionResetInterval
+			if resetInterval == 0 {
+				resetInterval = 1 * time.Minute
+			}
+			cache.shards[i].admission = newAdmissionFilter(bloomBits, resetInterval)
 		}
 	}
 
@@ -215,6 +234,9 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 		if item.heapIndex != noHeapIndex {
 			shard.lfuHeap.update(item)
 		}
+	case SampledLFU:
+		item.lastAccess = now
+		atomic.AddInt64(&item.frequency, 1)
 	}
 
 	if c.config.StatsEnabled {
@@ -288,6 +310,8 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 			if existing.heapIndex != -1 {
 				shard.lfuHeap.update(existing)
 			}
+		case SampledLFU:
+			existing.frequency = 1
 		}
 		return nil
 	}
@@ -296,6 +320,13 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	// Distribute total capacity evenly across shards
 	maxShardSize := c.config.MaxSize / int64(len(c.shards))
 	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
+		if c.config.EvictionPolicy == SampledLFU && shard.admission != nil {
+			keyHash := c.hasher.hash(key)
+			if !shard.admission.shouldAdmit(keyHash) {
+				// Reject this item to prevent cache pollution
+				return nil
+			}
+		}
 		c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
 	}
 
@@ -398,6 +429,10 @@ func (c *InMemoryCache[K, V]) Clear() {
 		shard.initLRU()
 		if c.config.EvictionPolicy == LFU {
 			*shard.lfuHeap = (*shard.lfuHeap)[:0]
+		}
+		if c.config.EvictionPolicy == SampledLFU && shard.admission != nil {
+			shard.admission.doorkeeper.reset()
+			shard.admission.lastReset = time.Now().UnixNano()
 		}
 		atomic.StoreInt64(&shard.size, 0)
 		shard.mu.Unlock()

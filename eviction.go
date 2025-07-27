@@ -144,6 +144,69 @@ func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEna
 	return false
 }
 
+// sampledLFUEvictor implements approximate LFU eviction.
+// uses random sampling instead of exact heap maintenance.
+type sampledLFUEvictor[K comparable, V any] struct {
+	sampleSize int
+}
+
+// evict removes the least frequently used item from a random sample.
+func (e sampledLFUEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
+	if len(s.data) == 0 {
+		return false
+	}
+
+	// Determine sample size
+	sampleSize := e.sampleSize
+	if sampleSize <= 0 {
+		sampleSize = 5
+	}
+	if sampleSize > 20 {
+		sampleSize = 20
+	}
+	if sampleSize > len(s.data) {
+		sampleSize = len(s.data)
+	}
+
+	var sample []*cacheItem[V]
+	count := 0
+	for _, item := range s.data {
+		if count >= sampleSize {
+			break
+		}
+		sample = append(sample, item)
+		count++
+	}
+
+	if len(sample) == 0 {
+		return false
+	}
+
+	// Find least frequent item in sample
+	lfu := sample[0]
+	for _, item := range sample[1:] {
+		if item.frequency < lfu.frequency ||
+			(item.frequency == lfu.frequency && item.lastAccess < lfu.lastAccess) {
+			lfu = item
+		}
+	}
+
+	// Evict the selected item
+	if lfu.key != nil {
+		if key, ok := lfu.key.(K); ok {
+			delete(s.data, key)
+		}
+		s.removeFromLRU(lfu)
+		itemPool.Put(lfu)
+		atomic.AddInt64(&s.size, -1)
+		if statsEnabled {
+			atomic.AddInt64(&s.evictions, 1)
+		}
+		return true
+	}
+	return false
+}
+
 // createEvictor returns an evictor implementation based on the specified policy.
 func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	switch policy {
@@ -155,6 +218,8 @@ func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 		return fifoEvictor[K, V]{}
 	case Random:
 		return randomEvictor[K, V]{}
+	case SampledLFU:
+		return sampledLFUEvictor[K, V]{sampleSize: 5}
 	default:
 		return lruEvictor[K, V]{} // Safe default
 	}

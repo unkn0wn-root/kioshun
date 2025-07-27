@@ -23,6 +23,7 @@ type shard[K comparable, V any] struct {
 	misses      int64
 	evictions   int64
 	expirations int64
+	admission   *admissionFilter
 }
 
 // initLRU initializes the doubly-linked list for LRU tracking.

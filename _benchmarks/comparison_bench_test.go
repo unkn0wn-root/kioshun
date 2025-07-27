@@ -230,7 +230,7 @@ func createCaches() map[string]CacheInterface {
 		ShardCount:      runtime.NumCPU() * 4,
 		CleanupInterval: 5 * time.Minute,
 		DefaultTTL:      1 * time.Hour,
-		EvictionPolicy:  cache.FIFO,
+		EvictionPolicy:  cache.SampledLFU,
 		StatsEnabled:    false,
 	}
 	caches["kioshun"] = &KioshunWrapper{cache: cache.New[string, []byte](kioshuConfig)}
