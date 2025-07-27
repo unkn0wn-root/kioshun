@@ -40,10 +40,10 @@ func (s *shard[K, V]) initLRU() {
 // Performs doubly-linked list insertion between head sentinel and first real node.
 func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext := s.head.next
-	// Update forward pointers: head -> item -> oldNext
+	// forward pointers: head -> item -> oldNext
 	s.head.next = item
 	item.next = oldNext
-	// Update backward pointers: head <- item <- oldNext
+	// backward pointers: head <- item <- oldNext
 	item.prev = s.head
 	oldNext.prev = item
 }
@@ -58,7 +58,6 @@ func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
 	if item.next != nil {
 		item.next.prev = item.prev
 	}
-	// Clear item's pointers to prevent memory leaks and stale references
 	item.prev = nil
 	item.next = nil
 }
@@ -69,8 +68,6 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
 	if s.head.next == item {
 		return
 	}
-
-	// Step 1: Remove item from current position
 	if item.prev != nil {
 		item.prev.next = item.next
 	}
@@ -78,7 +75,6 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
 		item.next.prev = item.prev
 	}
 
-	// Step 2: Insert at head position
 	oldNext := s.head.next
 	s.head.next = item
 	item.prev = s.head
@@ -93,7 +89,6 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 1: Collect expired keys
 	var keysToDelete []K
 	for key, item := range s.data {
 		if item.expireTime > 0 && now > item.expireTime {
@@ -101,7 +96,6 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 		}
 	}
 
-	// 2: Remove collected items
 	for _, key := range keysToDelete {
 		if item, exists := s.data[key]; exists {
 			delete(s.data, key)

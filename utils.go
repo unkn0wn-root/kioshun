@@ -19,7 +19,5 @@ func nextPowerOf2(n int) int {
 // This default implementation assumes keys are hashed or don't contain URL paths.
 // Users should provide custom extractors for pattern matching.
 func defaultPathExtractor(key string) string {
-	// Default: return empty string (no path extraction)
-	// Custom extractors should parse key format to extract URL path component
 	return ""
 }

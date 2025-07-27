@@ -49,12 +49,10 @@ type lfuEvictor[K comparable, V any] struct{}
 // evict removes the least frequently used item from the shard.
 // LFU policy: min-heap root contains the item with lowest access frequency.
 func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
-	// Check if heap is empty
 	if s.lfuHeap == nil || s.lfuHeap.Len() == 0 {
 		return false
 	}
 
-	// Pop minimum frequency item (heap root)
 	lfu := heap.Pop(s.lfuHeap).(*cacheItem[V])
 	if lfu.key != nil {
 		if key, ok := lfu.key.(K); ok {
@@ -79,12 +77,10 @@ type fifoEvictor[K comparable, V any] struct{}
 // evict removes the first inserted item from the shard.
 // FIFO policy: treats the LRU list as insertion-order queue (oldest at tail).
 func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
-	// Check if shard is empty (only sentinel nodes remain)
 	if s.tail.prev == s.head {
 		return false
 	}
 
-	// Get the oldest item (first inserted, now at tail)
 	oldest := s.tail.prev
 	if oldest != nil && oldest.key != nil {
 		if key, ok := oldest.key.(K); ok {
@@ -92,7 +88,6 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 		}
 		s.removeFromLRU(oldest)
 
-		// Clean up LFU heap (if exist)
 		if s.lfuHeap != nil && oldest.heapIndex != noHeapIndex {
 			heap.Remove(s.lfuHeap, oldest.heapIndex)
 		}

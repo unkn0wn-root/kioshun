@@ -44,7 +44,6 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 		if cache, ok := cached.(*InMemoryCache[K, V]); ok {
 			return cache, nil
 		}
-		// Type mismatch: cache exists but with different generic parameters
 		return nil, newCacheError("get", name, ErrTypeMismatch)
 	}
 
@@ -62,7 +61,6 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 	// attempt to create the same cache simultaneously
 	if actual, loaded := m.caches.LoadOrStore(name, cache); loaded {
 		// Another goroutine created the cache first
-		// Clean up our unused cache to prevent resource leaks
 		cache.Close()
 		// Return the winner's cache if types match
 		if existingCache, ok := actual.(*InMemoryCache[K, V]); ok {
@@ -106,13 +104,13 @@ func (m *Manager) CloseAll() error {
 				}
 			}
 		}
-		return true // Continue iteration
+		return true
 	})
 
 	// Phase 2: Clear all registry entries
 	m.caches.Range(func(key, value any) bool {
 		m.caches.Delete(key)
-		return true // Continue iteration
+		return true
 	})
 
 	if len(closeErrors) > 0 {
@@ -125,7 +123,6 @@ func (m *Manager) CloseAll() error {
 // RemoveCache removes and closes the named cache instance.
 // Removes from registry and cleans up both runtime and configuration state.
 func (m *Manager) RemoveCache(name string) error {
-	// Atomically remove from active cache registry
 	if cached, ok := m.caches.LoadAndDelete(name); ok {
 		if cache, ok := cached.(interface{ Close() error }); ok {
 			return cache.Close()

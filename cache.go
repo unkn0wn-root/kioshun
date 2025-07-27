@@ -207,7 +207,6 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 
 	switch c.config.EvictionPolicy {
 	case LRU:
-		// Move to head (most recently used position)
 		shard.moveToLRUHead(item)
 	case LFU:
 		item.lastAccess = now
@@ -273,15 +272,13 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	defer shard.mu.Unlock()
 
 	if existing, exists := shard.data[key]; exists {
-		// In-place update - reuse existing item
+		// reuse existing item
 		existing.value = value
 		existing.lastAccess = now
 		existing.expireTime = expireTime
 
-		// Update access patterns for in-place value replacement
 		switch c.config.EvictionPolicy {
 		case LRU:
-			// promote to most recently used position
 			shard.moveToLRUHead(existing)
 		case LFU:
 			// reset frequency counter for new value.
@@ -379,8 +376,10 @@ func (c *InMemoryCache[K, V]) Delete(key K) bool {
 	if c.config.EvictionPolicy == LFU && item.heapIndex != noHeapIndex {
 		heap.Remove(shard.lfuHeap, item.heapIndex)
 	}
+
 	c.itemPool.Put(item)
 	atomic.AddInt64(&shard.size, -1)
+
 	return true
 }
 
