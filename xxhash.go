@@ -9,14 +9,19 @@ import (
 const (
 	// Prime constants - large odd primes for multiplication mixing
 	prime64_1 = 0x9E3779B185EBCA87 // Primary mixing prime
-	prime64_2 = 0xC2B2AE3D27D4EB4F // 2-th prime for different bit patterns
-	prime64_3 = 0x165667B19E3779F9 // 3-th prime for avalanche mixing
-	prime64_4 = 0x85EBCA77C2B2AE63 // 4-th prime for merge operations
-	prime64_5 = 0x27D4EB2F165667C5 // 5-th prime for small input processing
+	prime64_2 = 0xC2B2AE3D27D4EB4F // 2nd prime for different bit patterns
+	prime64_3 = 0x165667B19E3779F9 // 3rd prime for avalanche mixing
+	prime64_4 = 0x85EBCA77C2B2AE63 // 4th prime for merge operations
+	prime64_5 = 0x27D4EB2F165667C5 // 5th prime for small input processing
 
-	// Seeds for accumulator registers (derived from primes)
-	seed64_1 = 0x60EA27EEADC0B5D6 // v1 initial state
-	seed64_4 = 0x61C8864E7A143579 // v4 initial state (v2=prime64_2, v3=0)
+	// Initial accumulator values for seed=0 (standard xxHash64)
+	// These are precomputed values following the initialization formula:
+	// v1 = seed + prime64_1 + prime64_2
+	// v2 = seed + prime64_2
+	// v3 = seed + 0
+	// v4 = seed - prime64_1
+	seed64_1 = 0x60EA27EEADC0B5D6 // v1 initial: 0 + prime64_1 + prime64_2
+	seed64_4 = 0x61C8864E7A143579 // v4 initial: 0 - prime64_1 (two's complement)
 
 	largeInputThreshold = 32 // Switches to 4-accumulator mode for inputs ≥32 bytes
 
@@ -26,20 +31,20 @@ const (
 	smallRotation = 23 // Finalization rotation for 4-byte chunks
 	tinyRotation  = 11 // Single-byte processing rotation
 
-	// Multi-stage avalanche XOR-shifts eliminate linear deps.
-	avalancheShift1 = 33 // 1 XOR-shift destroys high-bit patterns
-	avalancheShift2 = 29 // 2 shift affects middle bits
+	// Multi-stage avalanche XOR-shifts eliminate linear dependencies
+	avalancheShift1 = 33 // 1st XOR-shift destroys high-bit patterns
+	avalancheShift2 = 29 // 2nd XOR-shift affects middle bits
 	avalancheShift3 = 32 // Final shift ensures low-bit mixing
 
-	// Accumulator rotation offsets for parallel processing lanes
-	v1Rotation = 1  // Minimal rotation for v1 accumulator
-	v2Rotation = 7  // Small prime rotation for v2
-	v3Rotation = 12 // Medium rotation for v3
-	v4Rotation = 18 // Larger rotation for v4
+	// Accumulator combination rotation amounts
+	v1Rotation = 1  // Rotation for v1 when combining accumulators
+	v2Rotation = 7  // Rotation for v2 when combining accumulators
+	v3Rotation = 12 // Rotation for v3 when combining accumulators
+	v4Rotation = 18 // Rotation for v4 when combining accumulators
 )
 
 // xxHash64 computes a 64-bit hash of the input string using algo branching.
-// Large inputs (≥32 bytes) use 4-accumulator.
+// Large inputs (≥32 bytes) use 4-accumulator mode.
 // Small inputs skip the accumulator phase and go directly to finalization.
 func xxHash64(input string) uint64 {
 	data := []byte(input)
@@ -58,13 +63,17 @@ func xxHash64(input string) uint64 {
 
 // xxHash64Large processes input data ≥32 bytes using 4-accumulator.
 func xxHash64Large(data []byte, length uint64) uint64 {
-	// Initialize 4 accumulators with different seeds to avoid correlation
+	// Initialize 4 accumulators following xxHash64 spec with seed=0
+	// v1 = seed + prime64_1 + prime64_2 (precomputed as seed64_1)
+	// v2 = seed + prime64_2
+	// v3 = seed + 0
+	// v4 = seed - prime64_1 (precomputed as seed64_4)
 	v1 := uint64(seed64_1)
 	v2 := uint64(prime64_2)
 	v3 := uint64(0)
 	v4 := uint64(seed64_4)
 
-	// 4 lanes × 8 bytes each
+	// Process 32-byte blocks (4 lanes × 8 bytes each)
 	for len(data) >= largeInputThreshold {
 		v1 = xxHash64Round(v1, binary.LittleEndian.Uint64(data[0:8]))
 		v2 = xxHash64Round(v2, binary.LittleEndian.Uint64(data[8:16]))
