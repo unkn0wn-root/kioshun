@@ -192,94 +192,6 @@ make bench
 | **64** | 52,462,201 | 67.55 | 49 | 3 |
 | **128** | 59,367,160 | **56.80** | 49 | 3 |
 
-
-## Installation
-
-```bash
-go get github.com/unkn0wn-root/kioshun
-```
-
-## Quick Start
-
-```go
-package main
-
-import (
-    "fmt"
-    "time"
-
-    cache "github.com/unkn0wn-root/kioshun"
-)
-
-func main() {
-    // Create cache with default configuration
-    c := cache.NewWithDefaults[string, string]()
-    defer c.Close()
-
-    // Set with default TTL (30 min)
-    c.Set("user:123", "David Nice", cache.DefaultExpiration)
-
-    // Set with no expiration
-    c.Set("user:123", "David Nice", cache.NoExpiration)
-
-    // Set value with custom TTL
-    c.Set("user:123", "David Nice", 5*time.Minute)
-
-    // Get value
-    if value, found := c.Get("user:123"); found {
-        fmt.Printf("User: %s\n", value)
-    }
-
-    // Get cache statistics
-    stats := c.Stats()
-    fmt.Printf("Hit ratio: %.2f%%\n", stats.HitRatio*100)
-}
-```
-
-## Configuration
-
-### Basic Configuration
-
-```go
-config := cache.Config{
-    MaxSize:         100000,           // Maximum number of items
-    ShardCount:      16,               // Number of shards (0 = auto-detect)
-    CleanupInterval: 5 * time.Minute,  // Cleanup frequency
-    DefaultTTL:      30 * time.Minute, // Default expiration time
-    EvictionPolicy:  cache.LRU,        // Eviction algorithm
-    StatsEnabled:    true,             // Enable statistics collection
-}
-
-cache := cache.New[string, any](config)
-```
-
-### Predefined Configurations
-
-Kioshun provides several preset configurations for common use cases. These presets combine appropriate settings for cache size, shard count, cleanup intervals, TTL, and eviction policies based on typical usage patterns.
-
-```go
-// For session storage
-sessionCache := cache.New[string, Session](cache.SessionCacheConfig())
-
-// For API response caching
-apiCache := cache.New[string, APIResponse](cache.APICacheConfig())
-
-// For temporary data
-tempCache := cache.New[string, any](cache.TemporaryCacheConfig())
-
-// For persistent data
-persistentCache := cache.New[string, any](cache.PersistentCacheConfig())
-
-// For user data caching
-userCache := cache.New[string, User](cache.UserCacheConfig())
-
-// For high-performance scenarios
-hpCache := cache.New[string, any](cache.HPCacheConfig())
-
-// For memory-constrained env.
-lowMemCache := cache.New[string, any](cache.LowMemoryCacheConfig())
-```
-
 ## Architecture
 
 ### Sharded Design
@@ -372,6 +284,93 @@ const (
     FIFO                          // First In, First Out
     Random                        // Random eviction
 )
+```
+
+## Installation
+
+```bash
+go get github.com/unkn0wn-root/kioshun
+```
+
+## Quick Start
+
+```go
+package main
+
+import (
+    "fmt"
+    "time"
+
+    cache "github.com/unkn0wn-root/kioshun"
+)
+
+func main() {
+    // Create cache with default configuration
+    c := cache.NewWithDefaults[string, string]()
+    defer c.Close()
+
+    // Set with default TTL (30 min)
+    c.Set("user:123", "David Nice", cache.DefaultExpiration)
+
+    // Set with no expiration
+    c.Set("user:123", "David Nice", cache.NoExpiration)
+
+    // Set value with custom TTL
+    c.Set("user:123", "David Nice", 5*time.Minute)
+
+    // Get value
+    if value, found := c.Get("user:123"); found {
+        fmt.Printf("User: %s\n", value)
+    }
+
+    // Get cache statistics
+    stats := c.Stats()
+    fmt.Printf("Hit ratio: %.2f%%\n", stats.HitRatio*100)
+}
+```
+
+## Configuration
+
+### Basic Configuration
+
+```go
+config := cache.Config{
+    MaxSize:         100000,           // Maximum number of items
+    ShardCount:      16,               // Number of shards (0 = auto-detect)
+    CleanupInterval: 5 * time.Minute,  // Cleanup frequency
+    DefaultTTL:      30 * time.Minute, // Default expiration time
+    EvictionPolicy:  cache.LRU,        // Eviction algorithm
+    StatsEnabled:    true,             // Enable statistics collection
+}
+
+cache := cache.New[string, any](config)
+```
+
+### Predefined Configurations
+
+Kioshun provides several preset configurations for common use cases. These presets combine appropriate settings for cache size, shard count, cleanup intervals, TTL, and eviction policies based on typical usage patterns.
+
+```go
+// For session storage
+sessionCache := cache.New[string, Session](cache.SessionCacheConfig())
+
+// For API response caching
+apiCache := cache.New[string, APIResponse](cache.APICacheConfig())
+
+// For temporary data
+tempCache := cache.New[string, any](cache.TemporaryCacheConfig())
+
+// For persistent data
+persistentCache := cache.New[string, any](cache.PersistentCacheConfig())
+
+// For user data caching
+userCache := cache.New[string, User](cache.UserCacheConfig())
+
+// For high-performance scenarios
+hpCache := cache.New[string, any](cache.HPCacheConfig())
+
+// For memory-constrained env.
+lowMemCache := cache.New[string, any](cache.LowMemoryCacheConfig())
 ```
 
 ## API Reference
