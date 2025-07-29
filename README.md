@@ -505,6 +505,15 @@ contentMiddleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Durati
 conditionalMiddleware := cache.NewHTTPCacheMiddleware(config)
 conditionalMiddleware.SetKeyGenerator(cache.KeyWithoutQuery()) // Enable invalidation
 conditionalMiddleware.SetCachePolicy(cache.CacheBySize(100, 1024*1024, 3*time.Minute))
+
+// Configure eviction policy
+cacheConfig := cache.DefaultMiddlewareConfig()
+cacheConfig.EvictionPolicy = cache.FIFO
+cacheConfig.MaxSize = 100000
+cacheConfig.DefaultTTL = 5 * time.Minute
+
+middleware := cache.NewHTTPCacheMiddleware(cacheConfig)
+
 ```
 
 ### Built-in Key Generators
@@ -522,6 +531,31 @@ middleware.SetKeyGenerator(cache.KeyWithVaryHeaders([]string{"Accept", "Authoriz
 // Ignore query parameters
 middleware.SetKeyGenerator(cache.KeyWithoutQuery())
 ```
+
+### Eviction Policies
+
+The middleware supports different eviction algorithms that can be configured based on diffrent access patterns:
+
+```go
+config := cache.DefaultMiddlewareConfig()
+
+// FIFO (First In, First Out) - Best Performance
+config.EvictionPolicy = cache.FIFO
+
+// LRU (Least Recently Used) - General Purpose
+config.EvictionPolicy = cache.LRU
+
+// LFU (Least Frequently Used) - Frequency-Based
+config.EvictionPolicy = cache.LFU
+
+// Random - Cache-Oblivious
+config.EvictionPolicy = cache.Random
+
+// SampledLFU - Approximate LFU with Admission Control
+config.EvictionPolicy = cache.SampledLFU
+```
+
+**Recommend**: For most HTTP middlewares, **FIFO** offers the best performance and is suitable for most web apps where request patterns follow temporal locality.
 
 ### Built-in Cache Policies
 
