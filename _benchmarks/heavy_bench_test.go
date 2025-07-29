@@ -109,8 +109,8 @@ func BenchmarkCacheContentionStress(b *testing.B) {
 
 // BenchmarkCacheEvictionStress tests heavy eviction scenarios
 func BenchmarkCacheEvictionStress(b *testing.B) {
-	policies := []cache.EvictionPolicy{cache.LRU, cache.LFU, cache.FIFO, cache.Random}
-	policyNames := []string{"LRU", "LFU", "FIFO", "Random"}
+	policies := []cache.EvictionPolicy{cache.LRU, cache.LFU, cache.FIFO, cache.Random, cache.SampledLFU}
+	policyNames := []string{"LRU", "LFU", "FIFO", "Random", "SampledLFU"}
 
 	for i, policy := range policies {
 		b.Run(fmt.Sprintf("Eviction_%s", policyNames[i]), func(b *testing.B) {
