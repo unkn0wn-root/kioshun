@@ -36,11 +36,13 @@ type HTTPCacheMiddleware struct {
 
 type MiddlewareConfig struct {
 	// Cache configuration
-	MaxSize         int64
-	ShardCount      int
-	CleanupInterval time.Duration
-	DefaultTTL      time.Duration
-	StatsEnabled    bool
+	MaxSize                int64
+	ShardCount             int
+	CleanupInterval        time.Duration
+	DefaultTTL             time.Duration
+	EvictionPolicy         EvictionPolicy
+	AdmissionResetInterval time.Duration
+	StatsEnabled           bool
 
 	// HTTP-specific options
 	CacheableMethods []string
@@ -59,6 +61,7 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 		ShardCount:       16,
 		CleanupInterval:  5 * time.Minute,
 		DefaultTTL:       5 * time.Minute,
+		EvictionPolicy:   LRU,
 		StatsEnabled:     true,
 		CacheableMethods: []string{"GET", "HEAD"},
 		CacheableStatus:  []int{200, 201, 300, 301, 302, 304, 404, 410},
@@ -75,12 +78,13 @@ func NewHTTPCacheMiddleware(config MiddlewareConfig) *HTTPCacheMiddleware {
 	}
 
 	cacheConfig := Config{
-		MaxSize:         config.MaxSize,
-		ShardCount:      config.ShardCount,
-		CleanupInterval: config.CleanupInterval,
-		DefaultTTL:      config.DefaultTTL,
-		EvictionPolicy:  LRU,
-		StatsEnabled:    config.StatsEnabled,
+		MaxSize:                config.MaxSize,
+		ShardCount:             config.ShardCount,
+		CleanupInterval:        config.CleanupInterval,
+		DefaultTTL:             config.DefaultTTL,
+		EvictionPolicy:         config.EvictionPolicy,
+		AdmissionResetInterval: config.AdmissionResetInterval,
+		StatsEnabled:           config.StatsEnabled,
 	}
 
 	m := &HTTPCacheMiddleware{

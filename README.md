@@ -10,7 +10,7 @@
   [![CI](https://github.com/unkn0wn-root/kioshun/actions/workflows/test.yml/badge.svg)](https://github.com/unkn0wn-root/kioshun/actions)
 
 
-  *(Very) Fast, thread-safe, sharded in-memory cache for Go*
+  *Thread-safe, sharded in-memory cache for Go*
 </div>
 
 ## Table of Contents
@@ -144,7 +144,7 @@ make bench
 
 - **21-82ns per operation** for most cache operations
 - **58+ million operations/sec** throughput
-- **Peak performance**: 275M+ operations/sec for GET operations
+- **Peak throughput**: 275M+ operations/sec for GET operations
 
 ### Stress Test Results
 

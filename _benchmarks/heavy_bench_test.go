@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/unkn0wn-root/kioshun"
+	cache "github.com/unkn0wn-root/kioshun"
 )
 
 // BenchmarkCacheHeavyLoad tests high load scenarios
@@ -35,7 +35,7 @@ func BenchmarkCacheHeavyLoad(b *testing.B) {
 				ShardCount:      runtime.NumCPU() * 4,
 				CleanupInterval: 30 * time.Second,
 				DefaultTTL:      10 * time.Minute,
-				EvictionPolicy:  cache.LRU,
+				EvictionPolicy:  cache.SampledLFU,
 				StatsEnabled:    true,
 			}
 			c := cache.New[string, []byte](config)
@@ -221,7 +221,7 @@ func BenchmarkCacheShardingEfficiency(b *testing.B) {
 				ShardCount:      shardCount,
 				CleanupInterval: 5 * time.Minute,
 				DefaultTTL:      1 * time.Hour,
-				EvictionPolicy:  cache.LRU,
+				EvictionPolicy:  cache.SampledLFU,
 				StatsEnabled:    true,
 			}
 			c := cache.New[string, []byte](config)
@@ -386,7 +386,7 @@ func BenchmarkCacheCleanupStress(b *testing.B) {
 		ShardCount:      16,
 		CleanupInterval: 100 * time.Millisecond, // Aggressive cleanup
 		DefaultTTL:      500 * time.Millisecond, // Short default TTL
-		EvictionPolicy:  cache.LRU,
+		EvictionPolicy:  cache.SampledLFU,
 		StatsEnabled:    true,
 	}
 	c := cache.New[string, []byte](config)
