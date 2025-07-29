@@ -17,7 +17,7 @@ const (
 )
 
 const (
-	defaultAdmissionRate = 80 // Start optimistic
+	defaultAdmissionRate = 90 // Start optimistic
 	minAdmissionRate     = 50 // Floor to prevent total rejection
 	admissionRateStep    = 10 // Adjustment step size
 
