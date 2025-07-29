@@ -255,6 +255,36 @@ Items      Items        Items        Items
 - **Memory**: No additional overhead per item
 - **Algorithm**: Uses `time.Now().UnixNano() % len(keys)` for selection
 
+#### SampledLFU (Sampled Least Frequently Used)
+Uses random sampling with bloom filter admission control to prevent cache pollution:
+- **Access**: Update frequency counter in O(1)
+- **Eviction**: Sample items (default 5-20) and evict least frequent in O(k) where k = sample size
+- **Admission Control**: Tracks recently seen keys with adaptive admission rates (50-90%)
+- **Scan Detection**: Automatically detects sequential scan patterns and reduces admission rate
+- **Memory**: Bloom filter per shard + frequency counters per item
+
+**SampledLFU Architecture:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    SampledLFU Shard                         │
+├─────────────────────┬───────────────────────────────────────┤
+│   Admission Filter  │           Cache Items                 │
+│  ┌───────────────┐  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐      │
+│  │ Bloom Filter  │  │  │Item │ │Item │ │Item │ │Item │ ...  │
+│  │ (Doorkeeper)  │  │  │Freq:│ │Freq:│ │Freq:│ │Freq:│      │
+│  │               │  │  │  5  │ │  12 │ │  3  │ │  8  │      │
+│  └───────────────┘  │  └─────┘ └─────┘ └─────┘ └─────┘      │
+│  Rate: 50-90%       │                                       │
+│  Scan: Detected     │  Sample 5 → Evict Item with Freq: 3   │
+└─────────────────────┴───────────────────────────────────────┘
+```
+
+**Admission Filter:**
+- **Bloom Filter**: 3 hash functions with ~1% false positive rate
+- **Adaptive Rates**: 90% default, drops to 50% minimum during scans
+- **Scan Detection**: 80% new items in 100 requests triggers scan mode
+- **Reset Interval**: Periodic reset (default 1 minute)
+
 **Eviction Algorithm Comparison:**
 | Policy | Access Time | Eviction Time | Memory Overhead | Best Use Case |
 |--------|-------------|---------------|-----------------|---------------|
@@ -262,6 +292,7 @@ Items      Items        Items        Items
 | LFU    | O(log n)    | O(log n)      | Medium         | Frequency-based access |
 | FIFO   | O(1)        | O(1)          | Low            | Simple time-based |
 | Random | O(1)        | O(n)          | Low            | Cache-oblivious workloads |
+| SampledLFU | O(1)    | O(k)          | Medium         | Scan-resistant, better LFU |
 
 ### Concurrent Access Patterns
 The sharded design enables high-throughput concurrent access:
@@ -279,10 +310,11 @@ The sharded design enables high-throughput concurrent access:
 
 ```go
 const (
-    LRU     EvictionPolicy = iota // Least Recently Used (default)
-    LFU                           // Least Frequently Used
-    FIFO                          // First In, First Out
-    Random                        // Random eviction
+    LRU        EvictionPolicy = iota // Least Recently Used (default)
+    LFU                              // Least Frequently Used
+    FIFO                             // First In, First Out
+    Random                           // Random eviction
+    SampledLFU                       // Sampled LFU with admission control
 )
 ```
 
