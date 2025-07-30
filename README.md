@@ -148,14 +148,6 @@ make bench
 
 ### Stress Test Results
 
-#### Eviction Policy Performance
-| Policy | Ops/sec | ns/op | B/op | allocs/op |
-|--------|---------|-------|------|-----------|
-| **FIFO** | 47,275,994 | **152.4** | 59 | 3 |
-| **LRU** | 38,241,679 | 157.9 | 59 | 3 |
-| **Random** | 23,302,548 | 170.3 | 119 | 3 |
-| **LFU** | 39,562,033 | 191.9 | 60 | 3 |
-
 #### High Load Scenarios
 | Load Profile | Ops/sec | ns/op | B/op | allocs/op | Description |
 |-------------|---------|-------|------|-----------|-------------|
@@ -378,33 +370,6 @@ config := cache.Config{
 cache := cache.New[string, any](config)
 ```
 
-### Predefined Configurations
-
-Kioshun provides several preset configurations for common use cases. These presets combine appropriate settings for cache size, shard count, cleanup intervals, TTL, and eviction policies based on typical usage patterns.
-
-```go
-// For session storage
-sessionCache := cache.New[string, Session](cache.SessionCacheConfig())
-
-// For API response caching
-apiCache := cache.New[string, APIResponse](cache.APICacheConfig())
-
-// For temporary data
-tempCache := cache.New[string, any](cache.TemporaryCacheConfig())
-
-// For persistent data
-persistentCache := cache.New[string, any](cache.PersistentCacheConfig())
-
-// For user data caching
-userCache := cache.New[string, User](cache.UserCacheConfig())
-
-// For high-performance scenarios
-hpCache := cache.New[string, any](cache.HPCacheConfig())
-
-// For memory-constrained env.
-lowMemCache := cache.New[string, any](cache.LowMemoryCacheConfig())
-```
-
 ## API Reference
 
 ### Core
@@ -471,7 +436,7 @@ type Stats struct {
 ### HTTP Caching
 
 ```go
-config := cache.DefaultMiddlewareConfig()
+config := cache.DefaultMiddlewareConfig() // default uses FIFO
 config.DefaultTTL = 5 * time.Minute
 config.MaxSize = 100000
 config.ShardCount = 16
@@ -508,8 +473,7 @@ r.Use(middleware.Middleware)
 ### Middleware Configuration
 
 ```go
-// High-performance API caching
-apiConfig := cache.DefaultMiddlewareConfig()
+apiConfig := cache.DefaultMiddlewareConfig() // default config uses FIFO
 apiConfig.MaxSize = 50000
 apiConfig.ShardCount = 32
 apiConfig.DefaultTTL = 10 * time.Minute
