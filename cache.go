@@ -30,8 +30,7 @@ const (
 	LRU EvictionPolicy = iota
 	LFU
 	FIFO
-	Random
-	SampledLFU
+	AdmissionLFU
 )
 
 type Cache[K comparable, V any] interface {
@@ -63,7 +62,7 @@ type Config struct {
 	DefaultTTL             time.Duration  // Default TTL for items (0 = no expiration)
 	EvictionPolicy         EvictionPolicy // Eviction algorithm
 	StatsEnabled           bool           // Enable statistics collection
-	AdmissionResetInterval time.Duration  // Timeout for SampledLFU
+	AdmissionResetInterval time.Duration  // Timeout for AdmissionLFU
 }
 
 func DefaultConfig() Config {
@@ -141,18 +140,20 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 			heap.Init(cache.shards[i].lfuHeap)
 		}
 
-		if config.EvictionPolicy == SampledLFU && shardMaxSize > 0 {
-			// Each shard gets proportional bloom filter size
-			bloomBits := uint64(shardMaxSize * 10) // 10 bits per item for ~1% FPR
-			if bloomBits < 1024 {
-				bloomBits = 1024 // Minimum 1KB per shard
+		if config.EvictionPolicy == AdmissionLFU && shardMaxSize > 0 {
+			// Each shard gets proportional enhanced bloom filter size
+			numCounters := uint64(shardMaxSize * 10) // 10x counters for good accuracy
+			if numCounters < 1024 {
+				numCounters = 1024 // Minimum counters per shard
 			}
 
 			resetInterval := config.AdmissionResetInterval
 			if resetInterval == 0 {
 				resetInterval = 1 * time.Minute
 			}
-			cache.shards[i].admission = newAdmissionFilter(bloomBits, resetInterval)
+
+			// Use enhanced frequency-based admission filter
+			cache.shards[i].admission = newFrequencyAdmissionFilter(numCounters, resetInterval)
 		}
 	}
 
@@ -177,7 +178,7 @@ func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
 
 // get retrieves an item from the cache.
 // LRU/LFU policies require write locks to update access metadata,
-// while FIFO/Random policies only need read locks for retrieval.
+// while FIFO policies only need read locks for retrieval.
 func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return nil, 0, false
@@ -186,7 +187,7 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	shard := c.getShard(key)
 
 	// LRU/LFU policies require write access to update metadata,
-	// while FIFO/Random use read locks since they don't update on access
+	// while FIFO use read locks since they don't update on access
 	needsWriteLock := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
 	if needsWriteLock {
 		shard.mu.Lock()
@@ -234,7 +235,7 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 		if item.heapIndex != noHeapIndex {
 			shard.lfuHeap.update(item)
 		}
-	case SampledLFU:
+	case AdmissionLFU:
 		item.lastAccess = now
 		atomic.AddInt64(&item.frequency, 1)
 	}
@@ -310,7 +311,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 			if existing.heapIndex != -1 {
 				shard.lfuHeap.update(existing)
 			}
-		case SampledLFU:
+		case AdmissionLFU:
 			existing.frequency = 1
 		}
 		return nil
@@ -320,14 +321,21 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	// Distribute total capacity evenly across shards
 	maxShardSize := c.config.MaxSize / int64(len(c.shards))
 	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
-		if c.config.EvictionPolicy == SampledLFU && shard.admission != nil {
+		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
 			keyHash := c.hasher.hash(key)
-			if !shard.admission.shouldAdmit(keyHash) {
-				// Reject this item to prevent cache pollution
+			admissionEvictor := c.evictor.(admissionLFUEvictor[K, V])
+			// sample → admission → eviction:
+			if !admissionEvictor.evictWithAdmission(
+				shard, &c.itemPool, c.config.StatsEnabled,
+				shard.admission, keyHash,
+			) {
+				// lost admission → reject without ejecting
 				return nil
 			}
+		} else {
+			// Standard eviction for other policies
+			c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
 		}
-		c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
 	}
 
 	// Allocate from pool after eviction to ensure space availability
@@ -430,7 +438,7 @@ func (c *InMemoryCache[K, V]) Clear() {
 		if c.config.EvictionPolicy == LFU {
 			*shard.lfuHeap = (*shard.lfuHeap)[:0]
 		}
-		if c.config.EvictionPolicy == SampledLFU && shard.admission != nil {
+		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
 			shard.admission.doorkeeper.reset()
 			shard.admission.lastReset = time.Now().UnixNano()
 		}

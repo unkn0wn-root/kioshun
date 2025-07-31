@@ -35,7 +35,7 @@ func BenchmarkCacheHeavyLoad(b *testing.B) {
 				ShardCount:      runtime.NumCPU() * 4,
 				CleanupInterval: 30 * time.Second,
 				DefaultTTL:      10 * time.Minute,
-				EvictionPolicy:  cache.SampledLFU,
+				EvictionPolicy:  cache.AdmissionLFU,
 				StatsEnabled:    true,
 			}
 			c := cache.New[string, []byte](config)
@@ -109,8 +109,8 @@ func BenchmarkCacheContentionStress(b *testing.B) {
 
 // BenchmarkCacheEvictionStress tests heavy eviction scenarios
 func BenchmarkCacheEvictionStress(b *testing.B) {
-	policies := []cache.EvictionPolicy{cache.LRU, cache.LFU, cache.FIFO, cache.Random, cache.SampledLFU}
-	policyNames := []string{"LRU", "LFU", "FIFO", "Random", "SampledLFU"}
+	policies := []cache.EvictionPolicy{cache.LRU, cache.LFU, cache.FIFO, cache.AdmissionLFU}
+	policyNames := []string{"LRU", "LFU", "FIFO", "AdmissionLFU"}
 
 	for i, policy := range policies {
 		b.Run(fmt.Sprintf("Eviction_%s", policyNames[i]), func(b *testing.B) {
@@ -221,7 +221,7 @@ func BenchmarkCacheShardingEfficiency(b *testing.B) {
 				ShardCount:      shardCount,
 				CleanupInterval: 5 * time.Minute,
 				DefaultTTL:      1 * time.Hour,
-				EvictionPolicy:  cache.SampledLFU,
+				EvictionPolicy:  cache.AdmissionLFU,
 				StatsEnabled:    true,
 			}
 			c := cache.New[string, []byte](config)
@@ -386,7 +386,7 @@ func BenchmarkCacheCleanupStress(b *testing.B) {
 		ShardCount:      16,
 		CleanupInterval: 100 * time.Millisecond, // Aggressive cleanup
 		DefaultTTL:      500 * time.Millisecond, // Short default TTL
-		EvictionPolicy:  cache.SampledLFU,
+		EvictionPolicy:  cache.AdmissionLFU,
 		StatsEnabled:    true,
 	}
 	c := cache.New[string, []byte](config)

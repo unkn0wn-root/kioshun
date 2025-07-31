@@ -38,6 +38,26 @@
 - [HTTP Middleware](#http-middleware)
 - [Cache Invalidation Setup](#cache-invalidation-setup)
 
+## Benchmark Configuration
+
+The benchmarks compare **Kioshun** with **AdmissionLFU** eviction policy against other popular Go cache libraries:
+
+### Cache Configurations Used
+
+| Cache Library | Configuration | Notes |
+|---------------|---------------|-------|
+| **Kioshun** | MaxSize: 100,000<br>ShardCount: CPU cores × 4<br>EvictionPolicy: **AdmissionLFU**<br>DefaultTTL: 1 hour<br>CleanupInterval: 5 min | AdmissionLFU eviction policy with admission control |
+| **Ristretto** | NumCounters: 1,000,000<br>MaxCost: 100,000<br>BufferItems: 64 | TinyLFU-based admission policy |
+| **BigCache** | MaxEntriesInWindow: 100,000<br>Shards: CPU cores (power of 2)<br>MaxEntrySize: 64KB<br>HardMaxCacheSize: 256MB | No eviction policy, size-based |
+| **FreeCache** | Size: 128MB | Segmented LRU |
+| **go-cache** | DefaultExpiration: 1 hour<br>CleanupInterval: 5 min | Simple map-based with cleanup |
+
+**Test Environment:**
+- **CPU:** Apple M4 Max (14 cores)
+- **OS:** macOS (Darwin ARM64)
+- **Kioshun Shards:** 56 (14 × 4)
+- **Go Version:** 1.21+
+
 ### Benchmark Results Kioshun vs. Ristretto, go-cache and freecache
 
 ### Running Benchmarks
@@ -56,133 +76,135 @@ make bench-runner
 make bench
 ```
 
-**Test Environment:**
-- **OS:** macOS (Darwin)
-- **Architecture:** ARM64
-- **CPU:** Apple M4 Max
-- **Go Version:** 1.21+
-
 #### Core Operations
 
 ##### SET Operations
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 100,000,000 | **53.95** | 41 | 3 |
-| **Ristretto** | 83,301,469 | 82.08 | 153 | 5 |
-| **BigCache** | 38,670,102 | 154.1 | 40 | 2 |
-| **go-cache** | 20,022,591 | 353.3 | 57 | 3 |
-| **freecache** | 13,592,491 | 523.3 | 903 | 2 |
+| **Kioshun** | 100,000,000 | **61.19** | 42 | 3 |
+| **Ristretto** | 82,496,528 | 81.48 | 151 | 5 |
+| **BigCache** | 37,729,303 | 153.9 | 40 | 2 |
+| **go-cache** | 19,802,497 | 352.3 | 57 | 3 |
+| **freecache** | 12,485,425 | 540.2 | 920 | 2 |
 
 ##### GET Operations
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Ristretto** | 287,087,389 | **21.22** | 31 | 2 |
-| **Kioshun** | 281,013,220 | **21.78** | 31 | 2 |
-| **BigCache** | 100,000,000 | 79.34 | 1047 | 3 |
-| **freecache** | 80,708,305 | 77.29 | 1039 | 2 |
-| **go-cache** | 45,681,829 | 136.2 | 15 | 1 |
+| **Ristretto** | 310,158,865 | **19.35** | 31 | 2 |
+| **Kioshun** | 258,173,943 | **23.15** | 31 | 2 |
+| **BigCache** | 92,523,937 | 82.81 | 1047 | 3 |
+| **freecache** | 81,388,165 | 76.40 | 1039 | 2 |
+| **go-cache** | 45,881,512 | 132.9 | 15 | 1 |
 
 #### Workload-Specific
 
 ##### Mixed Operations (70% reads, 30% writes)
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 125,047,722 | **48.47** | 31 | 2 |
-| **Ristretto** | 85,749,963 | 60.89 | 69 | 3 |
-| **BigCache** | 36,268,677 | 148.9 | 743 | 3 |
-| **go-cache** | 30,280,268 | 201.9 | 22 | 2 |
-| **freecache** | 21,571,833 | 273.3 | 1039 | 2 |
+| **Kioshun** | 100,000,000 | **49.68** | 31 | 2 |
+| **Ristretto** | 85,088,882 | 60.14 | 69 | 3 |
+| **BigCache** | 40,550,335 | 149.4 | 742 | 3 |
+| **go-cache** | 30,110,391 | 200.5 | 22 | 2 |
+| **freecache** | 22,155,008 | 266.9 | 1039 | 2 |
 
 ##### High Contention Scenarios
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 97,568,907 | **69.87** | 34 | 2 |
-| **BigCache** | 36,030,003 | 167.2 | 558 | 2 |
-| **go-cache** | 28,345,117 | 235.5 | 34 | 1 |
-| **Ristretto** | 27,784,916 | 222.6 | 83 | 3 |
-| **freecache** | 18,082,710 | 329.7 | 919 | 2 |
+| **Kioshun** | 83,795,762 | **73.72** | 35 | 2 |
+| **BigCache** | 35,587,495 | 155.3 | 570 | 2 |
+| **go-cache** | 29,478,771 | 233.1 | 33 | 1 |
+| **Ristretto** | 27,075,663 | 228.9 | 83 | 3 |
+| **freecache** | 19,292,937 | 306.2 | 918 | 2 |
 
 ##### Read-Heavy Workloads (90% reads, 10% writes)
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Ristretto** | 106,750,716 | **33.20** | 45 | 3 |
-| **Kioshun** | 96,229,144 | **37.01** | 31 | 2 |
-| **BigCache** | 26,457,594 | 130.0 | 946 | 3 |
-| **freecache** | 23,158,801 | 157.0 | 1039 | 2 |
-| **go-cache** | 19,328,863 | 183.2 | 18 | 2 |
+| **Ristretto** | 109,256,152 | **32.95** | 45 | 3 |
+| **Kioshun** | 87,788,641 | **36.73** | 31 | 2 |
+| **BigCache** | 26,907,688 | 130.0 | 946 | 3 |
+| **freecache** | 22,986,230 | 156.4 | 1039 | 2 |
+| **go-cache** | 19,272,679 | 185.3 | 18 | 2 |
 
 ##### Write-Heavy Workloads (90% writes, 10% reads)
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 100,000,000 | **33.74** | 31 | 2 |
-| **Ristretto** | 25,788,711 | 163.6 | 132 | 5 |
-| **BigCache** | 21,301,932 | 168.7 | 133 | 3 |
-| **go-cache** | 12,469,190 | 279.9 | 37 | 2 |
-| **freecache** | 9,007,708 | 380.0 | 1039 | 2 |
+| **Kioshun** | 91,341,868 | **38.24** | 31 | 2 |
+| **Ristretto** | 25,319,823 | 167.6 | 132 | 5 |
+| **BigCache** | 20,838,819 | 169.9 | 133 | 3 |
+| **go-cache** | 12,607,954 | 275.5 | 37 | 2 |
+| **freecache** | 8,449,123 | 376.2 | 1039 | 2 |
 
 #### Simulate 'Real-World' Workflow
 
 ##### Real-World Workload Simulation
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 58,979,691 | **60.30** | 48 | 3 |
-| **Ristretto** | 26,206,014 | 120.9 | 97 | 3 |
-| **BigCache** | 20,647,864 | 183.7 | 816 | 3 |
-| **go-cache** | 16,281,172 | 229.4 | 40 | 2 |
-| **freecache** | 9,182,894 | 383.5 | 1167 | 2 |
+| **Kioshun** | 56,552,866 | **64.99** | 48 | 3 |
+| **Ristretto** | 27,220,159 | 121.7 | 97 | 3 |
+| **BigCache** | 20,555,629 | 180.3 | 812 | 3 |
+| **go-cache** | 16,119,222 | 229.1 | 40 | 2 |
+| **freecache** | 8,877,139 | 375.4 | 1163 | 2 |
 
 ##### Memory Efficiency
 | Cache Library | Ops/sec | ns/op | bytes/op |
 |---------------|---------|-------|----------|
-| **Kioshun** | 94,229,144 | **38.01** | **31.0** |
-| **Ristretto** | 106,750,716 | 33.20 | 45.0 |
-| **BigCache** | 26,457,594 | 130.0 | 946.0 |
-| **freecache** | 23,158,801 | 157.0 | 1039.0 |
-| **go-cache** | 19,328,863 | 183.2 | 18.0 |
+| **Kioshun** | 89,788,641 | **36.73** | **31.0** |
+| **Ristretto** | 109,256,152 | 32.95 | 45.0 |
+| **BigCache** | 26,907,688 | 130.0 | 946.0 |
+| **freecache** | 22,986,230 | 156.4 | 1039.0 |
+| **go-cache** | 19,272,679 | 185.3 | 18.0 |
 
 ### Performance Characteristics
 
-- **21-82ns per operation** for most cache operations
-- **58+ million operations/sec** throughput
-- **Peak throughput**: 275M+ operations/sec for GET operations
+- **~19-87ns per operation** for most cache operations using AdmissionLFU
+- **56+ million operations/sec** throughput in real-world scenarios
+- **Peak throughput**: 310M+ operations/sec for GET operations
 
 ### Stress Test Results
 
 #### High Load Scenarios
 | Load Profile | Ops/sec | ns/op | B/op | allocs/op | Description |
 |-------------|---------|-------|------|-----------|-------------|
-| **Small + High Concurrency** | 59,745,292 | **59.50** | 27 | 2 | Many goroutines, small cache |
-| **Medium + Mixed Load** | 56,104,041 | **64.83** | 31 | 2 | Balanced read/write operations |
-| **Large + Read Heavy** | 56,693,991 | **65.72** | 38 | 2 | Large cache, mostly reads |
-| **XLarge + Write Heavy** | 44,826,436 | **68.11** | 40 | 3 | Very large cache, mostly writes |
-| **Extreme + Balanced** | 45,561,304 | **80.95** | 41 | 3 | Maximum scale, balanced ops |
+| **Small + High Concurrency** | 56,066,578 | **59.72** | 27 | 2 | Many goroutines, small cache |
+| **Medium + Mixed Load** | 55,117,999 | **62.48** | 31 | 2 | Balanced read/write operations |
+| **Large + Read Heavy** | 63,296,053 | **51.89** | 38 | 2 | Large cache, mostly reads |
+| **XLarge + Write Heavy** | 43,971,300 | **67.03** | 40 | 3 | Very large cache, mostly writes |
+| **Extreme + Balanced** | 43,159,774 | **81.41** | 41 | 3 | Maximum scale, balanced ops |
 
 #### Advanced Stress Test Results
 
 ##### Contention Stress Test
 | Test | Ops/sec | ns/op | B/op | allocs/op |
 |------|---------|-------|------|-----------|
-| **High Contention** | 49,839,693 | **68.86** | 34 | 2 |
+| **High Contention** | 47,936,589 | **73.58** | 34 | 2 |
+
+##### Eviction Policy Performance
+| Eviction Policy | Ops/sec | ns/op | B/op | allocs/op |
+|-----------------|---------|-------|------|-----------|
+| **AdmissionLFU** | 35,685,565 | **124.7** | 53 | 3 |
+| **FIFO** | 42,240,423 | 146.4 | 56 | 3 |
+| **LRU** | 36,104,913 | 165.0 | 59 | 3 |
+| **LFU** | 24,205,524 | 195.0 | 58 | 3 |
 
 ##### Memory Pressure Tests
 | Value Size | Ops/sec | ns/op | B/op | allocs/op |
 |------------|---------|-------|------|-----------|
-| **64KB** | 56,616,940 | **66.20** | 40 | 3 |
-| **1KB** | 55,313,698 | **66.37** | 40 | 3 |
-| **4KB** | 56,154,799 | **65.81** | 40 | 2 |
-| **16KB** | 55,306,689 | **68.36** | 40 | 3 |
+| **1KB** | 53,634,813 | **71.20** | 40 | 3 |
+| **4KB** | 52,830,013 | **71.18** | 40 | 3 |
+| **16KB** | 53,889,962 | **70.94** | 40 | 3 |
+| **64KB** | 54,438,056 | **71.44** | 40 | 3 |
 
 ##### Sharding Efficiency Analysis
 | Shards | Ops/sec | ns/op | B/op | allocs/op |
 |--------|---------|-------|------|-----------|
-| **1** | 9,378,514 | 426.8 | 43 | 3 |
-| **2** | 11,517,030 | 340.5 | 43 | 3 |
-| **4** | 16,063,339 | 232.1 | 43 | 3 |
-| **8** | 23,789,816 | 154.2 | 45 | 3 |
-| **16** | 32,913,006 | 105.1 | 46 | 3 |
-| **32** | 42,531,112 | 80.99 | 47 | 3 |
-| **64** | 52,462,201 | 67.55 | 49 | 3 |
-| **128** | 59,367,160 | **56.80** | 49 | 3 |
+| **1** | 15,326,596 | 352.5 | 49 | 3 |
+| **2** | 15,610,903 | 310.2 | 48 | 3 |
+| **4** | 19,235,764 | 212.7 | 46 | 3 |
+| **8** | 25,790,181 | 157.0 | 47 | 3 |
+| **16** | 33,085,953 | 119.4 | 47 | 3 |
+| **32** | 41,616,372 | 95.76 | 48 | 3 |
+| **64** | 50,870,149 | 78.81 | 48 | 3 |
+| **128** | 63,269,726 | **62.85** | 49 | 3 |
 
 ## Architecture
 
@@ -241,13 +263,7 @@ Items      Items        Items        Items
 - **Eviction**: Remove oldest item (at tail) in O(1)
 - **Memory**: Minimal overhead per item
 
-#### Random Eviction
-- **Access**: No updates required on access
-- **Eviction**: Randomly select item using time-based pseudo-randomness in O(n)
-- **Memory**: No additional overhead per item
-- **Algorithm**: Uses `time.Now().UnixNano() % len(keys)` for selection
-
-#### SampledLFU (Sampled Least Frequently Used)
+#### AdmissionLFU (Admission-controlled Least Frequently Used)
 Uses random sampling with bloom filter admission control to prevent cache pollution:
 - **Access**: Update frequency counter in O(1)
 - **Eviction**: Sample items (default 5-20) and evict least frequent in O(k) where k = sample size
@@ -255,10 +271,10 @@ Uses random sampling with bloom filter admission control to prevent cache pollut
 - **Scan Detection**: Automatically detects sequential scan patterns and reduces admission rate
 - **Memory**: Bloom filter per shard + frequency counters per item
 
-**SampledLFU Architecture:**
+**AdmissionLFU Architecture:**
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    SampledLFU Shard                         │
+│                    AdmissionLFU Shard                       │
 ├─────────────────────┬───────────────────────────────────────┤
 │   Admission Filter  │           Cache Items                 │
 │  ┌───────────────┐  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐      │
@@ -283,8 +299,7 @@ Uses random sampling with bloom filter admission control to prevent cache pollut
 | LRU    | O(1)        | O(1)          | Low            | General purpose |
 | LFU    | O(log n)    | O(log n)      | Medium         | Frequency-based access |
 | FIFO   | O(1)        | O(1)          | Low            | Simple time-based |
-| Random | O(1)        | O(n)          | Low            | Cache-oblivious workloads |
-| SampledLFU | O(1)    | O(k)          | Medium         | Scan-resistant, better LFU |
+| AdmissionLFU | O(1)    | O(k)          | Medium         | Scan-resistant, better LFU |
 
 ### Concurrent Access Patterns
 The sharded design enables high-throughput concurrent access:
@@ -305,8 +320,7 @@ const (
     LRU        EvictionPolicy = iota // Least Recently Used (default)
     LFU                              // Least Frequently Used
     FIFO                             // First In, First Out
-    Random                           // Random eviction
-    SampledLFU                       // Sampled LFU with admission control
+    AdmissionLFU                     // Sampled LFU with admission control
 )
 ```
 
@@ -544,11 +558,8 @@ config.EvictionPolicy = cache.LRU
 // LFU (Least Frequently Used) - Frequency-Based
 config.EvictionPolicy = cache.LFU
 
-// Random - Cache-Oblivious
-config.EvictionPolicy = cache.Random
-
-// SampledLFU - Approximate LFU with Admission Control
-config.EvictionPolicy = cache.SampledLFU
+// AdmissionLFU - Approximate LFU with Admission Control
+config.EvictionPolicy = cache.AdmissionLFU
 ```
 
 **Recommend**: For most HTTP middlewares, **FIFO** offers the best performance and is suitable for most web apps where request patterns follow temporal locality.
