@@ -264,48 +264,72 @@ Items      Items        Items        Items
 - **Memory**: Minimal overhead per item
 
 #### AdmissionLFU (Admission-controlled Least Frequently Used)
-Uses random sampling with bloom filter admission control to prevent cache pollution:
-- **Access**: Update frequency counter in O(1)
-- **Eviction**: Sample items (default 5-20) and evict least frequent in O(k) where k = sample size
-- **Admission Control**: Tracks recently seen keys with adaptive admission rates (50-90%)
-- **Scan Detection**: Automatically detects sequential scan patterns and reduces admission rate
-- **Memory**: Bloom filter per shard + frequency counters per item
+- **Access**: Update frequency counter in O(1), no heap maintenance
+- **Eviction**: Random sampling (default 5 items, configurable up to 20) with LFU selection in O(k) where k = sample size
+- **Admission Control**: Multi-layer frequency-based admission with Count-Min Sketch and doorkeeper bloom filter
+- **Memory**: Frequency bloom filter (10x shard size counters) + doorkeeper bloom filter (1/8 size) per shard
 
 **AdmissionLFU Architecture:**
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    AdmissionLFU Shard                       │
-├─────────────────────┬───────────────────────────────────────┤
-│   Admission Filter  │           Cache Items                 │
-│  ┌───────────────┐  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐      │
-│  │ Bloom Filter  │  │  │Item │ │Item │ │Item │ │Item │ ...  │
-│  │ (Doorkeeper)  │  │  │Freq:│ │Freq:│ │Freq:│ │Freq:│      │
-│  │               │  │  │  5  │ │  12 │ │  3  │ │  8  │      │
-│  └───────────────┘  │  └─────┘ └─────┘ └─────┘ └─────┘      │
-│  Rate: 50-90%       │                                       │
-│  Scan: Detected     │  Sample 5 → Evict Item with Freq: 3   │
-└─────────────────────┴───────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              AdmissionLFU Shard                                 │
+├─────────────────────────────┬───────────────────────────────────────────────────┤
+│   Frequency Admission Filter │                Cache Items                       │
+│  ┌─────────────────────────┐ │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                │
+│  │  Frequency Bloom Filter  │ │  │Item │ │Item │ │Item │ │Item │ ...            │
+│  │  Count-Min Sketch        │ │  │Freq:│ │Freq:│ │Freq:│ │Freq:│                │
+│  │  4-bit counters x10*cap  │ │  │  5  │ │  12 │ │  3  │ │  8  │                │
+│  │  Hash: 4 functions       │ │  └─────┘ └─────┘ └─────┘ └─────┘                │
+│  └─────────────────────────┘ │                                                  │
+│  ┌─────────────────────────┐ │  Random Sample 5 → Compare Frequencies           │
+│  │    Doorkeeper Filter     │ │  Victim Selection: Min(freq, lastAccess)        │
+│  │    Bloom Filter          │ │  ↓                                               │
+│  │    Size: cap/8           │ │  Admission Decision vs Victim Frequency          │
+│  │    Hash: 3 functions     │ │                                                  │
+│  │    Reset: 1min interval  │ │  Admit Rules:                                    │
+│  └─────────────────────────┘ │  • freq ≥ 3: Always admit                       │
+│                              │  • freq > victim: Always admit                   │
+│                              │  • freq = victim & freq > 0: 50% chance          │
+│                              │  • else: 70% - (victim_freq * 10)%               │
+└─────────────────────────────┴───────────────────────────────────────────────────┘
 ```
 
-**Admission Filter:**
-- **Bloom Filter**: 3 hash functions with ~1% false positive rate
-- **Adaptive Rates**: 90% default, drops to 50% minimum during scans
-- **Scan Detection**: 80% new items in 100 requests triggers scan mode
-- **Reset Interval**: Periodic reset (default 1 minute)
+**Admission Control Components:**
 
-**Eviction Algorithm Comparison:**
-| Policy | Access Time | Eviction Time | Memory Overhead | Best Use Case |
-|--------|-------------|---------------|-----------------|---------------|
-| LRU    | O(1)        | O(1)          | Low            | General purpose |
-| LFU    | O(log n)    | O(log n)      | Medium         | Frequency-based access |
-| FIFO   | O(1)        | O(1)          | Low            | Simple time-based |
-| AdmissionLFU | O(1)    | O(k)          | Medium         | Scan-resistant, better LFU |
+1. **Frequency Estimation (Count-Min Sketch)**:
+   - 4-bit counters packed in uint64 arrays (16 counters per word)
+   - 4 hash functions with xxHash64-based avalanche mixing
+   - Automatic aging: counters halved when total increments ≥ size × 10
+   - Size: 10× shard capacity counters (min 1024 per shard)
 
-### Concurrent Access Patterns
-The sharded design enables high-throughput concurrent access:
-1. **Read Operations**: Multiple goroutines can read from different shards simultaneously
-2. **Write Operations**: Writers only block other operations on the same shard
-3. **Cross-Shard Operations**: Statistics aggregation uses atomic operations to avoid blocking
+2. **Doorkeeper Bloom Filter**:
+   - 3 hash functions for recent access tracking
+   - Size: 1/8 of frequency filter size for memory efficiency
+   - Periodic reset every 1 minute (configurable via AdmissionResetInterval)
+   - Immediate admission for items in doorkeeper (bypass frequency check)
+
+3. **Admission Algorithm**:
+   ```
+   Phase 1: Doorkeeper Check
+   if in_doorkeeper(key):
+       refresh_doorkeeper(key)
+       return ADMIT
+
+   Phase 2: Update Frequency
+   new_freq = frequency_filter.increment(key)
+   doorkeeper.add(key)
+
+   Phase 3: Admission Decision
+   if new_freq >= 3:                    // High frequency guarantee
+       return ADMIT
+   elif new_freq > victim_frequency:    // Better than victim
+       return ADMIT
+   elif new_freq == victim_frequency && new_freq > 0:  // Tie-breaking
+       return ADMIT if hash(key) % 2 == 0
+   else:                                // Probabilistic admission
+       threshold = 70 - (victim_frequency * 10)
+       return ADMIT if hash(key) % 100 < threshold
+   ```
 
 ### Memory Management
 - **Object Pooling**: Reuses `cacheItem` objects to reduce GC pressure
