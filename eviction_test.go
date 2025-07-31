@@ -168,7 +168,7 @@ func TestAdmissionLFUSpecificBehavior(t *testing.T) {
 		evictionsBefore := cache.Stats().Evictions
 		cache.Set(fmt.Sprintf("new%d", i), 100+i, time.Hour)
 		evictionsAfter := cache.Stats().Evictions
-		
+
 		// Count as added only if eviction occurred (item was admitted)
 		if evictionsAfter > evictionsBefore {
 			addedCount++
@@ -284,7 +284,7 @@ func TestAdmissionLFUSampleSize(t *testing.T) {
 		evictionsBefore := cache.Stats().Evictions
 		cache.Set(string(rune('x'+i)), 100+i, time.Hour)
 		evictionsAfter := cache.Stats().Evictions
-		
+
 		if evictionsAfter > evictionsBefore {
 			admittedItems++
 		}
