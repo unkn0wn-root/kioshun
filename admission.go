@@ -11,22 +11,14 @@ const (
 	bloomMixPrime1 = 0xff51afd7ed558ccd
 	bloomMixPrime2 = 0xc4ceb9fe1a85ec53
 
-	bloomHashFunctions = 3  // 3 hashes with 10 bits/item gives ~1% false positive rate
-	bitsPerWord        = 64 // Bits per uint64 for bit array indexing
-)
-
-const (
-	// Enhanced bloom filter with frequency tracking
-	enhancedBloomHashFunctions = 4    // More hash functions for better accuracy
-	frequencyBits              = 4    // 4-bit frequency counters (0-15)
-	frequencyMask              = 0x0F // Mask for 4-bit counter
-	maxFrequency               = 15   // Maximum frequency value
-	agingFactor                = 2    // Divide frequencies by this during aging
-
 	// Admission thresholds
-	baseAdmissionRate   = 70 // Base admission rate
-	frequencyThreshold  = 3  // Minimum frequency for guaranteed admission
-	scanResistanceBonus = 20 // Extra admission chance for repeated items
+	baseAdmissionRate  = 70 // Base admission rate
+	frequencyThreshold = 3  // Minimum frequency for guaranteed admission
+
+	bitsPerWord   = 64   // Bits per uint64 for bit array indexing
+	frequencyMask = 0x0F // Mask for 4-bit counter
+	maxFrequency  = 15   // Maximum frequency value
+	agingFactor   = 2    // Divide frequencies by this during aging
 )
 
 func hash1(hash, mask uint64) uint64 {
@@ -303,7 +295,6 @@ func (faf *frequencyAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency
 	// Get frequency estimate for new item
 	newItemFrequency := faf.frequencyFilter.increment(keyHash)
 
-	// Add to doorkeeper for future reference
 	faf.doorkeeper.add(keyHash)
 
 	// Admission decision based on frequency comparison
