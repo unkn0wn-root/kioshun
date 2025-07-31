@@ -274,23 +274,23 @@ Items      Items        Items        Items
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                              AdmissionLFU Shard                                 │
 ├─────────────────────────────┬───────────────────────────────────────────────────┤
-│   Frequency Admission Filter │                Cache Items                       │
-│  ┌─────────────────────────┐ │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                │
-│  │  Frequency Bloom Filter  │ │  │Item │ │Item │ │Item │ │Item │ ...            │
-│  │  Count-Min Sketch        │ │  │Freq:│ │Freq:│ │Freq:│ │Freq:│                │
-│  │  4-bit counters x10*cap  │ │  │  5  │ │  12 │ │  3  │ │  8  │                │
-│  │  Hash: 4 functions       │ │  └─────┘ └─────┘ └─────┘ └─────┘                │
-│  └─────────────────────────┘ │                                                  │
-│  ┌─────────────────────────┐ │  Random Sample 5 → Compare Frequencies           │
-│  │    Doorkeeper Filter     │ │  Victim Selection: Min(freq, lastAccess)        │
-│  │    Bloom Filter          │ │  ↓                                               │
-│  │    Size: cap/8           │ │  Admission Decision vs Victim Frequency          │
-│  │    Hash: 3 functions     │ │                                                  │
-│  │    Reset: 1min interval  │ │  Admit Rules:                                    │
-│  └─────────────────────────┘ │  • freq ≥ 3: Always admit                       │
-│                              │  • freq > victim: Always admit                   │
-│                              │  • freq = victim & freq > 0: 50% chance          │
-│                              │  • else: 70% - (victim_freq * 10)%               │
+│   Frequency Admission Filter│                Cache Items                        │
+│  ┌─────────────────────────┐│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                  │
+│  │  Frequency Bloom Filter ││  │Item │ │Item │ │Item │ │Item │ ...              │
+│  │  Count-Min Sketch       ││  │Freq:│ │Freq:│ │Freq:│ │Freq:│                  │
+│  │  4-bit counters x10*cap ││  │  5  │ │  12 │ │  3  │ │  8  │                  │
+│  │  Hash: 4 functions      ││  └─────┘ └─────┘ └─────┘ └─────┘                  │
+│  └─────────────────────────┘│                                                   │
+│  ┌─────────────────────────┐│  Random Sample 5 → Compare Frequencies            │
+│  │    Doorkeeper Filter    ││  Victim Selection: Min(freq, lastAccess)          │
+│  │    Bloom Filter         ││  ↓                                                │
+│  │    Size: cap/8          ││  Admission Decision vs Victim Frequency           │
+│  │    Hash: 3 functions    ││                                                   │
+│  │    Reset: 1min interval ││  Admit Rules:                                     │
+│  └─────────────────────────┘│  • freq ≥ 3: Always admit                         │
+│                             │  • freq > victim: Always admit                    │
+│                             │  • freq = victim & freq > 0: 50% chance           │
+│                             │  • else: 70% - (victim_freq * 10)%                │
 └─────────────────────────────┴───────────────────────────────────────────────────┘
 ```
 
