@@ -13,17 +13,18 @@ const (
 
 // shard represents a cache partition to reduce lock contention
 type shard[K comparable, V any] struct {
-	mu          sync.RWMutex
-	data        map[K]*cacheItem[V]
-	head        *cacheItem[V] // LRU head (most recently used)
-	tail        *cacheItem[V] // LRU tail (least recently used)
-	lfuHeap     *lfuHeap[V]   // For LFU eviction
-	size        int64         // Current number of items
-	hits        int64
-	misses      int64
-	evictions   int64
-	expirations int64
-	admission   *admissionFilter
+	mu                  sync.RWMutex
+	data                map[K]*cacheItem[V]
+	head                *cacheItem[V] // LRU head (most recently used)
+	tail                *cacheItem[V] // LRU tail (least recently used)
+	lfuHeap             *lfuHeap[V]   // For LFU eviction
+	size                int64         // Current number of items
+	hits                int64
+	misses              int64
+	evictions           int64
+	expirations         int64
+	admission           *frequencyAdmissionFilter
+	lastVictimFrequency uint64
 }
 
 // initLRU initializes the doubly-linked list for LRU tracking.

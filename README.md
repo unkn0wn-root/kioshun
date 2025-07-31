@@ -241,13 +241,7 @@ Items      Items        Items        Items
 - **Eviction**: Remove oldest item (at tail) in O(1)
 - **Memory**: Minimal overhead per item
 
-#### Random Eviction
-- **Access**: No updates required on access
-- **Eviction**: Randomly select item using time-based pseudo-randomness in O(n)
-- **Memory**: No additional overhead per item
-- **Algorithm**: Uses `time.Now().UnixNano() % len(keys)` for selection
-
-#### SampledLFU (Sampled Least Frequently Used)
+#### AdmissionLFU (Admission-controlled Least Frequently Used)
 Uses random sampling with bloom filter admission control to prevent cache pollution:
 - **Access**: Update frequency counter in O(1)
 - **Eviction**: Sample items (default 5-20) and evict least frequent in O(k) where k = sample size
@@ -255,10 +249,10 @@ Uses random sampling with bloom filter admission control to prevent cache pollut
 - **Scan Detection**: Automatically detects sequential scan patterns and reduces admission rate
 - **Memory**: Bloom filter per shard + frequency counters per item
 
-**SampledLFU Architecture:**
+**AdmissionLFU Architecture:**
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    SampledLFU Shard                         │
+│                    AdmissionLFU Shard                       │
 ├─────────────────────┬───────────────────────────────────────┤
 │   Admission Filter  │           Cache Items                 │
 │  ┌───────────────┐  │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐      │
@@ -283,8 +277,7 @@ Uses random sampling with bloom filter admission control to prevent cache pollut
 | LRU    | O(1)        | O(1)          | Low            | General purpose |
 | LFU    | O(log n)    | O(log n)      | Medium         | Frequency-based access |
 | FIFO   | O(1)        | O(1)          | Low            | Simple time-based |
-| Random | O(1)        | O(n)          | Low            | Cache-oblivious workloads |
-| SampledLFU | O(1)    | O(k)          | Medium         | Scan-resistant, better LFU |
+| AdmissionLFU | O(1)    | O(k)          | Medium         | Scan-resistant, better LFU |
 
 ### Concurrent Access Patterns
 The sharded design enables high-throughput concurrent access:
@@ -305,8 +298,7 @@ const (
     LRU        EvictionPolicy = iota // Least Recently Used (default)
     LFU                              // Least Frequently Used
     FIFO                             // First In, First Out
-    Random                           // Random eviction
-    SampledLFU                       // Sampled LFU with admission control
+    AdmissionLFU                     // Sampled LFU with admission control
 )
 ```
 
@@ -544,11 +536,8 @@ config.EvictionPolicy = cache.LRU
 // LFU (Least Frequently Used) - Frequency-Based
 config.EvictionPolicy = cache.LFU
 
-// Random - Cache-Oblivious
-config.EvictionPolicy = cache.Random
-
-// SampledLFU - Approximate LFU with Admission Control
-config.EvictionPolicy = cache.SampledLFU
+// AdmissionLFU - Approximate LFU with Admission Control
+config.EvictionPolicy = cache.AdmissionLFU
 ```
 
 **Recommend**: For most HTTP middlewares, **FIFO** offers the best performance and is suitable for most web apps where request patterns follow temporal locality.

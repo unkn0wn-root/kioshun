@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/unkn0wn-root/kioshun"
+	cache "github.com/unkn0wn-root/kioshun"
 )
 
 func BenchmarkCacheSet(b *testing.B) {
@@ -347,8 +347,8 @@ func BenchmarkCacheShardComparison(b *testing.B) {
 }
 
 func BenchmarkCacheEvictionPolicyComparison(b *testing.B) {
-	policies := []cache.EvictionPolicy{cache.LRU, cache.LFU, cache.FIFO, cache.Random, cache.SampledLFU}
-	policyNames := []string{"LRU", "LFU", "FIFO", "Random", "SampledLFU"}
+	policies := []cache.EvictionPolicy{cache.LRU, cache.LFU, cache.FIFO, cache.AdmissionLFU}
+	policyNames := []string{"LRU", "LFU", "FIFO", "AdmissionLFU"}
 
 	for i, policy := range policies {
 		b.Run(policyNames[i], func(b *testing.B) {

@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // evictor defines the interface for cache eviction policies.
@@ -102,109 +101,102 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 	return false
 }
 
-// randomEvictor implements Random eviction policy.
-type randomEvictor[K comparable, V any] struct{}
-
-// evict removes a randomly selected item from the shard.
-// Random policy: uses time-based pseudo-randomness for cache-oblivious eviction.
-func (e randomEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
-	if len(s.data) == 0 {
-		return false
-	}
-
-	// Collect all keys for random selection - (O(n) space/time)
-	keys := make([]K, 0, len(s.data))
-	for key := range s.data {
-		keys = append(keys, key)
-	}
-
-	if len(keys) == 0 {
-		return false
-	}
-
-	// "Pseudo-random" selection using nanosecond timestamp
-	// @todo- could we do this better?
-	randomIndex := int(time.Now().UnixNano()) % len(keys)
-	randomKey := keys[randomIndex]
-	if item, exists := s.data[randomKey]; exists {
-		delete(s.data, randomKey)
-		s.removeFromLRU(item)
-
-		if s.lfuHeap != nil && item.heapIndex != noHeapIndex {
-			heap.Remove(s.lfuHeap, item.heapIndex)
-		}
-
-		itemPool.Put(item)
-		atomic.AddInt64(&s.size, -1)
-		if statsEnabled {
-			atomic.AddInt64(&s.evictions, 1)
-		}
-		return true
-	}
-	return false
-}
-
-// sampledLFUEvictor implements approximate LFU eviction.
-// uses random sampling instead of exact heap maintenance.
-type sampledLFUEvictor[K comparable, V any] struct {
+// admissionLFUEvictor implements approximate LFU eviction with frequency-aware admission.
+// Uses random sampling instead of exact heap maintenance.
+type admissionLFUEvictor[K comparable, V any] struct {
 	sampleSize int
 }
 
-// evict removes the least frequently used item from a random sample.
-func (e sampledLFUEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
+// pickVictim does the random-sample scan and returns the least-frequent item,
+// or nil if shard is empty.
+func (e admissionLFUEvictor[K, V]) pickVictim(s *shard[K, V]) *cacheItem[V] {
 	if len(s.data) == 0 {
-		return false
+		return nil
+	}
+	// determine sample size
+	n := e.sampleSize
+	if n <= 0 {
+		n = 5
+	} else if n > 20 {
+		n = 20
+	}
+	if n > len(s.data) {
+		n = len(s.data)
 	}
 
-	// Determine sample size
-	sampleSize := e.sampleSize
-	if sampleSize <= 0 {
-		sampleSize = 5
-	}
-	if sampleSize > 20 {
-		sampleSize = 20
-	}
-	if sampleSize > len(s.data) {
-		sampleSize = len(s.data)
-	}
-
-	var sample []*cacheItem[V]
-	count := 0
-	for _, item := range s.data {
-		if count >= sampleSize {
+	var victim *cacheItem[V]
+	cnt := 0
+	for _, it := range s.data {
+		if victim == nil ||
+			it.frequency < victim.frequency ||
+			(it.frequency == victim.frequency && it.lastAccess < victim.lastAccess) {
+			victim = it
+		}
+		cnt++
+		if cnt >= n {
 			break
 		}
-		sample = append(sample, item)
-		count++
 	}
+	return victim
+}
 
-	if len(sample) == 0 {
+// removeVictim unlinks & deletes the given item and updates size/stats.
+func (e admissionLFUEvictor[K, V]) removeVictim(
+	s *shard[K, V],
+	victim *cacheItem[V],
+	itemPool *sync.Pool,
+	statsEnabled bool,
+) {
+	if key, ok := victim.key.(K); ok {
+		delete(s.data, key)
+	}
+	s.removeFromLRU(victim)
+	// no LFU heap, so no heap removal here
+	itemPool.Put(victim)
+	atomic.AddInt64(&s.size, -1)
+	if statsEnabled {
+		atomic.AddInt64(&s.evictions, 1)
+	}
+}
+
+// evict without admission
+func (e admissionLFUEvictor[K, V]) evict(
+	s *shard[K, V],
+	itemPool *sync.Pool,
+	statsEnabled bool,
+) bool {
+	victim := e.pickVictim(s)
+	if victim == nil {
 		return false
 	}
-
-	// Find least frequent item in sample
-	lfu := sample[0]
-	for _, item := range sample[1:] {
-		if item.frequency < lfu.frequency ||
-			(item.frequency == lfu.frequency && item.lastAccess < lfu.lastAccess) {
-			lfu = item
-		}
+	if s.admission != nil {
+		s.lastVictimFrequency = uint64(victim.frequency)
 	}
+	e.removeVictim(s, victim, itemPool, statsEnabled)
+	return true
+}
 
-	// Evict the selected item
-	if lfu.key != nil {
-		if key, ok := lfu.key.(K); ok {
-			delete(s.data, key)
-		}
-		s.removeFromLRU(lfu)
-		itemPool.Put(lfu)
-		atomic.AddInt64(&s.size, -1)
-		if statsEnabled {
-			atomic.AddInt64(&s.evictions, 1)
-		}
-		return true
+// evictWithAdmission does sample → shouldAdmit → remove.
+// Returns true only if admission succeeded & an eviction occurred.
+func (e admissionLFUEvictor[K, V]) evictWithAdmission(
+	s *shard[K, V],
+	itemPool *sync.Pool,
+	statsEnabled bool,
+	admission *frequencyAdmissionFilter,
+	keyHash uint64,
+) bool {
+	victim := e.pickVictim(s)
+	if victim == nil {
+		return false
 	}
-	return false
+	freq := uint64(victim.frequency)
+	s.lastVictimFrequency = freq
+
+	if !admission.shouldAdmit(keyHash, freq) {
+		return false
+	}
+	e.removeVictim(s, victim, itemPool, statsEnabled)
+	return true
 }
 
 // createEvictor returns an evictor implementation based on the specified policy.
@@ -216,10 +208,8 @@ func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 		return lfuEvictor[K, V]{}
 	case FIFO:
 		return fifoEvictor[K, V]{}
-	case Random:
-		return randomEvictor[K, V]{}
-	case SampledLFU:
-		return sampledLFUEvictor[K, V]{sampleSize: 5}
+	case AdmissionLFU:
+		return admissionLFUEvictor[K, V]{sampleSize: 5}
 	default:
 		return lruEvictor[K, V]{} // Safe default
 	}
