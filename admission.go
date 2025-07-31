@@ -19,40 +19,17 @@ const (
 	frequencyMask = 0x0F // Mask for 4-bit counter
 	maxFrequency  = 15   // Maximum frequency value
 	agingFactor   = 2    // Divide frequencies by this during aging
+
+	// rotate amounts for hash1…hash4
+	hash1Rotate = 0
+	hash2Rotate = 17
+	hash3Rotate = 31
+	hash4Rotate = 47
 )
 
-func hash1(hash, mask uint64) uint64 {
-	h := hash
-	h ^= h >> 33
-	h *= bloomMixPrime1
-	h ^= h >> 29
-	h *= bloomMixPrime2
-	h ^= h >> 32
-	return h & mask
-}
-
-func hash2(hash, mask uint64) uint64 {
-	h := bits.RotateLeft64(hash, 17)
-	h ^= h >> 33
-	h *= bloomMixPrime1
-	h ^= h >> 29
-	h *= bloomMixPrime2
-	h ^= h >> 32
-	return h & mask
-}
-
-func hash3(hash, mask uint64) uint64 {
-	h := bits.RotateLeft64(hash, 31)
-	h ^= h >> 33
-	h *= bloomMixPrime1
-	h ^= h >> 29
-	h *= bloomMixPrime2
-	h ^= h >> 32
-	return h & mask
-}
-
-func hash4(hash, mask uint64) uint64 {
-	h := bits.RotateLeft64(hash, 47)
+// hashN is mixer.
+func hashN(hash, mask uint64, rotate int) uint64 {
+	h := bits.RotateLeft64(hash, int(rotate))
 	h ^= h >> 33
 	h *= bloomMixPrime1
 	h ^= h >> 29
@@ -87,9 +64,9 @@ func newBloomFilter(size uint64) *bloomFilter {
 
 // add marks a key as present in the bloom filter
 func (bf *bloomFilter) add(keyHash uint64) {
-	h1 := hash1(keyHash, bf.mask)
-	h2 := hash2(keyHash, bf.mask)
-	h3 := hash3(keyHash, bf.mask)
+	h1 := hashN(keyHash, bf.mask, hash1Rotate)
+	h2 := hashN(keyHash, bf.mask, hash2Rotate)
+	h3 := hashN(keyHash, bf.mask, hash3Rotate)
 
 	// Set bits at all three hash positions
 	bf.bits[h1/bitsPerWord] |= 1 << (h1 % bitsPerWord)
@@ -99,9 +76,9 @@ func (bf *bloomFilter) add(keyHash uint64) {
 
 // contains checks if a key might be in the set
 func (bf *bloomFilter) contains(keyHash uint64) bool {
-	h1 := hash1(keyHash, bf.mask)
-	h2 := hash2(keyHash, bf.mask)
-	h3 := hash3(keyHash, bf.mask)
+	h1 := hashN(keyHash, bf.mask, 0)
+	h2 := hashN(keyHash, bf.mask, 17)
+	h3 := hashN(keyHash, bf.mask, 31)
 
 	// Check if all three bits are set
 	bit1 := bf.bits[h1/bitsPerWord] & (1 << (h1 % bitsPerWord))
@@ -149,10 +126,10 @@ func newFrequencyBloomFilter(numCounters uint64) *frequencyBloomFilter {
 
 // increment frequency for a key
 func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
-	h1 := hash1(keyHash, fbf.mask)
-	h2 := hash2(keyHash, fbf.mask)
-	h3 := hash3(keyHash, fbf.mask)
-	h4 := hash4(keyHash, fbf.mask)
+	h1 := hashN(keyHash, fbf.mask, hash1Rotate)
+	h2 := hashN(keyHash, fbf.mask, hash2Rotate)
+	h3 := hashN(keyHash, fbf.mask, hash3Rotate)
+	h4 := hashN(keyHash, fbf.mask, hash4Rotate)
 
 	// Get minimum frequency among all hash positions (Count-Min Sketch approach)
 	freq := fbf.getCounterValue(h1)
@@ -183,10 +160,10 @@ func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 
 // estimateFrequency returns the estimated frequency of a key
 func (fbf *frequencyBloomFilter) estimateFrequency(keyHash uint64) uint64 {
-	h1 := hash1(keyHash, fbf.mask)
-	h2 := hash2(keyHash, fbf.mask)
-	h3 := hash3(keyHash, fbf.mask)
-	h4 := hash4(keyHash, fbf.mask)
+	h1 := hashN(keyHash, fbf.mask, hash1Rotate)
+	h2 := hashN(keyHash, fbf.mask, hash2Rotate)
+	h3 := hashN(keyHash, fbf.mask, hash3Rotate)
+	h4 := hashN(keyHash, fbf.mask, hash4Rotate)
 
 	// Return minimum frequency
 	freq := fbf.getCounterValue(h1)
