@@ -7,27 +7,29 @@ import (
 )
 
 const (
-	// Hash mixing primes from xxHash64
+	// Hash mixing primes (based on xxHash64 avalanche steps)
 	bloomMixPrime1 = 0xff51afd7ed558ccd
 	bloomMixPrime2 = 0xc4ceb9fe1a85ec53
 
 	// Admission thresholds
-	baseAdmissionRate  = 70 // Base admission rate
-	frequencyThreshold = 3  // Minimum frequency for guaranteed admission
+	baseAdmissionRate  = 70 // Base chance (in percent) to admit low-frequency items
+	frequencyThreshold = 3  // Guaranteed admission for items seen at least this many times
 
+	// Bit-array and counter packing params
 	bitsPerWord   = 64   // Bits per uint64 for bit array indexing
 	frequencyMask = 0x0F // Mask for 4-bit counter
-	maxFrequency  = 15   // Maximum frequency value
-	agingFactor   = 2    // Divide frequencies by this during aging
+	maxFrequency  = 15   // Maximum value storable in a 4-bit counter
+	agingFactor   = 2    // Divisor used during the periodic aging process
 
-	// rotate amounts for hash1…hash4
-	hash1Rotate = 0
-	hash2Rotate = 17
-	hash3Rotate = 31
+	// Rotation offsets used to derive distinct hash functions from one value
+	hash1Rotate = 0  // No rotation for first hash
+	hash2Rotate = 17 // Rotate left by 17 bits for second hash
+	hash3Rotate = 31 // by 31...
 	hash4Rotate = 47
 )
 
-// hashN is mixer.
+// hashN applies a bit-rotation and a simple avalanche mixing,
+// then reduces the result modulo 'mask+1' (mask is assumed size-1 of a power-of-two).
 func hashN(hash, mask uint64, rotate int) uint64 {
 	h := bits.RotateLeft64(hash, int(rotate))
 	h ^= h >> 33
@@ -38,18 +40,17 @@ func hashN(hash, mask uint64, rotate int) uint64 {
 	return h & mask
 }
 
-// bloomFilter implements a probabilistic set membership test.
-// Uses 3 hash functions for ~1% false positive rate at 10 bits per item.
+// bloomFilter implements a basic Bloom filter over a bit array of size.
+// Uses three hash functions to set or check bits, yielding low false positives.
 type bloomFilter struct {
-	bits []uint64 // Bit array stored as uint64 slices
-	size uint64   // Total number of bits
-	mask uint64   // Bitmask for fast modulo (size - 1)
+	bits []uint64 // Packed bit array
+	size uint64   // Total number of bits (power of two)
+	mask uint64   // size-1, for fast bit-positioning
 }
 
 // newBloomFilter creates a bloom filter with the specified bit size.
 func newBloomFilter(size uint64) *bloomFilter {
 	size = uint64(nextPowerOf2(int(size)))
-
 	arraySize := size / bitsPerWord
 	if arraySize == 0 {
 		arraySize = 1
@@ -58,29 +59,27 @@ func newBloomFilter(size uint64) *bloomFilter {
 	return &bloomFilter{
 		bits: make([]uint64, arraySize),
 		size: size,
-		mask: size - 1, // For hash & mask == hash % size
+		mask: size - 1,
 	}
 }
 
-// add marks a key as present in the bloom filter
+// add marks the presence of keyHash by setting three bits in the bit array.
 func (bf *bloomFilter) add(keyHash uint64) {
 	h1 := hashN(keyHash, bf.mask, hash1Rotate)
 	h2 := hashN(keyHash, bf.mask, hash2Rotate)
 	h3 := hashN(keyHash, bf.mask, hash3Rotate)
 
-	// Set bits at all three hash positions
 	bf.bits[h1/bitsPerWord] |= 1 << (h1 % bitsPerWord)
 	bf.bits[h2/bitsPerWord] |= 1 << (h2 % bitsPerWord)
 	bf.bits[h3/bitsPerWord] |= 1 << (h3 % bitsPerWord)
 }
 
-// contains checks if a key might be in the set
+// contains returns true if all three bits corresponding to keyHash are set.
 func (bf *bloomFilter) contains(keyHash uint64) bool {
 	h1 := hashN(keyHash, bf.mask, 0)
 	h2 := hashN(keyHash, bf.mask, 17)
 	h3 := hashN(keyHash, bf.mask, 31)
 
-	// Check if all three bits are set
 	bit1 := bf.bits[h1/bitsPerWord] & (1 << (h1 % bitsPerWord))
 	bit2 := bf.bits[h2/bitsPerWord] & (1 << (h2 % bitsPerWord))
 	bit3 := bf.bits[h3/bitsPerWord] & (1 << (h3 % bitsPerWord))
@@ -88,50 +87,49 @@ func (bf *bloomFilter) contains(keyHash uint64) bool {
 	return bit1 != 0 && bit2 != 0 && bit3 != 0
 }
 
-// reset clears all bits in the filter
+// reset clears the filter by zeroing all words.
 func (bf *bloomFilter) reset() {
 	for i := range bf.bits {
 		bf.bits[i] = 0
 	}
 }
 
-// frequencyBloomFilter combines bloom filter with frequency estimation
-// Uses 4-bit counters with Count-Min Sketch approach for frequency tracking
+// frequencyBloomFilter maintains approximate counts using 4-bit counters
+// packed into uint64 words. It uses a count–min sketch approach with four hashes.
 type frequencyBloomFilter struct {
 	counters []uint64 // Each uint64 holds 16 4-bit counters
 	size     uint64   // Total number of 4-bit counters
-	mask     uint64   // Bitmask for fast modulo
+	mask     uint64   // size-1, for index masking
 
-	totalIncrements uint64
-	agingThreshold  uint64 // When to trigger aging
+	totalIncrements uint64 // Number of increments since last aging
+	agingThreshold  uint64 // Trigger aging when totalIncrements ≥ threshold
 }
 
-// newFrequencyBloomFilter creates enhanced bloom with frequency tracking
+// newFrequencyBloomFilter creates a sketch with counters,
+// rounding to next power of two and packing 16 counters per uint64.
 func newFrequencyBloomFilter(numCounters uint64) *frequencyBloomFilter {
 	size := uint64(nextPowerOf2(int(numCounters)))
-
-	// Each uint64 holds 16 4-bit counters
 	arraySize := size / 16
 	if arraySize == 0 {
 		arraySize = 1
 	}
-
 	return &frequencyBloomFilter{
 		counters:       make([]uint64, arraySize),
 		size:           size,
 		mask:           size - 1,
-		agingThreshold: size * 10, // Age when we've seen 10x the number of counters
+		agingThreshold: size * 10, // Age after roughly 10× as many increments as counters
 	}
 }
 
-// increment frequency for a key
+// increment increases the count for keyHash and returns the new minimum estimate.
+// Uses the smallest of four counters to avoid overcounting (CMS).
 func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 	h1 := hashN(keyHash, fbf.mask, hash1Rotate)
 	h2 := hashN(keyHash, fbf.mask, hash2Rotate)
 	h3 := hashN(keyHash, fbf.mask, hash3Rotate)
 	h4 := hashN(keyHash, fbf.mask, hash4Rotate)
 
-	// Get minimum frequency among all hash positions (Count-Min Sketch approach)
+	// Find the minimum counter value among the four positions
 	freq := fbf.getCounterValue(h1)
 	if f2 := fbf.getCounterValue(h2); f2 < freq {
 		freq = f2
@@ -143,6 +141,7 @@ func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 		freq = f4
 	}
 
+	// Only increment if below the 4-bit maximum
 	if freq < maxFrequency {
 		fbf.incrementCounter(h1)
 		fbf.incrementCounter(h2)
@@ -151,6 +150,7 @@ func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 		freq++
 	}
 
+	// Trigger aging if we've done enough increments
 	if atomic.AddUint64(&fbf.totalIncrements, 1) >= fbf.agingThreshold {
 		fbf.age()
 	}
@@ -165,7 +165,6 @@ func (fbf *frequencyBloomFilter) estimateFrequency(keyHash uint64) uint64 {
 	h3 := hashN(keyHash, fbf.mask, hash3Rotate)
 	h4 := hashN(keyHash, fbf.mask, hash4Rotate)
 
-	// Return minimum frequency
 	freq := fbf.getCounterValue(h1)
 	if f2 := fbf.getCounterValue(h2); f2 < freq {
 		freq = f2
@@ -184,31 +183,28 @@ func (fbf *frequencyBloomFilter) estimateFrequency(keyHash uint64) uint64 {
 func (fbf *frequencyBloomFilter) getCounterValue(index uint64) uint64 {
 	arrayIndex := index / 16
 	counterIndex := index % 16
-	shiftAmount := counterIndex * 4
-
-	counter := fbf.counters[arrayIndex]
-	return (counter >> shiftAmount) & frequencyMask
+	shift := counterIndex * 4
+	return (fbf.counters[arrayIndex] >> shift) & frequencyMask
 }
 
-// incrementCounter increments a 4-bit counter
+// incrementCounter atomically increases the 4-bit counter.
+// Uses CAS to retry on concurrent modifications.
 func (fbf *frequencyBloomFilter) incrementCounter(index uint64) {
 	arrayIndex := index / 16
 	counterIndex := index % 16
-	shiftAmount := counterIndex * 4
+	shift := counterIndex * 4
 
 	for {
 		current := atomic.LoadUint64(&fbf.counters[arrayIndex])
-		currentValue := (current >> shiftAmount) & frequencyMask
-
-		if currentValue >= maxFrequency {
-			return // Already at maximum
+		val := (current >> shift) & frequencyMask
+		if val >= maxFrequency {
+			return // Already at top value
 		}
 
-		newValue := current + (1 << shiftAmount)
-		if atomic.CompareAndSwapUint64(&fbf.counters[arrayIndex], current, newValue) {
+		newVal := current + (1 << shift)
+		if atomic.CompareAndSwapUint64(&fbf.counters[arrayIndex], current, newVal) {
 			return
 		}
-		// Retry if CAS failed
 	}
 }
 
@@ -217,14 +213,12 @@ func (fbf *frequencyBloomFilter) age() {
 	for i := range fbf.counters {
 		for {
 			current := atomic.LoadUint64(&fbf.counters[i])
-
-			// Divide each 4-bit counter by 2
 			aged := uint64(0)
+			// Divide each 4-bit counter by 2
 			for j := 0; j < 16; j++ {
-				shiftAmount := j * 4
-				counterValue := (current >> shiftAmount) & frequencyMask
-				agedValue := counterValue / agingFactor
-				aged |= agedValue << shiftAmount
+				shift := j * 4
+				val := (current >> shift) & frequencyMask
+				aged |= (val / agingFactor) << shift
 			}
 
 			if atomic.CompareAndSwapUint64(&fbf.counters[i], current, aged) {
@@ -232,97 +226,92 @@ func (fbf *frequencyBloomFilter) age() {
 			}
 		}
 	}
-
+	// Reset the increment counter to start a new aging cycle
 	atomic.StoreUint64(&fbf.totalIncrements, 0)
 }
 
-// FrequencyAdmissionFilter makes admission decisions based on access frequency
+// frequencyAdmissionFilter makes cache admission decisions by combining a "doorkeeper"
+// (to catch recently seen items) with the more stable frequency estimates above.
 type frequencyAdmissionFilter struct {
 	frequencyFilter *frequencyBloomFilter
-	doorkeeper      *bloomFilter // Still keep simple doorkeeper for recent items
+	doorkeeper      *bloomFilter
 
-	resetInterval int64
-	lastReset     int64
+	resetInterval int64 // nanoseconds between automatic resets
+	lastReset     int64 // timestamp of the last reset
 
-	admissionRequests uint64
-	admissionGrants   uint64
+	admissionRequests uint64 // total calls to shouldAdmit
+	admissionGrants   uint64 // total times shouldAdmit returned true
 }
 
-// newFrequencyAdmissionFilter creates frequency-based admission filter
+// newFrequencyAdmissionFilter sets up the two-layer filter. The doorkeeper uses 1/8 the size of the
+// frequency sketch to cheaply track very recent accesses.
 func newFrequencyAdmissionFilter(numCounters uint64, resetInterval time.Duration) *frequencyAdmissionFilter {
 	return &frequencyAdmissionFilter{
 		frequencyFilter: newFrequencyBloomFilter(numCounters),
-		doorkeeper:      newBloomFilter(numCounters / 8), // Smaller doorkeeper
+		doorkeeper:      newBloomFilter(numCounters / 8),
 		resetInterval:   int64(resetInterval),
 		lastReset:       time.Now().UnixNano(),
 	}
 }
 
-// shouldAdmit makes frequency-based admission decision
+// shouldAdmit returns true if keyHash should be admitted to cache, comparing its estimated frequency
+// against a victim's frequency, with special cases for ties and rare items.
 func (faf *frequencyAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency uint64) bool {
 	atomic.AddUint64(&faf.admissionRequests, 1)
 
-	// Always admit if recently seen (doorkeeper)
+	// Phase 1: if it's in the doorkeeper, always admit and refresh its bit
 	if faf.doorkeeper.contains(keyHash) {
-		faf.doorkeeper.add(keyHash) // Refresh in doorkeeper
+		faf.doorkeeper.add(keyHash)
 		atomic.AddUint64(&faf.admissionGrants, 1)
 		return true
 	}
 
-	// Get frequency estimate for new item
-	newItemFrequency := faf.frequencyFilter.increment(keyHash)
-
+	// Phase 2: update and retrieve frequency estimate
+	newFreq := faf.frequencyFilter.increment(keyHash)
 	faf.doorkeeper.add(keyHash)
 
-	// Admission decision based on frequency comparison
-	var shouldAdmit bool
-
-	if newItemFrequency >= frequencyThreshold {
-		// High frequency items get guaranteed admission
-		shouldAdmit = true
-	} else if newItemFrequency > victimFrequency {
-		// Admit if frequency is higher than victim
-		shouldAdmit = true
-	} else if newItemFrequency == victimFrequency && newItemFrequency > 0 {
-		// Tie-breaker: admit 50% of equal frequency items
-		shouldAdmit = (keyHash % 2) == 0
+	// Phase 3: admission logic based on frequency thresholds and comparisons
+	var admit bool
+	// Guaranteed admission if seen at least frequencyThreshold times
+	if newFreq >= frequencyThreshold {
+		admit = true
+	} else if newFreq > victimFrequency {
+		// Admit if this item's frequency exceeds the victim's
+		admit = true
+	} else if newFreq == victimFrequency && newFreq > 0 {
+		// Tie: admit half the time based on a bit of the hash
+		admit = (keyHash % 2) == 0
 	} else {
-		// Low frequency new item vs higher frequency victim
-		// Give small chance based on base admission rate
-		shouldAdmit = (keyHash % 100) < uint64(baseAdmissionRate-int(victimFrequency*10))
+		// Otherwise, admit with a base probability reduced by victim's frequency
+		// baseAdmissionRate is in percent, victimFrequency*10 scales it down
+		admit = (keyHash % 100) < uint64(baseAdmissionRate-int(victimFrequency*10))
 	}
 
+	// Periodic reset of the doorkeeper based on elapsed time
 	now := time.Now().UnixNano()
 	if now-faf.lastReset > faf.resetInterval {
-		faf.reset(now)
+		faf.doorkeeper.reset()
+		faf.lastReset = now
 	}
 
-	if shouldAdmit {
+	if admit {
 		atomic.AddUint64(&faf.admissionGrants, 1)
 	}
-
-	return shouldAdmit
+	return admit
 }
 
-// getFrequencyEstimate returns frequency estimate for a key
+// getFrequencyEstimate returns the sketch's current count estimate for keyHash.
 func (faf *frequencyAdmissionFilter) getFrequencyEstimate(keyHash uint64) uint64 {
 	return faf.frequencyFilter.estimateFrequency(keyHash)
 }
 
-// reset clears doorkeeper and resets statistics
-func (faf *frequencyAdmissionFilter) reset(now int64) {
-	faf.doorkeeper.reset()
-	faf.lastReset = now
-}
-
-// getStats returns admission statistics
-func (faf *frequencyAdmissionFilter) getStats() (requests, grants uint64, admissionRate float64) {
+// getStats reports total requests, grants, and the current admission rate (grants/requests)
+func (faf *frequencyAdmissionFilter) getStats() (requests, grants uint64, rate float64) {
 	requests = atomic.LoadUint64(&faf.admissionRequests)
 	grants = atomic.LoadUint64(&faf.admissionGrants)
 
 	if requests > 0 {
-		admissionRate = float64(grants) / float64(requests)
+		rate = float64(grants) / float64(requests)
 	}
-
-	return requests, grants, admissionRate
+	return
 }
