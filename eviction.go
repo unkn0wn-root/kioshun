@@ -112,7 +112,7 @@ func (e admissionLFUEvictor[K, V]) pickVictim(s *shard[K, V]) *cacheItem[V] {
 	if len(s.data) == 0 {
 		return nil
 	}
-	// determine sample size
+
 	n := e.sampleSize
 	if n <= 0 {
 		n = 5

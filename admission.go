@@ -232,7 +232,6 @@ func (fbf *frequencyBloomFilter) age() {
 			}
 		}
 	}
-	// Reset the increment counter to start a new aging cycle
 	atomic.StoreUint64(&fbf.totalIncrements, 0)
 }
 
@@ -258,7 +257,6 @@ func newWorkloadDetector() *workloadDetector {
 func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 	now := time.Now().UnixNano()
 
-	// Update admission rate tracking
 	elapsed := now - atomic.LoadInt64(&wd.recentAdmissionTime)
 	if elapsed > 1e9 { // More than 1 second
 		admissions := atomic.LoadUint64(&wd.recentAdmissions)
@@ -270,22 +268,18 @@ func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 		atomic.StoreInt64(&wd.recentAdmissionTime, now)
 	}
 
-	// Check for sequential access pattern
 	idx := atomic.LoadUint32(&wd.lastKeyIndex)
 	lastKey := wd.lastKeys[idx&(sequenceBufferSize-1)]
 
-	// Simple sequential detection: keys increasing monotonically
 	if keyHash == lastKey+1 {
 		atomic.AddUint32(&wd.sequenceCount, 1)
 	} else {
 		atomic.StoreUint32(&wd.sequenceCount, 0)
 	}
 
-	// Store current key in circular buffer
 	atomic.AddUint32(&wd.lastKeyIndex, 1)
 	wd.lastKeys[(idx+1)&(sequenceBufferSize-1)] = keyHash
 
-	// Detect scan based on multiple signals
 	return atomic.LoadUint64(&wd.admissionRate) > scanAdmissionThreshold ||
 		atomic.LoadUint32(&wd.sequenceCount) > scanSequenceThreshold ||
 		atomic.LoadUint64(&wd.consecutiveMisses) > scanMissThreshold
@@ -348,7 +342,6 @@ func newAdaptiveAdmissionFilter(numCounters uint64, resetInterval time.Duration)
 func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency uint64, victimAge int64) bool {
 	atomic.AddUint64(&aaf.admissionRequests, 1)
 
-	// Phase 1: Check doorkeeper for recent access
 	if aaf.doorkeeper.contains(keyHash) {
 		aaf.doorkeeper.add(keyHash) // Refresh the bit
 		aaf.detector.recordAdmission()
@@ -356,7 +349,6 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency 
 		return true
 	}
 
-	// Phase 2: Scan detection
 	isScanning := aaf.detector.detectScan(keyHash)
 	if isScanning {
 		atomic.AddUint64(&aaf.scanRejections, 1)
@@ -370,14 +362,11 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency 
 		return admit
 	}
 
-	// Phase 3: Update frequency and add to doorkeeper
 	newFreq := aaf.frequencyFilter.increment(keyHash)
 	aaf.doorkeeper.add(keyHash)
 
-	// Phase 4: Adaptive admission decision
 	admit := aaf.makeAdmissionDecision(keyHash, newFreq, victimFrequency, victimAge)
 
-	// Phase 5: Update adaptive parameters and statistics
 	aaf.adjustAdmissionProbability()
 	aaf.checkPeriodicReset()
 
@@ -400,8 +389,6 @@ func (aaf *adaptiveAdmissionFilter) admitDuringScan(keyHash uint64, victimAge in
 	if victimAge > 0 && now-victimAge > 100e6 {
 		return true
 	}
-
-	// Otherwise use minimum admission probability
 	return (keyHash % 100) < uint64(aaf.minProbability)
 }
 
@@ -425,7 +412,6 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, vict
 			// Prefer newer items for ties (victim older than 1 second)
 			return victimRecency > 1e9
 		}
-		// Fallback to hash-based randomization for ties
 		return (keyHash % 2) == 0
 	}
 
@@ -467,7 +453,6 @@ func (aaf *adaptiveAdmissionFilter) adjustAdmissionProbability() {
 			atomic.StoreUint32(&aaf.admissionProbability, newProb)
 		}
 
-		// Reset counters
 		atomic.StoreUint64(&aaf.recentEvictions, 0)
 		atomic.StoreInt64(&aaf.evictionWindow, now)
 	}

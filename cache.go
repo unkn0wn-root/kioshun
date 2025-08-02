@@ -188,10 +188,8 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 
 	shard := c.getShard(key)
 
-	// LRU/LFU policies require write access to update metadata,
-	// while FIFO use read locks since they don't update on access
-	needsWriteLock := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
-	if needsWriteLock {
+	nw := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
+	if nw {
 		shard.mu.Lock()
 		defer shard.mu.Unlock()
 	} else {
@@ -212,10 +210,11 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	if item.expireTime > 0 && now > item.expireTime {
 		delete(shard.data, key)
 		shard.removeFromLRU(item)
-		// Remove from LFU list if present
+
 		if c.config.EvictionPolicy == LFU {
 			shard.lfuList.remove(item)
 		}
+
 		c.itemPool.Put(item)
 		atomic.AddInt64(&shard.size, -1)
 
@@ -303,9 +302,6 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		case LRU:
 			shard.moveToLRUHead(ex)
 		case LFU:
-			// reset frequency counter for new value.
-			// we do not want to preserve last frequanency since this is a new value
-			// reusing the same key so set freq. to 1
 			shard.lfuList.remove(ex)
 			ex.frequency = 1
 			shard.lfuList.add(ex)
@@ -315,8 +311,6 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		return nil
 	}
 
-	// Proactive eviction: check capacity before allocation to prevent oversized shards
-	// Distribute total capacity evenly across shards
 	maxShardSize := c.config.MaxSize / int64(len(c.shards))
 	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
 		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
@@ -335,16 +329,15 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		}
 	}
 
-	// Allocate from pool after eviction to ensure space availability
 	item := c.itemPool.Get().(*cacheItem[V])
 	item.value = value
 	item.lastAccess = now
-	item.frequency = 1 // Start with access count of 1
+	item.frequency = 1
 	item.key = key
 	item.expireTime = expireTime
 
 	shard.data[key] = item
-	shard.addToLRUHead(item) // Add to LRU list head (most recently used position)
+	shard.addToLRUHead(item)
 
 	if c.config.EvictionPolicy == LFU {
 		shard.lfuList.add(item)
@@ -531,7 +524,7 @@ func (c *InMemoryCache[K, V]) Stats() Stats {
 	return stats
 }
 
-// Close gracefully shuts down the cache
+// Close shuts down the cache
 func (c *InMemoryCache[K, V]) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
@@ -548,13 +541,11 @@ func (c *InMemoryCache[K, V]) TriggerCleanup() {
 		return
 	}
 
-	// If no background worker is running, do cleanup directly
 	if c.config.CleanupInterval <= 0 {
 		c.cleanup()
 		return
 	}
 
-	// Otherwise, signal the background worker
 	select {
 	case c.cleanupCh <- struct{}{}:
 	default:
