@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"container/heap"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -18,9 +17,6 @@ const (
 	defaultTTL             = 30 * time.Minute
 	maxShardCount          = 256
 	shardMultiplier        = 4
-
-	// heap index item is not in heap
-	noHeapIndex = -1
 )
 
 // EvictionPolicy defines the eviction algorithm
@@ -41,6 +37,17 @@ type Cache[K comparable, V any] interface {
 	Size() int64
 	Stats() Stats
 	Close() error
+}
+
+// cacheItem represents a single cache entry with metadata for eviction policies
+type cacheItem[V any] struct {
+	value      V
+	expireTime int64
+	lastAccess int64
+	frequency  int64
+	prev       *cacheItem[V]
+	next       *cacheItem[V]
+	key        any
 }
 
 // Stats holds cache performance metrics
@@ -106,8 +113,8 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 			shardCount = maxShardCount
 		}
 	}
-
 	shardCount = nextPowerOf2(shardCount)
+
 	cache := &InMemoryCache[K, V]{
 		shards:    make([]*shard[K, V], shardCount),
 		shardMask: uint64(shardCount - 1), // hash & (shardCount-1) ≡ hash % shardCount
@@ -116,7 +123,7 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		closeCh:   make(chan struct{}),
 		itemPool: sync.Pool{
 			New: func() any {
-				return &cacheItem[V]{heapIndex: noHeapIndex}
+				return &cacheItem[V]{}
 			},
 		},
 	}
@@ -125,36 +132,31 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	cache.evictor = createEvictor[K, V](config.EvictionPolicy)
 
 	shardMaxSize := config.MaxSize / int64(shardCount)
-
 	for i := 0; i < shardCount; i++ {
-		cache.shards[i] = &shard[K, V]{
+		s := &shard[K, V]{
 			data: make(map[K]*cacheItem[V]),
 		}
 		// LRU list is used for all eviction policies to maintain insertion order
-		cache.shards[i].initLRU()
+		s.initLRU()
 
-		// LFU policy requires additional min-heap for frequency-based eviction
 		if config.EvictionPolicy == LFU {
-			h := make(lfuHeap[V], 0)
-			cache.shards[i].lfuHeap = &h
-			heap.Init(cache.shards[i].lfuHeap)
+			s.lfuList = newLFUList[K, V]()
 		}
 
 		if config.EvictionPolicy == AdmissionLFU && shardMaxSize > 0 {
-			// Each shard gets proportional enhanced bloom filter size
-			numCounters := uint64(shardMaxSize * 10) // 10x counters for good accuracy
-			if numCounters < 1024 {
-				numCounters = 1024 // Minimum counters per shard
+			nc := uint64(shardMaxSize * 10)
+			if nc < 1024 {
+				nc = 1024 // Minimum counters per shard
 			}
 
 			resetInterval := config.AdmissionResetInterval
 			if resetInterval == 0 {
 				resetInterval = 1 * time.Minute
 			}
-
-			// Use enhanced frequency-based admission filter
-			cache.shards[i].admission = newFrequencyAdmissionFilter(numCounters, resetInterval)
+			s.admission = newAdaptiveAdmissionFilter(nc, resetInterval)
 		}
+
+		cache.shards[i] = s
 	}
 
 	if config.CleanupInterval > 0 {
@@ -186,10 +188,8 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 
 	shard := c.getShard(key)
 
-	// LRU/LFU policies require write access to update metadata,
-	// while FIFO use read locks since they don't update on access
-	needsWriteLock := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
-	if needsWriteLock {
+	nw := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
+	if nw {
 		shard.mu.Lock()
 		defer shard.mu.Unlock()
 	} else {
@@ -210,10 +210,11 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	if item.expireTime > 0 && now > item.expireTime {
 		delete(shard.data, key)
 		shard.removeFromLRU(item)
-		// Remove from LFU heap if present (heapIndex tracks heap membership)
-		if c.config.EvictionPolicy == LFU && item.heapIndex != noHeapIndex {
-			heap.Remove(shard.lfuHeap, item.heapIndex)
+
+		if c.config.EvictionPolicy == LFU {
+			shard.lfuList.remove(item)
 		}
+
 		c.itemPool.Put(item)
 		atomic.AddInt64(&shard.size, -1)
 
@@ -231,10 +232,7 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	case LFU:
 		item.lastAccess = now
 		atomic.AddInt64(&item.frequency, 1)
-		// Reheapify to maintain min-heap property after frequency change
-		if item.heapIndex != noHeapIndex {
-			shard.lfuHeap.update(item)
-		}
+		shard.lfuList.increment(item)
 	case AdmissionLFU:
 		item.lastAccess = now
 		atomic.AddInt64(&item.frequency, 1)
@@ -294,40 +292,33 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	if existing, exists := shard.data[key]; exists {
+	if ex, exists := shard.data[key]; exists {
 		// in-place update: reuse existing item
-		existing.value = value
-		existing.lastAccess = now
-		existing.expireTime = expireTime
+		ex.value = value
+		ex.lastAccess = now
+		ex.expireTime = expireTime
 
 		switch c.config.EvictionPolicy {
 		case LRU:
-			shard.moveToLRUHead(existing)
+			shard.moveToLRUHead(ex)
 		case LFU:
-			// reset frequency counter for new value.
-			// we do not want to preserve last frequanency since this is a new value
-			// reusing the same key so set freq. to 1
-			existing.frequency = 1
-			if existing.heapIndex != -1 {
-				shard.lfuHeap.update(existing)
-			}
+			shard.lfuList.remove(ex)
+			ex.frequency = 1
+			shard.lfuList.add(ex)
 		case AdmissionLFU:
-			existing.frequency = 1
+			ex.frequency = 1
 		}
 		return nil
 	}
 
-	// Proactive eviction: check capacity before allocation to prevent oversized shards
-	// Distribute total capacity evenly across shards
 	maxShardSize := c.config.MaxSize / int64(len(c.shards))
 	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
 		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
-			keyHash := c.hasher.hash(key)
 			admissionEvictor := c.evictor.(admissionLFUEvictor[K, V])
 			// sample → admission → eviction:
 			if !admissionEvictor.evictWithAdmission(
 				shard, &c.itemPool, c.config.StatsEnabled,
-				shard.admission, keyHash,
+				shard.admission, c.hasher.hash(key),
 			) {
 				// lost admission → reject without ejecting
 				return nil
@@ -338,21 +329,18 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		}
 	}
 
-	// Allocate from pool after eviction to ensure space availability
 	item := c.itemPool.Get().(*cacheItem[V])
 	item.value = value
 	item.lastAccess = now
-	item.frequency = 1 // Start with access count of 1
+	item.frequency = 1
 	item.key = key
-	item.heapIndex = noHeapIndex // Will be set by heap.Push if needed
 	item.expireTime = expireTime
 
 	shard.data[key] = item
-	shard.addToLRUHead(item) // Add to LRU list head (most recently used position)
+	shard.addToLRUHead(item)
 
-	// For LFU policy, also add to min-heap for frequency-based eviction
 	if c.config.EvictionPolicy == LFU {
-		heap.Push(shard.lfuHeap, item)
+		shard.lfuList.add(item)
 	}
 
 	atomic.AddInt64(&shard.size, 1)
@@ -412,8 +400,8 @@ func (c *InMemoryCache[K, V]) Delete(key K) bool {
 
 	delete(shard.data, key)
 	shard.removeFromLRU(item)
-	if c.config.EvictionPolicy == LFU && item.heapIndex != noHeapIndex {
-		heap.Remove(shard.lfuHeap, item.heapIndex)
+	if c.config.EvictionPolicy == LFU {
+		shard.lfuList.remove(item)
 	}
 
 	c.itemPool.Put(item)
@@ -436,11 +424,10 @@ func (c *InMemoryCache[K, V]) Clear() {
 		shard.data = make(map[K]*cacheItem[V])
 		shard.initLRU()
 		if c.config.EvictionPolicy == LFU {
-			*shard.lfuHeap = (*shard.lfuHeap)[:0]
+			shard.lfuList = newLFUList[K, V]()
 		}
 		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
-			shard.admission.doorkeeper.reset()
-			shard.admission.lastReset = time.Now().UnixNano()
+			shard.admission.Reset()
 		}
 		atomic.StoreInt64(&shard.size, 0)
 		shard.mu.Unlock()
@@ -467,8 +454,8 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 	if item.expireTime > 0 && now > item.expireTime {
 		delete(shard.data, key)
 		shard.removeFromLRU(item)
-		if c.config.EvictionPolicy == LFU && item.heapIndex != noHeapIndex {
-			heap.Remove(shard.lfuHeap, item.heapIndex)
+		if c.config.EvictionPolicy == LFU {
+			shard.lfuList.remove(item)
 		}
 		c.itemPool.Put(item)
 		atomic.AddInt64(&shard.size, -1)
@@ -537,7 +524,7 @@ func (c *InMemoryCache[K, V]) Stats() Stats {
 	return stats
 }
 
-// Close gracefully shuts down the cache
+// Close shuts down the cache
 func (c *InMemoryCache[K, V]) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
@@ -554,13 +541,11 @@ func (c *InMemoryCache[K, V]) TriggerCleanup() {
 		return
 	}
 
-	// If no background worker is running, do cleanup directly
 	if c.config.CleanupInterval <= 0 {
 		c.cleanup()
 		return
 	}
 
-	// Otherwise, signal the background worker
 	select {
 	case c.cleanupCh <- struct{}{}:
 	default:
@@ -595,62 +580,4 @@ func (c *InMemoryCache[K, V]) cleanup() {
 	for _, shard := range c.shards {
 		shard.cleanup(now, c.config.EvictionPolicy, &c.itemPool, c.config.StatsEnabled)
 	}
-}
-
-// cacheItem represents a single cache entry with metadata for eviction policies
-type cacheItem[V any] struct {
-	value      V
-	expireTime int64
-	lastAccess int64
-	frequency  int64
-	prev       *cacheItem[V]
-	next       *cacheItem[V]
-	key        any
-	heapIndex  int
-}
-
-// lfuHeap implements a min-heap for LFU eviction policy.
-// Items are ordered by access frequency, with ties broken by access time.
-type lfuHeap[V any] []*cacheItem[V]
-
-// Len returns the number of items in the heap.
-func (h lfuHeap[V]) Len() int { return len(h) }
-
-// Less reports whether the item at index i should sort before the item at index j.
-// Items with lower frequency are prioritized; ties are broken by access time.
-func (h lfuHeap[V]) Less(i, j int) bool {
-	if h[i].frequency != h[j].frequency {
-		return h[i].frequency < h[j].frequency
-	}
-	// Break ties by access time (older items have priority for eviction)
-	return h[i].lastAccess < h[j].lastAccess
-}
-
-// Swap exchanges the elements at indices i and j.
-func (h lfuHeap[V]) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].heapIndex = i
-	h[j].heapIndex = j
-}
-
-// Push adds an element to the heap.
-func (h *lfuHeap[V]) Push(x any) {
-	item := x.(*cacheItem[V])
-	item.heapIndex = len(*h)
-	*h = append(*h, item)
-}
-
-// Pop removes and returns the minimum element from the heap.
-func (h *lfuHeap[V]) Pop() any {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	item.heapIndex = noHeapIndex
-	*h = old[0 : n-1]
-	return item
-}
-
-// update re-establishes the heap ordering after an item's priority changes.
-func (h *lfuHeap[V]) update(item *cacheItem[V]) {
-	heap.Fix(h, item.heapIndex)
 }

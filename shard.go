@@ -1,29 +1,23 @@
 package cache
 
 import (
-	"container/heap"
 	"sync"
 	"sync/atomic"
-)
-
-const (
-	// sentinel index for LRU list head/tail nodes
-	sentinelIndex = -1
 )
 
 // shard represents a cache partition to reduce lock contention
 type shard[K comparable, V any] struct {
 	mu                  sync.RWMutex
 	data                map[K]*cacheItem[V]
-	head                *cacheItem[V] // LRU head (most recently used)
-	tail                *cacheItem[V] // LRU tail (least recently used)
-	lfuHeap             *lfuHeap[V]   // For LFU eviction
-	size                int64         // Current number of items
+	head                *cacheItem[V]  // LRU head (most recently used)
+	tail                *cacheItem[V]  // LRU tail (least recently used)
+	lfuList             *lfuList[K, V] // For LFU eviction
+	size                int64          // Current number of items
 	hits                int64
 	misses              int64
 	evictions           int64
 	expirations         int64
-	admission           *frequencyAdmissionFilter
+	admission           *adaptiveAdmissionFilter
 	lastVictimFrequency uint64
 }
 
@@ -31,8 +25,8 @@ type shard[K comparable, V any] struct {
 // Creates a circular list with sentinel head and tail nodes.
 // Sentinel nodes eliminate null pointer checks during insertion/removal operations.
 func (s *shard[K, V]) initLRU() {
-	s.head = &cacheItem[V]{heapIndex: sentinelIndex}
-	s.tail = &cacheItem[V]{heapIndex: sentinelIndex}
+	s.head = &cacheItem[V]{}
+	s.tail = &cacheItem[V]{}
 	// Initialize circular structure: head <-> tail
 	s.head.next = s.tail
 	s.tail.prev = s.head
@@ -102,8 +96,8 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 		if item, exists := s.data[key]; exists {
 			delete(s.data, key)
 			s.removeFromLRU(item)
-			if evictionPolicy == LFU && item.heapIndex != noHeapIndex {
-				heap.Remove(s.lfuHeap, item.heapIndex)
+			if evictionPolicy == LFU {
+				s.lfuList.remove(item)
 			}
 			itemPool.Put(item)
 			atomic.AddInt64(&s.size, -1)

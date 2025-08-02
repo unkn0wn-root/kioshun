@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"container/heap"
 	"sync"
 	"sync/atomic"
 )
@@ -46,13 +45,13 @@ func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 type lfuEvictor[K comparable, V any] struct{}
 
 // evict removes the least frequently used item from the shard.
-// LFU policy: min-heap root contains the item with lowest access frequency.
+// LFU policy: O(1) frequency list contains the item with lowest access frequency.
 func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
-	if s.lfuHeap == nil || s.lfuHeap.Len() == 0 {
+	lfu := s.lfuList.removeLFU()
+	if lfu == nil {
 		return false
 	}
 
-	lfu := heap.Pop(s.lfuHeap).(*cacheItem[V])
 	if lfu.key != nil {
 		if key, ok := lfu.key.(K); ok {
 			delete(s.data, key)
@@ -87,8 +86,8 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 		}
 		s.removeFromLRU(oldest)
 
-		if s.lfuHeap != nil && oldest.heapIndex != noHeapIndex {
-			heap.Remove(s.lfuHeap, oldest.heapIndex)
+		if s.lfuList != nil {
+			s.lfuList.remove(oldest)
 		}
 
 		itemPool.Put(oldest)
@@ -113,7 +112,7 @@ func (e admissionLFUEvictor[K, V]) pickVictim(s *shard[K, V]) *cacheItem[V] {
 	if len(s.data) == 0 {
 		return nil
 	}
-	// determine sample size
+
 	n := e.sampleSize
 	if n <= 0 {
 		n = 5
@@ -173,6 +172,7 @@ func (e admissionLFUEvictor[K, V]) evict(
 		s.lastVictimFrequency = uint64(victim.frequency)
 	}
 	e.removeVictim(s, victim, itemPool, statsEnabled)
+
 	return true
 }
 
@@ -182,7 +182,7 @@ func (e admissionLFUEvictor[K, V]) evictWithAdmission(
 	s *shard[K, V],
 	itemPool *sync.Pool,
 	statsEnabled bool,
-	admission *frequencyAdmissionFilter,
+	admission *adaptiveAdmissionFilter,
 	keyHash uint64,
 ) bool {
 	victim := e.pickVictim(s)
@@ -192,10 +192,13 @@ func (e admissionLFUEvictor[K, V]) evictWithAdmission(
 	freq := uint64(victim.frequency)
 	s.lastVictimFrequency = freq
 
-	if !admission.shouldAdmit(keyHash, freq) {
+	if !admission.shouldAdmit(keyHash, freq, victim.lastAccess) {
 		return false
 	}
 	e.removeVictim(s, victim, itemPool, statsEnabled)
+
+	admission.RecordEviction()
+
 	return true
 }
 
@@ -211,6 +214,6 @@ func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	case AdmissionLFU:
 		return admissionLFUEvictor[K, V]{sampleSize: 5}
 	default:
-		return fifoEvictor[K, V]{} // Safe default
+		return lfuEvictor[K, V]{} // Safe default
 	}
 }
