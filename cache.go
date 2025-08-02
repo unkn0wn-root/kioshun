@@ -90,7 +90,6 @@ type InMemoryCache[K comparable, V any] struct {
 	shardMask   uint64         // Bitmask for fast shard selection
 	config      Config
 	globalStats Stats
-	statsMux    sync.RWMutex
 	cleanupCh   chan struct{}
 	closeCh     chan struct{}
 	closeOnce   sync.Once
