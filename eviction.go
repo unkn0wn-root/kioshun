@@ -214,6 +214,6 @@ func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	case AdmissionLFU:
 		return admissionLFUEvictor[K, V]{sampleSize: 5}
 	default:
-		return lfuEvictor[K, V]{} // Safe default
+		return admissionLFUEvictor[K, V]{sampleSize: 5}
 	}
 }
