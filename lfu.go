@@ -36,51 +36,51 @@ func (l *lfuList[K, V]) add(item *cacheItem[V]) {
 
 // increment increases item frequency by 1
 func (l *lfuList[K, V]) increment(item *cacheItem[V]) {
-	currentNode := l.itemFreq[item]
-	if currentNode == nil {
+	cur := l.itemFreq[item]
+	if cur == nil {
+		// never seen → freq=1
 		l.add(item)
 		return
 	}
 
-	oldFreq := currentNode.freq
-	newFreq := oldFreq + 1
+	newFreq := cur.freq + 1
+	delete(cur.items, item)
 
-	delete(currentNode.items, item)
-
-	newNode := l.getOrCreateFreqNode(newFreq)
-	newNode.items[item] = struct{}{}
-	l.itemFreq[item] = newNode
+	nxt := cur.next
+	var target *freqNode[K, V]
+	if nxt != l.head && nxt.freq == newFreq {
+		target = nxt
+	} else {
+		target = l.ensureIndex(cur, newFreq)
+	}
+	target.items[item] = struct{}{}
+	l.itemFreq[item] = target
 	item.frequency = newFreq
 
-	if len(currentNode.items) == 0 && currentNode.freq != 0 {
-		l.removeFreqNode(currentNode)
+	// drop empty old bucket
+	if len(cur.items) == 0 && cur.freq != 0 {
+		l.removeFreqNode(cur)
 	}
 }
 
 // removeLFU removes and returns the least frequently used item
 func (l *lfuList[K, V]) removeLFU() *cacheItem[V] {
 	node := l.head.next
-	for node != l.head && len(node.items) == 0 {
-		node = node.next
-	}
-
 	if node == l.head {
-		return nil // Empty
+		return nil
 	}
-
+	// since we always unlink empty nodes, head.next is non-empty
 	var victim *cacheItem[V]
-	for item := range node.items {
-		victim = item
+	for it := range node.items {
+		victim = it
 		break
 	}
 
 	delete(node.items, victim)
 	delete(l.itemFreq, victim)
-
 	if len(node.items) == 0 {
 		l.removeFreqNode(node)
 	}
-
 	return victim
 }
 
@@ -99,9 +99,12 @@ func (l *lfuList[K, V]) remove(item *cacheItem[V]) {
 	}
 }
 
-// getOrCreateFreqNode ensures a frequency node exists in the right position
-func (l *lfuList[K, V]) getOrCreateFreqNode(freq int64) *freqNode[K, V] {
-	if node, exists := l.freqMap[freq]; exists {
+// ensureIndex returns the node for exactly `freq`:
+//   - if there's already a node at freq, return it
+//   - else splice a brand new node right after `prev`
+func (l *lfuList[K, V]) ensureIndex(prev *freqNode[K, V], freq int64) *freqNode[K, V] {
+	// fast-path: exact hit
+	if node, ok := l.freqMap[freq]; ok {
 		return node
 	}
 
@@ -110,18 +113,24 @@ func (l *lfuList[K, V]) getOrCreateFreqNode(freq int64) *freqNode[K, V] {
 		items: make(map[*cacheItem[V]]struct{}),
 	}
 
-	prev := l.head
-	for prev.next != l.head && prev.next.freq < freq {
-		prev = prev.next
-	}
-
-	newNode.next = prev.next
-	newNode.prev = prev
-	prev.next.prev = newNode
+	nxt := prev.next
 	prev.next = newNode
+	newNode.prev = prev
+	newNode.next = nxt
+	nxt.prev = newNode
 
 	l.freqMap[freq] = newNode
 	return newNode
+}
+
+// get 1-node (for new items) is always head.next==freq=0, so we splice after head
+func (l *lfuList[K, V]) getOrCreateFreqNode(freq int64) *freqNode[K, V] {
+	if freq == 1 {
+		return l.ensureIndex(l.head, 1)
+	}
+	// otherwise find your current node and insert after it
+	prev := l.freqMap[freq-1]
+	return l.ensureIndex(prev, freq)
 }
 
 // removeFreqNode removes an empty frequency node
