@@ -5,13 +5,12 @@ import (
 	"sync/atomic"
 )
 
-
 // shard represents a cache partition to reduce lock contention
 type shard[K comparable, V any] struct {
 	mu                  sync.RWMutex
 	data                map[K]*cacheItem[V]
-	head                *cacheItem[V] // LRU head (most recently used)
-	tail                *cacheItem[V] // LRU tail (least recently used)
+	head                *cacheItem[V]  // LRU head (most recently used)
+	tail                *cacheItem[V]  // LRU tail (least recently used)
 	lfuList             *lfuList[K, V] // For LFU eviction
 	size                int64          // Current number of items
 	hits                int64

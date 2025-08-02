@@ -48,14 +48,14 @@ func TestAllEvictionPolicies(t *testing.T) {
 
 			// Test that cache still works
 			cache.Set("test", 999, time.Hour)
-			
+
 			// For AdmissionLFU, the test item might be rejected by admission control
 			if policies[i] == AdmissionLFU {
 				// Try accessing the item to build frequency for admission
 				cache.Get("test")
 				cache.Set("test", 999, time.Hour) // Try again with higher chance
 			}
-			
+
 			if val, found := cache.Get("test"); !found || val != 999 {
 				if policies[i] == AdmissionLFU {
 					t.Logf("Test item was rejected by AdmissionLFU admission control - expected behavior")
@@ -816,7 +816,7 @@ func TestAdmissionLFUFrequencyThreshold(t *testing.T) {
 
 	finalEvictions := cache.Stats().Evictions
 	t.Logf("Evictions: %d", finalEvictions-initialEvictions)
-	
+
 	// Admission control may prevent evictions by rejecting items at the door
 	if finalEvictions <= initialEvictions {
 		t.Log("No evictions occurred - admission control prevented cache entry")
@@ -930,7 +930,7 @@ func TestAdmissionLFUDoorkeeperBehavior(t *testing.T) {
 
 	finalEvictions := cache.Stats().Evictions
 	t.Logf("Evictions: %d", finalEvictions-initialEvictions)
-	
+
 	// Admission control may prevent evictions by rejecting items
 	if finalEvictions <= initialEvictions {
 		t.Log("No evictions occurred - admission control working effectively")
