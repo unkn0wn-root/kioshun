@@ -17,8 +17,7 @@
 
 - [Architecture](#architecture)
   - [Sharded Design](#sharded-design)
-  - [Eviction Policy Implementation](#eviction-policy-implementation)
-  - [Memory Management](#memory-management)
+  - [Evictions Implementation](#eviction-policy-implementation)
   - [Eviction Policies](#eviction-policies)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -80,34 +79,40 @@ Items      Items        Items        Items
 - **Eviction**: Remove oldest item (at tail) in O(1)
 - **Memory**: Minimal overhead per item
 
-#### AdmissionLFU (Admission-controlled Least Frequently Used)
+#### AdmissionLFU (Adaptive Admission-controlled Least Frequently Used)
 - **Access**: Update frequency counter in O(1), no heap maintenance
 - **Eviction**: Random sampling (default 5 items, configurable up to 20) with LFU selection in O(k) where k = sample size
-- **Admission Control**: Multi-layer frequency-based admission with Count-Min Sketch and doorkeeper bloom filter
-- **Memory**: Frequency bloom filter (10x shard size counters) + doorkeeper bloom filter (1/8 size) per shard
+- **Admission Control**: Adaptive multi-layer frequency-based admission with Count-Min Sketch, doorkeeper bloom filter, and scan resistance
+- **Scan Resistance**: Detects and adapts to scanning workloads (high admission rates, sequential access patterns, consecutive misses)
+- **Memory**: Frequency bloom filter (10x shard size counters) + doorkeeper bloom filter (1/8 size) + workload detector per shard
 
 **AdmissionLFU Architecture:**
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              AdmissionLFU Shard                                 │
+│                          Adaptive AdmissionLFU Shard                            │
 ├─────────────────────────────┬───────────────────────────────────────────────────┤
-│   Frequency Admission Filter│                Cache Items                        │
+│ Adaptive Admission Filter   │                Cache Items                        │
 │  ┌─────────────────────────┐│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                  │
 │  │  Frequency Bloom Filter ││  │Item │ │Item │ │Item │ │Item │ ...              │
 │  │  Count-Min Sketch       ││  │Freq:│ │Freq:│ │Freq:│ │Freq:│                  │
 │  │  4-bit counters x10*cap ││  │  5  │ │  12 │ │  3  │ │  8  │                  │
 │  │  Hash: 4 functions      ││  └─────┘ └─────┘ └─────┘ └─────┘                  │
-│  └─────────────────────────┘│                                                   │
-│  ┌─────────────────────────┐│  Random Sample 5 → Compare Frequencies            │
-│  │    Doorkeeper Filter    ││  Victim Selection: Min(freq, lastAccess)          │
-│  │    Bloom Filter         ││  ↓                                                │
-│  │    Size: cap/8          ││  Admission Decision vs Victim Frequency           │
-│  │    Hash: 3 functions    ││                                                   │
-│  │    Reset: 1min interval ││  Admit Rules:                                     │
-│  └─────────────────────────┘│  • freq ≥ 3: Always admit                         │
-│                             │  • freq > victim: Always admit                    │
-│                             │  • freq = victim & freq > 0: 50% chance           │
-│                             │  • else: 70% - (victim_freq * 10)%                │
+│  │  Auto-aging threshold   ││                                                   │
+│  └─────────────────────────┘│  Random Sample 5 → Compare Frequencies            │
+│  ┌─────────────────────────┐│  Victim Selection: Min(freq, lastAccess)          │
+│  │    Doorkeeper Filter    ││  ↓                                                │
+│  │    Bloom Filter         ││  Adaptive Admission Decision                      │
+│  │    Size: cap/8          ││                                                   │
+│  │    Hash: 3 functions    ││  Normal Mode:                                     │
+│  │    Reset: 1min interval ││  • freq ≥ 3: Always admit                         │
+│  └─────────────────────────┘│  • freq > victim: Always admit                    │
+│  ┌─────────────────────────┐│  • freq = victim & freq > 0: Recency-based        │
+│  │   Workload Detector     ││  • else: Adaptive probability 5-95%               │
+│  │   Sequential patterns   ││                                                   │
+│  │   Admission rate track  ││  Scan Mode (detected patterns):                   │
+│  │   Miss streak tracking  ││  • Recency-based admission                        │
+│  │   Adaptive probability  ││  • Lower admission threshold                      │
+│  └─────────────────────────┘│  • Protect against cache pollution                │
 └─────────────────────────────┴───────────────────────────────────────────────────┘
 ```
 
@@ -125,34 +130,50 @@ Items      Items        Items        Items
    - Periodic reset every 1 minute (configurable via AdmissionResetInterval)
    - Immediate admission for items in doorkeeper (bypass frequency check)
 
-3. **Admission Algorithm**:
+3. **Workload Detector (Scan Resistance)**:
+   - Tracks admission rate (admissions/second) with threshold of 100/sec
+   - Detects sequential access patterns using circular buffer of recent keys
+   - Monitors consecutive miss streaks with threshold of 50 misses
+   - Adapts admission strategy during detected scanning workloads
+
+4. **Adaptive Admission Algorithm**:
    ```
    Phase 1: Doorkeeper Check
    if in_doorkeeper(key):
        refresh_doorkeeper(key)
        return ADMIT
 
-   Phase 2: Update Frequency
+   Phase 2: Scan Detection
+   if detect_scan(key):
+       if victim_age > 100ms:
+           return ADMIT    // Prefer recent items during scan
+       else:
+           return ADMIT if hash(key) % 100 < min_probability(5%)
+
+   Phase 3: Update Frequency & Doorkeeper
    new_freq = frequency_filter.increment(key)
    doorkeeper.add(key)
 
-   Phase 3: Admission Decision
+   Phase 4: Adaptive Admission Decision
    if new_freq >= 3:                    // High frequency guarantee
        return ADMIT
    elif new_freq > victim_frequency:    // Better than victim
        return ADMIT
-   elif new_freq == victim_frequency && new_freq > 0:  // Tie-breaking
-       return ADMIT if hash(key) % 2 == 0
-   else:                                // Probabilistic admission
-       threshold = 70 - (victim_frequency * 10)
-       return ADMIT if hash(key) % 100 < threshold
+   elif new_freq == victim_frequency && new_freq > 0:  // Recency tie-breaking
+       return ADMIT if victim_age > 1_second
+   else:                                // Adaptive probabilistic admission
+       probability = adaptive_probability(5-95%) - (victim_frequency * 10)
+       return ADMIT if hash(key) % 100 < max(probability, 5%)
+
+   Phase 5: Probability Adjustment
+   adjust_probability_based_on_eviction_pressure()
    ```
 
-### Memory Management
-- **Object Pooling**: Reuses `cacheItem` objects to reduce GC pressure
-- **Atomic Statistics**: Per-shard metrics tracked with atomic operations
-- **Lazy Initialization**: LFU heaps only created when LFU policy is selected
-- **Cleanup**: Background goroutine removes expired items periodically
+5. **Adaptive Probability Control**:
+   - Dynamic admission probability between 5% and 95%
+   - Decreases probability (-5%) when eviction rate > 100/second
+   - Increases probability (+5%) when eviction rate < 10/second
+   - Eviction pressure monitored every second
 
 ### Eviction Policies
 
