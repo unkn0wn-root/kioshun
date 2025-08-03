@@ -32,59 +32,120 @@
 
 ### Sharded Design
 
-Kioshun uses a sharded architecture to minimize lock contention:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Kioshun Cache                          │
-├─────────────┬─────────────┬─────────────┬───────────────────┤
-│   Shard 0   │   Shard 1   │   Shard 2   │   ...   │ Shard N │
-│  RWMutex    │  RWMutex    │  RWMutex    │         │ RWMutex │
-│  LRU List   │  LRU List   │  LRU List   │         │ LRU List│
-│  LFU Heap   │  LFU Heap   │  LFU Heap   │         │ LFU Heap│
-│  Hash Map   │  Hash Map   │  Hash Map   │         │ Hash Map│
-│  Stats      │  Stats      │  Stats      │         │ Stats   │
-└─────────────┴─────────────┴─────────────┴───────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            Kioshun Cache                                 │
+├─────────────────┬─────────────────┬─────────────────┬─────────────────────┤
+│     Shard 0     │     Shard 1     │     Shard 2     │  ...  │   Shard N   │
+│   RWMutex       │   RWMutex       │   RWMutex       │       │   RWMutex   │
+│                 │                 │                 │       │             │
+│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │       │ ┌─────────┐ │
+│ │ Hash Map    │ │ │ Hash Map    │ │ │ Hash Map    │ │       │ │Hash Map │ │
+│ │ K -> Item   │ │ │ K -> Item   │ │ │ K -> Item   │ │       │ │K -> Item│ │
+│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │       │ └─────────┘ │
+│                 │                 │                 │       │             │
+│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │       │ ┌─────────┐ │
+│ │ LRU List    │ │ │ LRU List    │ │ │ LRU List    │ │       │ │LRU List │ │
+│ │ head ←→ tail│ │ │ head ←→ tail│ │ │ head ←→ tail│ │       │ │head↔tail│ │
+│ │ (sentinel)  │ │ │ (sentinel)  │ │ │ (sentinel)  │ │       │ │(sentinel│ │
+│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │       │ └─────────┘ │
+│                 │                 │                 │       │             │
+│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │       │ ┌─────────┐ │
+│ │LFU FreqList │ │ │LFU FreqList │ │ │LFU FreqList │ │       │ │LFU Freq │ │
+│ │(if LFU mode)│ │ │(if LFU mode)│ │ │(if LFU mode)│ │       │ │(LFU only│ │
+│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │       │ └─────────┘ │
+│                 │                 │                 │       │             │
+│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │       │ ┌─────────┐ │
+│ │Admission    │ │ │Admission    │ │ │Admission    │ │       │ │Admission│ │
+│ │Filter       │ │ │Filter       │ │ │Filter       │ │       │ │Filter   │ │
+│ │(AdmLFU only)│ │ │(AdmLFU only)│ │ │(AdmLFU only)│ │       │ │(AdmLFU) │ │
+│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │       │ └─────────┘ │
+│                 │                 │                 │       │             │
+│ Stats Counter   │ Stats Counter   │ Stats Counter   │       │ Stats       │
+└─────────────────┴─────────────────┴─────────────────┴─────────────────────┘
 ```
 
-- Keys distributed across shards using optimized hash functions
+- Keys distributed across shards using FNV-1a hash functions with bit mixing
 - Each shard maintains independent read-write mutex
-- Auto-detection based on CPU cores
-- Object pooling to reduce GC pressure
+- Shard count auto-detected based on CPU cores (default: 2×CPU cores, minimum 16)
+- Object pooling reduces GC pressure
 
 ### Eviction Policy Implementation
 
 #### LRU (Least Recently Used)
-- **Access**: Move to head in O(1)
-- **Eviction**: Remove tail in O(1)
-- **Memory**: Minimal overhead per item
+**Implementation**: Circular doubly-linked list with sentinel nodes
+- **Access**: Move item to head position in O(1) - bypasses null checks using sentinels
+- **Eviction**: Remove least recent item (tail.prev) in O(1)
+- **Memory**: Minimal overhead per item (2 pointers: prev, next)
+- head ←→ item1 ←→ item2 ←→ ... ←→ itemN ←→ tail (sentinels)
 
-#### LFU (Least Frequently Used) - **Optimized**
-Uses min-heap for efficient frequency-based eviction:
-- **Access**: Update frequency and rebalance heap in O(log n)
-- **Eviction**: Remove minimum frequency item in O(log n)
-- **Memory**: Additional heap index per item
+**LRU Operations:**
+```go
+// O(1) access update - no null checks needed due to sentinels
+moveToLRUHead(item):
+  if head.next == item: return  // already at head
+  remove item from current position
+  insert item after head sentinel
 
-**LFU Heap Structure:**
+// O(1) eviction - always valid due to sentinel structure
+evictLRU():
+  victim = tail.prev           // LRU item
+  removeFromLRU(victim)        // unlink from list
+  delete from hashmap          // remove from shard.data
 ```
-       Min Frequency Item (Root)
-      /                        \
-   Higher Freq              Higher Freq
-  /          \              /          \
-Items      Items        Items        Items
+
+#### LFU (Least Frequently Used) - **Frequency-Node Architecture**
+**Implementation**: Doubly-linked list of frequency buckets, each containing items with same access count
+- **Access**: Increment frequency and move item to next bucket in O(1) amortized
+- **Eviction**: Remove item from lowest frequency bucket in O(1)
+- **Memory**: Additional frequency tracking per item + bucket management
+
+**LFU Structure:**
+```
+Frequency Buckets (sorted by access count):
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ Freq: 1  │←→  │ Freq: 2  │←→  │ Freq: 5  │←→  │ Freq: 8  │
+│ item1    │    │ item3    │    │ item2    │    │ item4    │
+│ item5    │    │ item7    │    │          │    │          │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+```
+
+**LFU Operations:**
+```go
+// O(1) amortized frequency increment
+increment(item):
+  currentBucket = itemFreq[item]
+  newFreq = currentBucket.freq + 1
+
+  // Move to next bucket or create new one
+  if nextBucket.freq == newFreq:
+    target = nextBucket
+  else:
+    target = createBucket(newFreq) // splice after current
+
+  move item from currentBucket to target
+  if currentBucket.isEmpty(): removeBucket(currentBucket)
+
+// O(1) eviction from lowest frequency bucket
+evictLFU():
+  lowestBucket = head.next     // first non-sentinel bucket
+  victim = any item from lowestBucket.items
+  remove victim from bucket and hashmap
 ```
 
 #### FIFO (First In, First Out)
-- **Access**: No updates required on access
-- **Eviction**: Remove oldest item (at tail) in O(1)
-- **Memory**: Minimal overhead per item
+**Implementation**: Uses LRU list structure but treats it as insertion-order queue
+- **Access**: No position updates on access (maintains insertion order)
+- **Eviction**: Remove oldest inserted item (at tail.prev) in O(1)
 
-#### AdmissionLFU (Adaptive Admission-controlled Least Frequently Used)
-- **Access**: Update frequency counter in O(1), no heap maintenance
-- **Eviction**: Random sampling (default 5 items, configurable up to 20) with LFU selection in O(k) where k = sample size
-- **Admission Control**: Adaptive multi-layer frequency-based admission with Count-Min Sketch, doorkeeper bloom filter, and scan resistance
-- **Scan Resistance**: Detects and adapts to scanning workloads (high admission rates, sequential access patterns, consecutive misses)
-- **Memory**: Frequency bloom filter (10x shard size counters) + doorkeeper bloom filter (1/8 size) + workload detector per shard
+#### AdmissionLFU (Adaptive Admission-controlled Least Frequently Used) - **Default**
+**Implementation**: Approximate LFU with admission control and scan resistance
+- **Access**: Update frequency counter in O(1) using Count-Min Sketch, no heap maintenance
+- **Eviction**: Random sampling (default 5 items, max 20) with LFU selection in O(k) where k = sample size
+- **Admission Control**: Multi-layered frequency-based admission with adaptive thresholds
+- **Scan Resistance**: Detects and adapts to scanning workloads automatically
+- Frequency bloom filter (10×shard size) + doorkeeper bloom filter (1/8 size) + workload detector per shard
 
 **AdmissionLFU Architecture:**
 ```
@@ -411,20 +472,18 @@ The middleware supports different eviction algorithms that can be configured bas
 ```go
 config := cache.DefaultMiddlewareConfig()
 
-// FIFO (First In, First Out) - Best Performance
+// FIFO (First In, First Out)
 config.EvictionPolicy = cache.FIFO
 
-// LRU (Least Recently Used) - General Purpose
+// LRU (Least Recently Used)
 config.EvictionPolicy = cache.LRU
 
-// LFU (Least Frequently Used) - Frequency-Based
+// LFU (Least Frequently Used)
 config.EvictionPolicy = cache.LFU
 
 // AdmissionLFU - Approximate LFU with Admission Control
 config.EvictionPolicy = cache.AdmissionLFU
 ```
-
-**Recommend**: For most HTTP middlewares, **FIFO** offers the best performance and is suitable for most web apps where request patterns follow temporal locality.
 
 ### Built-in Cache Policies
 
