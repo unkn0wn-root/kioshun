@@ -68,7 +68,7 @@
 
 - Keys distributed across shards using FNV-1a hash functions with bit mixing
 - Each shard maintains independent read-write mutex
-- Shard count auto-detected based on CPU cores (default: 2×CPU cores, minimum 16)
+- Shard count auto-detected based on CPU cores (default: 4×CPU cores, max 256)
 - Object pooling reduces GC pressure
 
 ### Eviction Policy Implementation
@@ -240,10 +240,10 @@ evictLFU():
 
 ```go
 const (
-    LRU        EvictionPolicy = iota // Least Recently Used (default)
+    LRU        EvictionPolicy = iota // Least Recently Used
     LFU                              // Least Frequently Used
     FIFO                             // First In, First Out
-    AdmissionLFU                     // Sampled LFU with admission control
+    AdmissionLFU                     // Sampled LFU with admission control (default)
 )
 ```
 
@@ -300,7 +300,7 @@ config := cache.Config{
     ShardCount:      16,               // Number of shards (0 = auto-detect)
     CleanupInterval: 5 * time.Minute,  // Cleanup frequency
     DefaultTTL:      30 * time.Minute, // Default expiration time
-    EvictionPolicy:  cache.LRU,        // Eviction algorithm
+    EvictionPolicy:  cache.AdmissionLFU, // Eviction algorithm (default)
     StatsEnabled:    true,             // Enable statistics collection
 }
 
