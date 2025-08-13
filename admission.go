@@ -15,6 +15,11 @@ const (
 	baseAdmissionRate  = 70 // Base chance (in percent) to admit low-frequency items
 	frequencyThreshold = 3  // Guaranteed admission for items seen at least this many times
 
+	// Eviction pressure thresholds
+	highEvictionRateThreshold = 100 // Treshold for reducing admission probability
+	lowEvictionRateThreshold  = 10  // Threshold for increasing admission probability
+	admissionProbabilityStep  = 5   // Step size for admission probability adjustment
+
 	// Bit-array and counter packing params
 	bitsPerWord   = 64   // Bits per uint64 for bit array indexing
 	frequencyMask = 0x0F // Mask for 4-bit counter
@@ -32,6 +37,11 @@ const (
 	scanSequenceThreshold  = 8   // Sequential accesses that indicate scanning
 	scanMissThreshold      = 50  // Consecutive misses that suggest scanning
 	sequenceBufferSize     = 16  // Size of circular buffer for sequence detection
+
+	// Time-based thresholds
+	scanModeRecencyThreshold = 100e6 // 100ms in nanoseconds - victim age threshold during scanning
+	recencyTieBreakThreshold = 1e9   // 1 second in nanoseconds - recency threshold for frequency ties
+	evictionPressureInterval = 1e9   // 1 second in nanoseconds - interval for eviction pressure monitoring
 )
 
 // hashN applies a bit-rotation and a simple avalanche mixing,
@@ -385,8 +395,8 @@ func (aaf *adaptiveAdmissionFilter) admitDuringScan(keyHash uint64, victimAge in
 	now := time.Now().UnixNano()
 
 	// During scanning, prefer recency over frequency
-	// Admit if victim is older than 100ms (keep recent items)
-	if victimAge > 0 && now-victimAge > 100e6 {
+	// Admit if victim is older than threshold (keep recent items)
+	if victimAge > 0 && now-victimAge > scanModeRecencyThreshold {
 		return true
 	}
 	return (keyHash % 100) < uint64(aaf.minProbability)
@@ -409,8 +419,8 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, vict
 		if victimAge > 0 {
 			now := time.Now().UnixNano()
 			victimRecency := now - victimAge
-			// Prefer newer items for ties (victim older than 1 second)
-			return victimRecency > 1e9
+			// Prefer newer items for ties (victim older than threshold)
+			return victimRecency > recencyTieBreakThreshold
 		}
 		return (keyHash % 2) == 0
 	}
@@ -430,23 +440,23 @@ func (aaf *adaptiveAdmissionFilter) adjustAdmissionProbability() {
 	now := time.Now().UnixNano()
 	window := atomic.LoadInt64(&aaf.evictionWindow)
 
-	if now-window > 1e9 { // Every second
+	if now-window > evictionPressureInterval { // Every second
 		evictions := atomic.LoadUint64(&aaf.recentEvictions)
 		currentProb := atomic.LoadUint32(&aaf.admissionProbability)
 
 		// High eviction rate: decrease admission probability
-		if evictions > 100 {
+		if evictions > highEvictionRateThreshold {
 			newProb := currentProb
-			if newProb > 5 {
-				newProb -= 5
+			if newProb > admissionProbabilityStep {
+				newProb -= admissionProbabilityStep
 			}
 			if newProb < aaf.minProbability {
 				newProb = aaf.minProbability
 			}
 			atomic.StoreUint32(&aaf.admissionProbability, newProb)
-		} else if evictions < 10 {
+		} else if evictions < lowEvictionRateThreshold {
 			// Low eviction rate: increase admission probability
-			newProb := currentProb + 5
+			newProb := currentProb + admissionProbabilityStep
 			if newProb > aaf.maxProbability {
 				newProb = aaf.maxProbability
 			}

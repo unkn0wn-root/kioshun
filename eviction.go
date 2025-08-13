@@ -5,6 +5,12 @@ import (
 	"sync/atomic"
 )
 
+const (
+	// AdmissionLFU sampling parameters
+	defaultAdmissionLFUSampleSize = 5
+	maxAdmissionLFUSampleSize     = 20
+)
+
 // evictor defines the interface for cache eviction policies.
 // Select which item to remove when the cache reaches capacity.
 type evictor[K comparable, V any] interface {
@@ -115,9 +121,9 @@ func (e admissionLFUEvictor[K, V]) pickVictim(s *shard[K, V]) *cacheItem[V] {
 
 	n := e.sampleSize
 	if n <= 0 {
-		n = 5
-	} else if n > 20 {
-		n = 20
+		n = defaultAdmissionLFUSampleSize
+	} else if n > maxAdmissionLFUSampleSize {
+		n = maxAdmissionLFUSampleSize
 	}
 	if n > len(s.data) {
 		n = len(s.data)
@@ -212,8 +218,8 @@ func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	case FIFO:
 		return fifoEvictor[K, V]{}
 	case AdmissionLFU:
-		return admissionLFUEvictor[K, V]{sampleSize: 5}
+		return admissionLFUEvictor[K, V]{sampleSize: defaultAdmissionLFUSampleSize}
 	default:
-		return admissionLFUEvictor[K, V]{sampleSize: 5}
+		return admissionLFUEvictor[K, V]{sampleSize: defaultAdmissionLFUSampleSize}
 	}
 }
