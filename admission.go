@@ -253,7 +253,13 @@ type workloadDetector struct {
 	consecutiveMisses   uint64                     // Consecutive cache misses
 	lastKeys            [sequenceBufferSize]uint64 // Recent key hashes for sequence detection
 	lastKeyIndex        uint32                     // Current position in circular buffer
-	sequenceCount       uint32                     // Count of sequential accesses
+	// Lightweight novelty detector for the current 1s window:
+	// seen64 is a 64-bit bitset indexed by (keyHash & 63).
+	// uniqueInWindow counts how many *new* bits we set in the window.
+	seen64         uint64
+	uniqueInWindow uint64
+	// reuse sequenceCount to mean "consecutive *novel* keys" (uniqueness streak).
+	sequenceCount uint32
 }
 
 // newWorkloadDetector creates a new scan detector
@@ -275,22 +281,35 @@ func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 			atomic.StoreUint64(&wd.admissionRate, rate)
 		}
 		atomic.StoreUint64(&wd.recentAdmissions, 0)
+		atomic.StoreUint64(&wd.uniqueInWindow, 0)
+		atomic.StoreUint64(&wd.seen64, 0)
+		atomic.StoreUint32(&wd.sequenceCount, 0)
 		atomic.StoreInt64(&wd.recentAdmissionTime, now)
 	}
 
-	idx := atomic.LoadUint32(&wd.lastKeyIndex)
-	lastKey := wd.lastKeys[idx&(sequenceBufferSize-1)]
-
-	if keyHash == lastKey+1 {
-		atomic.AddUint32(&wd.sequenceCount, 1)
+	// novelty bit (cheap mini-Bloom):
+	mask := uint64(1) << (keyHash & 63)
+	unique := false
+	for {
+		old := atomic.LoadUint64(&wd.seen64)
+		if (old & mask) != 0 {
+			break // already seen in this window
+		}
+		if atomic.CompareAndSwapUint64(&wd.seen64, old, old|mask) {
+			unique = true
+			atomic.AddUint64(&wd.uniqueInWindow, 1)
+			break
+		}
+		// CAS failed; retry
+	}
+	if unique {
+		atomic.AddUint32(&wd.sequenceCount, 1) // count consecutive *novel* keys
 	} else {
 		atomic.StoreUint32(&wd.sequenceCount, 0)
 	}
 
-	atomic.AddUint32(&wd.lastKeyIndex, 1)
-	wd.lastKeys[(idx+1)&(sequenceBufferSize-1)] = keyHash
-
 	return atomic.LoadUint64(&wd.admissionRate) > scanAdmissionThreshold ||
+		atomic.LoadUint32(&wd.sequenceCount) > scanSequenceThreshold ||
 		atomic.LoadUint32(&wd.sequenceCount) > scanSequenceThreshold ||
 		atomic.LoadUint64(&wd.consecutiveMisses) > scanMissThreshold
 }
@@ -299,6 +318,8 @@ func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 func (wd *workloadDetector) recordAdmission() {
 	atomic.AddUint64(&wd.recentAdmissions, 1)
 	atomic.StoreUint64(&wd.consecutiveMisses, 0) // Reset miss counter on admission
+	// An admission usually means locality; break the "unique streak" quickly.
+	atomic.StoreUint32(&wd.sequenceCount, 0)
 }
 
 // recordRejection updates tracking for rejection decisions
@@ -309,27 +330,19 @@ func (wd *workloadDetector) recordRejection() {
 // adaptiveAdmissionFilter combines frequency-based admission with scan resistance
 // and dynamic probability adjustment based on cache pressure.
 type adaptiveAdmissionFilter struct {
-	frequencyFilter *frequencyBloomFilter
-	doorkeeper      *bloomFilter
-	detector        *workloadDetector
-
-	// Adaptive parameters
+	frequencyFilter      *frequencyBloomFilter
+	doorkeeper           *bloomFilter
+	detector             *workloadDetector
 	admissionProbability uint32 // Current admission probability (0-100)
 	minProbability       uint32 // Minimum admission probability
 	maxProbability       uint32 // Maximum admission probability
-
-	// Eviction tracking for adaptive behavior
-	recentEvictions uint64 // Track recent eviction count
-	evictionWindow  int64  // Time window for eviction tracking
-
-	// Periodic reset
-	resetInterval int64 // nanoseconds between automatic resets
-	lastReset     int64 // timestamp of the last reset
-
-	// Statistics
-	admissionRequests uint64 // total calls to shouldAdmit
-	admissionGrants   uint64 // total times shouldAdmit returned true
-	scanRejections    uint64 // rejections due to scan detection
+	recentEvictions      uint64 // Track recent eviction count
+	evictionWindow       int64  // Time window for eviction tracking
+	resetInterval        int64  // nanoseconds between automatic resets
+	lastReset            int64  // timestamp of the last reset
+	admissionRequests    uint64 // total calls to shouldAdmit
+	admissionGrants      uint64 // total times shouldAdmit returned true
+	scanRejections       uint64 // rejections due to scan detection
 }
 
 // NewAdaptiveAdmissionFilter creates a new adaptive scan-resistant admission filter
@@ -354,6 +367,7 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency 
 
 	if aaf.doorkeeper.contains(keyHash) {
 		aaf.doorkeeper.add(keyHash) // Refresh the bit
+		_ = aaf.frequencyFilter.increment(keyHash)
 		aaf.detector.recordAdmission()
 		atomic.AddUint64(&aaf.admissionGrants, 1)
 		return true
@@ -386,7 +400,6 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency 
 	} else {
 		aaf.detector.recordRejection()
 	}
-
 	return admit
 }
 
@@ -408,12 +421,10 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, vict
 	if newFreq >= frequencyThreshold {
 		return true
 	}
-
 	// Admit if higher frequency than victim
 	if newFreq > victimFrequency {
 		return true
 	}
-
 	// Handle ties with recency consideration
 	if newFreq == victimFrequency && newFreq > 0 {
 		if victimAge > 0 {
@@ -427,7 +438,13 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, vict
 
 	// Probabilistic admission with adaptive threshold
 	prob := atomic.LoadUint32(&aaf.admissionProbability)
-	adjustedProb := int64(prob) - int64(victimFrequency*10)
+	// Cap the penalty from a very large victim frequency, so old items don't become immortal.
+	vf := victimFrequency
+	if vf > 5 { // max 50% penalty
+		vf = 5
+	}
+
+	adjustedProb := int64(prob) - int64(vf*10)
 	if adjustedProb < int64(aaf.minProbability) {
 		adjustedProb = int64(aaf.minProbability)
 	}
@@ -443,7 +460,6 @@ func (aaf *adaptiveAdmissionFilter) adjustAdmissionProbability() {
 	if now-window > evictionPressureInterval { // Every second
 		evictions := atomic.LoadUint64(&aaf.recentEvictions)
 		currentProb := atomic.LoadUint32(&aaf.admissionProbability)
-
 		// High eviction rate: decrease admission probability
 		if evictions > highEvictionRateThreshold {
 			newProb := currentProb

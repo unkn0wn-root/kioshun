@@ -89,6 +89,11 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 	for key, item := range s.data {
 		if item.expireTime > 0 && now > item.expireTime {
 			keysToDelete = append(keysToDelete, key)
+			continue
+		}
+		// light per-item aging for AdmissionLFU: keeps frequencies from becoming immortal.
+		if evictionPolicy == AdmissionLFU && item.frequency > 1 {
+			item.frequency >>= 1 // halve
 		}
 	}
 
