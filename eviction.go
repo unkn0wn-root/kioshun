@@ -146,12 +146,7 @@ func (e admissionLFUEvictor[K, V]) pickVictim(s *shard[K, V]) *cacheItem[V] {
 }
 
 // removeVictim unlinks & deletes the given item and updates size/stats.
-func (e admissionLFUEvictor[K, V]) removeVictim(
-	s *shard[K, V],
-	victim *cacheItem[V],
-	itemPool *sync.Pool,
-	statsEnabled bool,
-) {
+func (e admissionLFUEvictor[K, V]) removeVictim(s *shard[K, V], victim *cacheItem[V], itemPool *sync.Pool, statsEnabled bool) {
 	if key, ok := victim.key.(K); ok {
 		delete(s.data, key)
 	}
@@ -195,10 +190,12 @@ func (e admissionLFUEvictor[K, V]) evictWithAdmission(
 	if victim == nil {
 		return false
 	}
+
 	freq := uint64(victim.frequency)
+	victimAge := victim.lastAccess
 	s.lastVictimFrequency = freq
 
-	if !admission.shouldAdmit(keyHash, freq, victim.lastAccess) {
+	if !admission.shouldAdmit(keyHash, freq, victimAge) {
 		return false
 	}
 	e.removeVictim(s, victim, itemPool, statsEnabled)

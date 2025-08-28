@@ -90,6 +90,7 @@ type InMemoryCache[K comparable, V any] struct {
 	shardMask   uint64         // Bitmask for fast shard selection
 	config      Config
 	globalStats Stats
+	perShardCap int64
 	cleanupCh   chan struct{}
 	closeCh     chan struct{}
 	closeOnce   sync.Once
@@ -112,6 +113,23 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 			shardCount = maxShardCount
 		}
 	}
+
+	// if MaxSize is set, cap shardCount to the largest power-of-two
+	// that is ≤ min(MaxSize, maxShardCount). This prevents perShardCap==0
+	// when MaxSize < shardCount, while preserving even distribution + mask math.
+	if config.MaxSize > 0 {
+		limit := config.MaxSize
+		if limit > int64(maxShardCount) {
+			limit = int64(maxShardCount)
+		}
+		maxPow2 := 1
+		for (int64(maxPow2) << 1) <= limit {
+			maxPow2 <<= 1
+		}
+		if shardCount > maxPow2 {
+			shardCount = maxPow2
+		}
+	}
 	shardCount = nextPowerOf2(shardCount)
 
 	cache := &InMemoryCache[K, V]{
@@ -127,23 +145,28 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		},
 	}
 
+	// Compute per-shard capacity once (FLOOR division).
+	// This guarantees total capacity across shards <= MaxSize.
+	if config.MaxSize > 0 {
+		cache.perShardCap = config.MaxSize / int64(shardCount)
+	}
+
 	cache.hasher = newHasher[K]()
 	cache.evictor = createEvictor[K, V](config.EvictionPolicy)
 
-	shardMaxSize := config.MaxSize / int64(shardCount)
 	for i := 0; i < shardCount; i++ {
 		s := &shard[K, V]{
 			data: make(map[K]*cacheItem[V]),
 		}
+
 		// LRU list is used for all eviction policies to maintain insertion order
 		s.initLRU()
 
 		if config.EvictionPolicy == LFU {
 			s.lfuList = newLFUList[K, V]()
 		}
-
-		if config.EvictionPolicy == AdmissionLFU && shardMaxSize > 0 {
-			nc := uint64(shardMaxSize * 10)
+		if config.EvictionPolicy == AdmissionLFU && cache.perShardCap > 0 {
+			nc := uint64(cache.perShardCap * 10)
 			if nc < 1024 {
 				nc = 1024 // Minimum counters per shard
 			}
@@ -154,7 +177,6 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 			}
 			s.admission = newAdaptiveAdmissionFilter(nc, resetInterval)
 		}
-
 		cache.shards[i] = s
 	}
 
@@ -184,7 +206,6 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return nil, 0, false
 	}
-
 	shard := c.getShard(key)
 
 	nw := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
@@ -230,10 +251,10 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 		shard.moveToLRUHead(item)
 	case LFU:
 		item.lastAccess = now
-		atomic.AddInt64(&item.frequency, 1)
+		item.frequency++
 		shard.lfuList.increment(item)
 	case AdmissionLFU:
-		item.lastAccess = now
+		atomic.StoreInt64(&item.lastAccess, now)
 		atomic.AddInt64(&item.frequency, 1)
 	}
 
@@ -275,7 +296,6 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
 	}
-
 	if ttl == 0 {
 		ttl = c.config.DefaultTTL
 	}
@@ -310,8 +330,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		return nil
 	}
 
-	maxShardSize := c.config.MaxSize / int64(len(c.shards))
-	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
+	if c.perShardCap > 0 && atomic.LoadInt64(&shard.size) >= c.perShardCap {
 		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
 			admissionEvictor := c.evictor.(admissionLFUEvictor[K, V])
 			// sample → admission → eviction:
@@ -463,7 +482,6 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 		}
 		return false
 	}
-
 	return true
 }
 
@@ -486,7 +504,6 @@ func (c *InMemoryCache[K, V]) Keys() []K {
 		}
 		shard.mu.RUnlock()
 	}
-
 	return keys
 }
 
@@ -519,7 +536,6 @@ func (c *InMemoryCache[K, V]) Stats() Stats {
 			stats.HitRatio = float64(stats.Hits) / float64(total)
 		}
 	}
-
 	return stats
 }
 
@@ -527,9 +543,9 @@ func (c *InMemoryCache[K, V]) Stats() Stats {
 func (c *InMemoryCache[K, V]) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
-		atomic.StoreInt32(&c.closed, 1)
 		close(c.closeCh)
 		c.Clear()
+		atomic.StoreInt32(&c.closed, 1)
 	})
 	return err
 }
