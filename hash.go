@@ -6,58 +6,78 @@ import (
 	"math/bits"
 )
 
-// xxHash64
+// xxHash64 (seed=0) partial reimplementation focused on hot-path characteristics.
+// Notes on design choices:
+//   - We keep the exact xxHash64 mixing/avalanche structure so the output
+//     distribution matches stock xxHash64 for the processed lanes.
+//   - Little-endian loads (binary.LittleEndian) are used per spec.
+//   - For short strings we bypass xxHash64 entirely (see hasher.hashString) because
+//     FNV-1a has fewer multiplies/rotates, which wins on tiny payloads.
+//   - Integers are passed through a reduced "avalanche-only" path to decorrelate
+//     low-entropy values without the cost of lane processing.
 const (
-	prime64_1 = 0x9E3779B185EBCA87 // Primary mixing prime
-	prime64_2 = 0xC2B2AE3D27D4EB4F // 2nd prime for different bit patterns
-	prime64_3 = 0x165667B19E3779F9 // 3rd prime for avalanche mixing
-	prime64_4 = 0x85EBCA77C2B2AE63 // 4th prime for merge operations
-	prime64_5 = 0x27D4EB2F165667C5 // 5th prime for small input processing
+	// Standard xxHash64 primes
+	prime64_1 = 0x9E3779B185EBCA87 // main mixing prime
+	prime64_2 = 0xC2B2AE3D27D4EB4F // secondary prime (used in rounds/avalanche)
+	prime64_3 = 0x165667B19E3779F9 // avalanche prime
+	prime64_4 = 0x85EBCA77C2B2AE63 // merge/add prime
+	prime64_5 = 0x27D4EB2F165667C5 // small-input prime
 
-	// Initial accumulator values for seed=0 (standard xxHash64)
-	// These are precomputed values following the initialization formula:
+	// Precomputed seeds for seed=0 (exact xxHash64 initialization)
 	// v1 = seed + prime64_1 + prime64_2
 	// v2 = seed + prime64_2
 	// v3 = seed + 0
 	// v4 = seed - prime64_1
-	seed64_1 = 0x60EA27EEADC0B5D6 // v1 initial: 0 + prime64_1 + prime64_2
-	seed64_4 = 0x61C8864E7A143579 // v4 initial: 0 - prime64_1 (two's complement)
+	seed64_1 = 0x60EA27EEADC0B5D6 // v1 initial (prime64_1 + prime64_2)
+	seed64_4 = 0x61C8864E7A143579 // v4 initial (two's complement of prime64_1)
 
-	largeInputThreshold = 32 // Switches to 4-accumulator mode for inputs ≥32 bytes
+	// Size and rotation parameters per xxHash64 spec
+	largeInputThreshold = 32 // switch to 4-lane (32B) processing when len ≥ 32
 
-	roundRotation = 31 // Primary mixing rotation in accumulator rounds
-	mergeRotation = 27 // Merge phase rotation for 8-byte chunks
-	smallRotation = 23 // Finalization rotation for 4-byte chunks
-	tinyRotation  = 11 // Single-byte processing rotation
+	roundRotation = 31 // rotation used inside per-lane round
+	mergeRotation = 27 // rotation when folding 8B chunks in finalization
+	smallRotation = 23 // rotation when folding 4B chunks
+	tinyRotation  = 11 // rotation when folding trailing bytes
 
-	avalancheShift1 = 33 // 1st XOR-shift destroys high-bit patterns
-	avalancheShift2 = 29 // 2nd XOR-shift affects middle bits
-	avalancheShift3 = 32 // Final shift ensures low-bit mixing
+	// Final avalanche XOR-shifts; order matters (destroys patterns progressively).
+	avalancheShift1 = 33
+	avalancheShift2 = 29
+	avalancheShift3 = 32
 
-	v1Rotation = 1  // Rotation for v1 when combining accumulators
-	v2Rotation = 7  // Rotation for v2 when combining accumulators
-	v3Rotation = 12 // Rotation for v3 when combining accumulators
-	v4Rotation = 18 // Rotation for v4 when combining accumulators
+	// Rotations for combining v1..v4 before merge rounds (xxHash64 combine step).
+	v1Rotation = 1
+	v2Rotation = 7
+	v3Rotation = 12
+	v4Rotation = 18
 )
 
+// Heuristic for choosing hashing strategy for strings.
+// For very short strings, FNV-1a tends to be faster on modern CPUs due to avoiding
+// 64-bit multiplies/rotates in loops (and because payload fits in registers).
 const (
-	// hasher
-	// threshold for choosing between FNV and xxHash algorithms
+	// Threshold for choosing between FNV and xxHash for strings.
+	// ≤8 bytes → FNV-1a; >8 bytes → xxHash64
 	stringByteLength = 8
 )
 
-// hasher provides type-specific hash functions for cache keys.
+// hasher provides type-specialized hashing without reflection.
+// The instance is stateless and may be reused across goroutines.
 type hasher[K comparable] struct{}
 
 // newHasher creates a new hasher instance for the specified key type.
-// The hasher is stateless and can be reused across multiple operations.
+// No state is captured; returned value is a tiny value type.
 func newHasher[K comparable]() hasher[K] {
 	return hasher[K]{}
 }
 
-// hash returns a 64-bit hash value for the given key based on its type.
-// integers get avalanche mixing for distribution,
-// strings use length-based algorithm selection, others fall back to string conversion.
+// hash returns a 64-bit hash for the given key.
+// Policy:
+//   - Built-in integer types go through xxHash64Avalanche to cheaply
+//     decorrelate small integers (common in sharding/IDs).
+//   - Strings choose FNV-1a vs xxHash64 based on length (see hashString).
+//   - All other key types fall back to fmt.Sprintf("%v", k) then string hashing.
+//     (This introduces an allocation; callers who care about zero-alloc should
+//     prefer K=string/int/uint... or provide their own adapter.)
 func (h hasher[K]) hash(key K) uint64 {
 	switch k := any(key).(type) {
 	case string:
@@ -75,23 +95,33 @@ func (h hasher[K]) hash(key K) uint64 {
 	case uint64:
 		return xxHash64Avalanche(k)
 	default:
+		// Fallback path: formatting incurs allocation; kept for generality.
 		return h.hashString(fmt.Sprintf("%v", k))
 	}
 }
 
-// hashString computes a 64-bit hash for string keys using length-based selection.
-// Short strings (≤8 bytes): FNV-1a is faster due to simpler operations
-// Long strings (>8 bytes): xxHash64 provides better collision resistance and parallelism
+// hashString chooses the hashing backend based on length.
+// Rationale:
+//   - ≤8B: FNV-1a usually beats xxHash on tiny payloads due to less arithmetic.
+//   - >8B: xxHash64 provides better distribution and throughput on longer inputs.
+//
+// Endianness not relevant here; FNV and xxHash treat the byte slice as-is.
 func (h hasher[K]) hashString(s string) uint64 {
 	if len(s) <= stringByteLength {
-		return fnvHash64(s)
+		return fnvHash64(s) // assumed provided elsewhere in the package
 	}
 	return xxHash64(s)
 }
 
-// xxHash64 computes a 64-bit hash of the input string using algo branching.
-// Large inputs (≥32 bytes) use 4-accumulator mode.
-// Small inputs skip the accumulator phase and go directly to finalization.
+// xxHash64 computes xxHash64(seed=0) for an input string.
+// Implementation detail: converting string → []byte allocates; acceptable for
+// long strings where the hashing work dwarfs the allocation cost. If callers
+// need zero-alloc hashing for large strings, they should pass []byte directly
+// via a specialized path (not provided here by design).
+//
+// Branching:
+//   - len ≥ 32: 4-lane processing (v1..v4) for bulk throughput.
+//   - len <  32: small-input path that feeds directly into finalization.
 func xxHash64(input string) uint64 {
 	data := []byte(input)
 	length := len(data)
@@ -100,6 +130,7 @@ func xxHash64(input string) uint64 {
 	if length >= largeInputThreshold {
 		h64 = xxHash64Large(data, uint64(length))
 	} else {
+		// Per spec: initialize small-input state with prime64_5 + len.
 		h64 = prime64_5 + uint64(length)
 		h64 = xxHash64Small(data, h64)
 	}
@@ -107,19 +138,17 @@ func xxHash64(input string) uint64 {
 	return xxHash64Avalanche(h64)
 }
 
-// xxHash64Large processes input data ≥32 bytes using 4-accumulator.
+// xxHash64Large processes data in 32-byte stripes using four accumulators.
+// After block processing it combines accumulators with distinct rotations and
+// merge rounds to decorrelate lanes, then hands remaining tail to finalization.
 func xxHash64Large(data []byte, length uint64) uint64 {
-	// Initialize 4 accumulators following xxHash64 spec with seed=0
-	// v1 = seed + prime64_1 + prime64_2 (precomputed as seed64_1)
-	// v2 = seed + prime64_2
-	// v3 = seed + 0
-	// v4 = seed - prime64_1 (precomputed as seed64_4)
-	v1 := uint64(seed64_1)
-	v2 := uint64(prime64_2)
-	v3 := uint64(0)
-	v4 := uint64(seed64_4)
+	// Initialize accumulators for seed=0.
+	v1 := uint64(seed64_1)  // prime64_1 + prime64_2
+	v2 := uint64(prime64_2) // seed + prime64_2
+	v3 := uint64(0)         // seed
+	v4 := uint64(seed64_4)  // seed - prime64_1
 
-	// Process 32-byte blocks (4 lanes × 8 bytes each)
+	// Main loop: 32B per iteration, 8B per lane.
 	for len(data) >= largeInputThreshold {
 		v1 = xxHash64Round(v1, binary.LittleEndian.Uint64(data[0:8]))
 		v2 = xxHash64Round(v2, binary.LittleEndian.Uint64(data[8:16]))
@@ -128,11 +157,13 @@ func xxHash64Large(data []byte, length uint64) uint64 {
 		data = data[largeInputThreshold:]
 	}
 
-	// Combine accumulators with different rotations to mix their states
-	h64 := bits.RotateLeft64(v1, v1Rotation) + bits.RotateLeft64(v2, v2Rotation) +
-		bits.RotateLeft64(v3, v3Rotation) + bits.RotateLeft64(v4, v4Rotation)
+	// Combine accumulators (distinct rotations reduce symmetry).
+	h64 := bits.RotateLeft64(v1, v1Rotation) +
+		bits.RotateLeft64(v2, v2Rotation) +
+		bits.RotateLeft64(v3, v3Rotation) +
+		bits.RotateLeft64(v4, v4Rotation)
 
-	// Merge each accumulator to eliminate state correlation
+	// Merge rounds fold each lane into the hash state to mix high/low bits.
 	h64 = xxHash64MergeRound(h64, v1)
 	h64 = xxHash64MergeRound(h64, v2)
 	h64 = xxHash64MergeRound(h64, v3)
@@ -142,12 +173,13 @@ func xxHash64Large(data []byte, length uint64) uint64 {
 	return xxHash64Finalize(data, h64)
 }
 
+// xxHash64Small feeds the small remainder directly into finalization.
 func xxHash64Small(data []byte, h64 uint64) uint64 {
 	return xxHash64Finalize(data, h64)
 }
 
-// xxHash64Round performs a single round of the xxHash algorithm.
-// multiply-add → rotate → multiply creates strong bit mixing.
+// xxHash64Round is the per-lane step: (acc + input*prime2) → rot(31) → *prime1.
+// The multiply-rotate-multiply pattern provides fast diffusion across bits.
 func xxHash64Round(acc, input uint64) uint64 {
 	acc += input * prime64_2
 	acc = bits.RotateLeft64(acc, roundRotation)
@@ -155,8 +187,9 @@ func xxHash64Round(acc, input uint64) uint64 {
 	return acc
 }
 
-// xxHash64MergeRound merges an accumulator into the hash state during finalization.
-// Ensures that all accumulated entropy is properly distributed in the final hash.
+// xxHash64MergeRound mixes one lane into the main hash during the combine phase.
+// It runs the lane value through a round and then xors/adds with primes to avoid
+// carry/rotation artifacts.
 func xxHash64MergeRound(h64, val uint64) uint64 {
 	val = xxHash64Round(0, val)
 	h64 ^= val
@@ -164,9 +197,9 @@ func xxHash64MergeRound(h64, val uint64) uint64 {
 	return h64
 }
 
-// xxHash64Finalize processes any remaining bytes and applies final mixing.
-// Uses different processing patterns for 8-byte, 4-byte, and 1-byte chunks
-// to ensure all input bits contribute to the final hash value.
+// xxHash64Finalize folds the remaining tail bytes and applies final avalanche.
+// Tail processing order: 8-byte chunks → 4-byte chunk → single bytes.
+// Each step uses its own rotation/prime mix per spec to avoid structural bias.
 func xxHash64Finalize(data []byte, h64 uint64) uint64 {
 	for len(data) >= 8 {
 		k1 := binary.LittleEndian.Uint64(data[0:8])
@@ -183,7 +216,7 @@ func xxHash64Finalize(data []byte, h64 uint64) uint64 {
 		data = data[4:]
 	}
 
-	// Remaining individual bytes
+	// Trailing bytes (len(data) ∈ [0..3])
 	for len(data) > 0 {
 		k1 := uint64(data[0])
 		h64 ^= k1 * prime64_5
@@ -194,8 +227,9 @@ func xxHash64Finalize(data []byte, h64 uint64) uint64 {
 	return h64
 }
 
-// xxHash64Avalanche applies final mixing to eliminate bias.
-// The XOR-shift sequence ensures small input changes cause large output changes.
+// xxHash64Avalanche is the final mixing that destroys regularities.
+// The xor-shift/multiply/xor-shift/multiply/xor-shift sequence ensures that
+// small input deltas cause widespread output changes (avalanche property).
 func xxHash64Avalanche(h64 uint64) uint64 {
 	h64 ^= h64 >> avalancheShift1
 	h64 *= prime64_2
