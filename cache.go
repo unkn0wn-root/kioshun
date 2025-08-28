@@ -90,6 +90,7 @@ type InMemoryCache[K comparable, V any] struct {
 	shardMask   uint64         // Bitmask for fast shard selection
 	config      Config
 	globalStats Stats
+	perShardCap int64
 	cleanupCh   chan struct{}
 	closeCh     chan struct{}
 	closeOnce   sync.Once
@@ -127,10 +128,14 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		},
 	}
 
+	// Compute per-shard capacity once (ceiling division).
+	if config.MaxSize > 0 {
+		cache.perShardCap = (config.MaxSize + int64(shardCount) - 1) / int64(shardCount)
+	}
+
 	cache.hasher = newHasher[K]()
 	cache.evictor = createEvictor[K, V](config.EvictionPolicy)
 
-	shardMaxSize := config.MaxSize / int64(shardCount)
 	for i := 0; i < shardCount; i++ {
 		s := &shard[K, V]{
 			data: make(map[K]*cacheItem[V]),
@@ -142,8 +147,8 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 			s.lfuList = newLFUList[K, V]()
 		}
 
-		if config.EvictionPolicy == AdmissionLFU && shardMaxSize > 0 {
-			nc := uint64(shardMaxSize * 10)
+		if config.EvictionPolicy == AdmissionLFU && cache.perShardCap > 0 {
+			nc := uint64(cache.perShardCap * 10)
 			if nc < 1024 {
 				nc = 1024 // Minimum counters per shard
 			}
@@ -233,7 +238,7 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 		atomic.AddInt64(&item.frequency, 1)
 		shard.lfuList.increment(item)
 	case AdmissionLFU:
-		item.lastAccess = now
+		atomic.StoreInt64(&item.lastAccess, now)
 		atomic.AddInt64(&item.frequency, 1)
 	}
 
@@ -310,8 +315,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		return nil
 	}
 
-	maxShardSize := c.config.MaxSize / int64(len(c.shards))
-	if c.config.MaxSize > 0 && maxShardSize > 0 && atomic.LoadInt64(&shard.size) >= maxShardSize {
+	if c.perShardCap > 0 && atomic.LoadInt64(&shard.size) >= c.perShardCap {
 		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
 			admissionEvictor := c.evictor.(admissionLFUEvictor[K, V])
 			// sample → admission → eviction:
@@ -527,9 +531,9 @@ func (c *InMemoryCache[K, V]) Stats() Stats {
 func (c *InMemoryCache[K, V]) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
-		atomic.StoreInt32(&c.closed, 1)
 		close(c.closeCh)
 		c.Clear()
+		atomic.StoreInt32(&c.closed, 1)
 	})
 	return err
 }

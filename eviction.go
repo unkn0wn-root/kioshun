@@ -190,10 +190,11 @@ func (e admissionLFUEvictor[K, V]) evictWithAdmission(
 	if victim == nil {
 		return false
 	}
-	freq := uint64(victim.frequency)
+	freq := uint64(atomic.LoadInt64(&victim.frequency))
+	victimAge := atomic.LoadInt64(&victim.lastAccess)
 	s.lastVictimFrequency = freq
 
-	if !admission.shouldAdmit(keyHash, freq, victim.lastAccess) {
+	if !admission.shouldAdmit(keyHash, freq, victimAge) {
 		return false
 	}
 	e.removeVictim(s, victim, itemPool, statsEnabled)
