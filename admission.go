@@ -242,19 +242,15 @@ func (fbf *frequencyBloomFilter) incrementCounter(index uint64) {
 	}
 }
 
-// age halves every nybble counter in-place via per-word CAS. This provides
-// exponential decay so stale popularity fades over time.
+// age halves every nybble counter in-place via per-word CAS.
+// Vectorized form: shift the whole word right by 1 and mask off each nybble's MSB
+// so bits don't "spill" across nybble boundaries.
 func (fbf *frequencyBloomFilter) age() {
+	const halfMask uint64 = 0x7777777777777777 // 0b0111 repeated per nybble
 	for i := range fbf.counters {
 		for {
 			current := atomic.LoadUint64(&fbf.counters[i])
-			aged := uint64(0)
-			// Divide each 4-bit field by 2 while rebuilding the packed word.
-			for j := 0; j < 16; j++ {
-				shift := j * 4
-				val := (current >> shift) & frequencyMask
-				aged |= (val / agingFactor) << shift
-			}
+			aged := (current >> 1) & halfMask
 			if atomic.CompareAndSwapUint64(&fbf.counters[i], current, aged) {
 				break
 			}
