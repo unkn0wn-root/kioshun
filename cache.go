@@ -154,9 +154,14 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	cache.hasher = newHasher[K]()
 	cache.evictor = createEvictor[K, V](config.EvictionPolicy)
 
+	capHint := 0
+	if cache.perShardCap > 0 {
+		capHint = int(cache.perShardCap)
+	}
+
 	for i := 0; i < shardCount; i++ {
 		s := &shard[K, V]{
-			data: make(map[K]*cacheItem[V]),
+			data: make(map[K]*cacheItem[V], capHint),
 		}
 
 		// LRU list is used for all eviction policies to maintain insertion order

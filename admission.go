@@ -118,9 +118,7 @@ func (bf *bloomFilter) contains(keyHash uint64) bool {
 
 // reset zeroes the bitset. Called under shard lock (so no atomics needed).
 func (bf *bloomFilter) reset() {
-	for i := range bf.bits {
-		bf.bits[i] = 0
-	}
+	clear(bf.bits)
 }
 
 //	Frequency sketch: 4-bit Count–Min Sketch with periodic aging
