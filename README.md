@@ -18,7 +18,7 @@
 - [Architecture](#architecture)
   - [Sharded Design](#sharded-design)
   - [Evictions Implementation](#eviction-policy-implementation)
-  - [Eviction Policies](#eviction-policies)
+  - [Eviction Policy Implementation](#eviction-policy-implementation)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -66,9 +66,9 @@
 └─────────────────┴─────────────────┴─────────────────┴─────────────────────┘
 ```
 
-- Keys distributed across shards using FNV-1a hash functions with bit mixing
-- Each shard maintains independent read-write mutex
-- Shard count auto-detected based on CPU cores (default: 4×CPU cores, max 256)
+- Keys are sharded by a 64-bit hasher: integers are avalanched, short strings (≤8B) use FNV-1a, and longer strings use xxHash64. Shard index = `hash & (shardCount-1)`.
+- Each shard maintains an independent read-write mutex
+- Shard count auto-detected based on CPU cores (default: 4× CPU cores, max 256)
 - Object pooling reduces GC pressure
 
 ### Eviction Policy Implementation
@@ -192,10 +192,9 @@ evictLFU():
    - Immediate admission for items in doorkeeper (bypass frequency check)
 
 3. **Workload Detector (Scan Resistance)**:
-   - Tracks admission rate (admissions/second) with threshold of 100/sec
-   - Detects sequential access patterns using circular buffer of recent keys
-   - Monitors consecutive miss streaks with threshold of 50 misses
-   - Adapts admission strategy during detected scanning workloads
+   - Tracks consecutive admission rejections (fast signal of cold scans)
+   - Optional admissions/sec signal (disabled by default; see note below)
+   - Switches to a more recency-biased admission during detected scans
 
 4. **Adaptive Admission Algorithm**:
    ```
@@ -359,7 +358,7 @@ cache.TriggerCleanup()
 type Stats struct {
     Hits        int64   // Cache hits
     Misses      int64   // Cache misses
-    Evictions   int64   // LRU evictions
+    Evictions   int64   // Evictions (all policies)
     Expirations int64   // TTL expirations
     Size        int64   // Current items
     Capacity    int64   // Maximum items
