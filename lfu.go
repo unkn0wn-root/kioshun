@@ -1,39 +1,23 @@
 package cache
 
-// freqNode represents one frequency bucket in an intrusive, doubly-linked list.
-//   - Nodes are ordered by freq in strictly increasing order from head → ...,
-//     with a sentinel head at freq==0.
-//   - Each node holds a set of items at exactly that frequency.
-//   - Empty non-sentinel buckets are removed immediately to keep head.next
-//     pointing at the current minimum frequency.
+// freqNode is a doubly-linked bucket for one exact frequency.
+// non-sentinel empty buckets are removed eagerly so head.next is the current min.
 type freqNode[K comparable, V any] struct {
 	freq  int64                      // exact frequency (>= 0); head sentinel uses 0
-	items map[*cacheItem[V]]struct{} // open-addressed set of items at this frequency
-	prev  *freqNode[K, V]            // previous bucket in the list
-	next  *freqNode[K, V]            // next bucket in the list
+	items map[*cacheItem[V]]struct{} // set of items at this frequency
+	prev  *freqNode[K, V]
+	next  *freqNode[K, V]
 }
 
-// lfuList is an LFU index implemented as a linked set of frequency buckets.
-//   - head:     sentinel node at freq==0 (never removed); head.next is the min freq bucket.
-//   - freqMap:  freq → *freqNode (fast bucket lookup/creation).
-//   - itemFreq: item → *freqNode (fast item relocation between buckets).
-//   - add/increment/remove/removeLFU: O(1) average-case.
-//   - removeLFU: picks an arbitrary item from the minimum-frequency bucket
-//     (iteration over a Go map yields an arbitrary element).
+// lfuList is an LFU index of ascending-frequency buckets (sentinel head at freq==0).
+// O(1) add/increment/remove; used under the shard lock.
 type lfuList[K comparable, V any] struct {
 	head     *freqNode[K, V]
-	freqMap  map[int64]*freqNode[K, V]
-	itemFreq map[*cacheItem[V]]*freqNode[K, V]
+	freqMap  map[int64]*freqNode[K, V]         // freq → bucket
+	itemFreq map[*cacheItem[V]]*freqNode[K, V] // item → bucket
 }
 
-// newLFUList initializes the LFU structure with a circular sentinel head.
-//   - head.freq == 0
-//   - head.next == head && head.prev == head when empty
-//   - real buckets are always spliced between head and head (circular)
-//     maintaining ascending freq order starting at 1.
-//
-// the sentinel "items" set exists only to avoid nil guards; no real items
-// are stored at freq==0.
+// newLFUList creates a circular list with a freq==0 sentinel; sentinel holds no real items.
 func newLFUList[K comparable, V any]() *lfuList[K, V] {
 	list := &lfuList[K, V]{
 		head:     &freqNode[K, V]{freq: 0, items: make(map[*cacheItem[V]]struct{})},
@@ -45,9 +29,7 @@ func newLFUList[K comparable, V any]() *lfuList[K, V] {
 	return list
 }
 
-// add inserts a new item with frequency = 1.
-//   - Caller has ensured the item is not already present in this LFU list.
-//   - We set item.frequency for coherence with external observers.
+// add inserts item with frequency=1 and indexes it.
 func (l *lfuList[K, V]) add(item *cacheItem[V]) {
 	freq := int64(1)
 	item.frequency = freq
@@ -57,12 +39,7 @@ func (l *lfuList[K, V]) add(item *cacheItem[V]) {
 	l.itemFreq[item] = node
 }
 
-// increment bumps an item's frequency by 1 and relocates it to the appropriate bucket.
-//  1. Look up current bucket via itemFreq.
-//  2. Compute newFreq = cur.freq + 1.
-//  3. Move item into existing next bucket if it already matches newFreq,
-//     otherwise splice a new bucket at the correct position (right after cur).
-//  4. If the old bucket becomes empty (and is not the sentinel), remove it.
+// increment bumps item's frequency by 1, moves it to the correct bucket, and removes an empty old bucket.
 func (l *lfuList[K, V]) increment(item *cacheItem[V]) {
 	cur := l.itemFreq[item]
 	if cur == nil {
@@ -93,10 +70,8 @@ func (l *lfuList[K, V]) increment(item *cacheItem[V]) {
 	}
 }
 
-// removeLFU removes and returns one item from the minimum-frequency bucket.
-// Tie-breaking within the bucket is arbitrary (map iteration order).
-// If the bucket becomes empty, we unlink it to keep head.next pointing at the
-// current minimum.
+// removeLFU removes and returns one item from the minimum-frequency bucket
+// unlinks the bucket if it becomes empty.
 func (l *lfuList[K, V]) removeLFU() *cacheItem[V] {
 	node := l.head.next
 	if node == l.head {
@@ -117,8 +92,7 @@ func (l *lfuList[K, V]) removeLFU() *cacheItem[V] {
 	return victim
 }
 
-// remove deletes a specific item from whichever bucket it currently resides in.
-// If that bucket becomes empty (and is not the sentinel), it is unlinked.
+// remove deletes a specific item from its bucket and removes the bucket if it becomes empty (non-sentinel).
 func (l *lfuList[K, V]) remove(item *cacheItem[V]) {
 	node := l.itemFreq[item]
 	if node == nil {
@@ -133,11 +107,7 @@ func (l *lfuList[K, V]) remove(item *cacheItem[V]) {
 	}
 }
 
-// ensureIndex returns the node for exactly 'freq', inserting a new bucket
-// right after 'prev' if it doesn't already exist.
-//   - The list remains sorted ascending by frequency.
-//   - New buckets are always inserted immediately after the previous frequency,
-//     so traversal from head is monotonic.
+// ensureIndex returns the bucket for freq, inserting a new bucket immediately after prev to keep ascending order.
 func (l *lfuList[K, V]) ensureIndex(prev *freqNode[K, V], freq int64) *freqNode[K, V] {
 	// Exact-hit fast path via freqMap.
 	if node, ok := l.freqMap[freq]; ok {
@@ -159,10 +129,7 @@ func (l *lfuList[K, V]) ensureIndex(prev *freqNode[K, V], freq int64) *freqNode[
 	return newNode
 }
 
-// getOrCreateFreqNode returns the bucket for 'freq' with the correct splice point.
-//   - freq==1 → insert right after the sentinel head (min frequency).
-//
-// Otherwise we place it after the freq-1 bucket to maintain ordering.
+// getOrCreateFreqNode returns the bucket for freq, inserting after freq-1 (or after head for freq==1).
 func (l *lfuList[K, V]) getOrCreateFreqNode(freq int64) *freqNode[K, V] {
 	if freq == 1 {
 		return l.ensureIndex(l.head, 1)
@@ -172,8 +139,7 @@ func (l *lfuList[K, V]) getOrCreateFreqNode(freq int64) *freqNode[K, V] {
 	return l.ensureIndex(prev, freq)
 }
 
-// removeFreqNode unlinks an empty non-sentinel bucket from the list and
-// deletes its mapping. Caller must ensure node.freq != 0 and len(node.items) == 0.
+// removeFreqNode unlinks an empty non-sentinel bucket and drops its freq map entry.
 func (l *lfuList[K, V]) removeFreqNode(node *freqNode[K, V]) {
 	node.prev.next = node.next
 	node.next.prev = node.prev

@@ -6,28 +6,20 @@ import (
 )
 
 const (
-	// AdmissionLFU sampling parameters.
-	// We use a tiny random sample of the shard's items and pick the least-frequent
-	// (ties by oldest lastAccess). Small, bounded samples keep eviction O(1) on
-	// average and avoid maintaining a global heap.
+	// AdmissionLFU sampling: take a small randomized sample and pick the least-frequent (tie: oldest).
 	defaultAdmissionLFUSampleSize = 5
 	maxAdmissionLFUSampleSize     = 20
 )
 
-// evictor is the policy interface. Implementations remove exactly one item
-// when a shard is at capacity and return whether they evicted.
-// called under the shard's write lock by Set(); implementations
-// assume they have exclusive access to s.{data,LRU,lfuList} and may update stats.
+// evictor defines a policy that evicts exactly one item when a shard is full (called under shard write lock).
 type evictor[K comparable, V any] interface {
 	evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool
 }
 
-// lruEvictor implements classic LRU using the shard's intrusive list.
-// The shard maintains a sentinel {head,tail}; tail.prev is the least-recently-used.
+// lruEvictor removes the least-recently-used item using the shard's intrusive LRU list.
 type lruEvictor[K comparable, V any] struct{}
 
-// evict removes the least recently used item from the shard.
-// O(1). Also unlinks from the LRU list and recycles the node.
+// evict unlinks and recycles the tail.prev (LRU) item; updates size/stats; O(1).
 func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	// Empty list check: only sentinels present.
 	if s.tail.prev == s.head {
@@ -55,12 +47,10 @@ func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 	return false
 }
 
-// lfuEvictor picks the least-frequently-used item using the shard's O(1) LFU list.
-// The LFU list maintains buckets by frequency; removeLFU() returns the global min.
+// lfuEvictor removes the global least-frequent item via the O(1) LFU bucket list.
 type lfuEvictor[K comparable, V any] struct{}
 
-// evict removes the LFU item and updates shared structures.
-// O(1) for removeLFU + O(1) list unlink.
+// evict pops the LFU item, unlinks from LRU too, recycles, and updates size/stats; O(1).
 func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	lfu := s.lfuList.removeLFU()
 	if lfu == nil {
@@ -85,13 +75,10 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 	return false
 }
 
-// fifoEvictor uses the same intrusive list as LRU but treats it as insertion order.
-// Oldest item sits at tail.prev.
+// fifoEvictor treats the LRU list as insertion order and removes the oldest item.
 type fifoEvictor[K comparable, V any] struct{}
 
-// evict removes the earliest inserted item.
-// O(1). If an LFU list exists (policy changes), we unlink there too
-// to maintain internal invariants.
+// evict deletes the earliest inserted (tail.prev), unlinks from optional LFU, and updates stats; O(1).
 func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	if s.tail.prev == s.head {
 		return false
@@ -118,25 +105,12 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 	return false
 }
 
-// admissionLFUEvictor implements approximate LFU with admission control.
-//   - Randomly sample up to N items from the shard's map (iteration order over
-//     a Go map is randomized; we early-break after N to get a cheap sample).
-//   - Choose the least-frequent; on ties, choose the older lastAccess.
-//   - With admission disabled: evict that victim.
-//   - With admission enabled: first call shouldAdmit(keyHash, victimFreq, victimAge).
-//   - If admission denies: return false (caller rejects the Set without evicting).
-//   - If admission allows: evict victim and return true.
-//
-// bounded, allocation-free eviction without maintaining a heap or tree.
+// admissionLFUEvictor does approximate-LFU by sampling and optionally gating via the admission filter.
 type admissionLFUEvictor[K comparable, V any] struct {
 	sampleSize int // desired sample size; clamped to [1, maxAdmissionLFUSampleSize]
 }
 
-// pickVictim performs a bounded scan over the shard's map and returns the
-// "worst" item under (frequency ASC, lastAccess ASC). If the shard is empty
-// it returns nil.
-// O(sampleSize) expected. We rely on Go's randomized map iteration
-// order to approximate uniform sampling without extra RNG.
+// pickVictim scans up to sampleSize items (randomized map order) and returns the worst (freq↑, age↑); nil if empty.
 func (e admissionLFUEvictor[K, V]) pickVictim(s *shard[K, V]) *cacheItem[V] {
 	if len(s.data) == 0 {
 		return nil
@@ -169,8 +143,7 @@ func (e admissionLFUEvictor[K, V]) pickVictim(s *shard[K, V]) *cacheItem[V] {
 	return victim
 }
 
-// removeVictim unlinks 'victim' from all shard structures, updates size/stats,
-// and recycles the node via sync.Pool. Caller must hold the shard write lock.
+// removeVictim unlinks victim from shard structures, recycles it, updates size/stats (caller holds write lock).
 func (e admissionLFUEvictor[K, V]) removeVictim(s *shard[K, V], victim *cacheItem[V], itemPool *sync.Pool, statsEnabled bool) {
 	if key, ok := victim.key.(K); ok {
 		delete(s.data, key)
@@ -184,9 +157,7 @@ func (e admissionLFUEvictor[K, V]) removeVictim(s *shard[K, V], victim *cacheIte
 	}
 }
 
-// evict implements "approximate LFU without admission". It samples,
-// picks a victim, and evicts it. lastVictimFrequency is recorded on the shard
-// for observability/telemetry (used by admission logic elsewhere).
+// evict samples, picks a victim, evicts it, and records lastVictimFrequency for observability.
 func (e admissionLFUEvictor[K, V]) evict(
 	s *shard[K, V],
 	itemPool *sync.Pool,
@@ -204,10 +175,7 @@ func (e admissionLFUEvictor[K, V]) evict(
 	return true
 }
 
-// evictWithAdmission performs: sample → shouldAdmit → (optionally) evict.
-// Returns true only when admission approves and we actually evict a victim.
-// If admission denies, the caller (Set) will reject the incoming item without
-// evicting, which prevents cache pollution during scans/cold bursts.
+// evictWithAdmission runs sample → shouldAdmit → (optional) evict; denies return false to let Set() skip pollution.
 func (e admissionLFUEvictor[K, V]) evictWithAdmission(
 	s *shard[K, V],
 	itemPool *sync.Pool,
@@ -236,7 +204,7 @@ func (e admissionLFUEvictor[K, V]) evictWithAdmission(
 	return true
 }
 
-// createEvictor constructs the policy implementation for the configured strategy.
+// createEvictor returns the policy implementation for the selected EvictionPolicy.
 func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	switch policy {
 	case LRU:
