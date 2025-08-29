@@ -16,7 +16,7 @@ const (
 
 // evictor is the policy interface. Implementations remove exactly one item
 // when a shard is at capacity and return whether they evicted.
-// Concurrency: called under the shard's write lock by Set(); implementations
+// called under the shard's write lock by Set(); implementations
 // assume they have exclusive access to s.{data,LRU,lfuList} and may update stats.
 type evictor[K comparable, V any] interface {
 	evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool
@@ -27,7 +27,7 @@ type evictor[K comparable, V any] interface {
 type lruEvictor[K comparable, V any] struct{}
 
 // evict removes the least recently used item from the shard.
-// Complexity: O(1). Also unlinks from the LRU list and recycles the node.
+// O(1). Also unlinks from the LRU list and recycles the node.
 func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	// Empty list check: only sentinels present.
 	if s.tail.prev == s.head {
@@ -60,7 +60,7 @@ func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 type lfuEvictor[K comparable, V any] struct{}
 
 // evict removes the LFU item and updates shared structures.
-// Complexity: O(1) for removeLFU + O(1) list unlink.
+// O(1) for removeLFU + O(1) list unlink.
 func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	lfu := s.lfuList.removeLFU()
 	if lfu == nil {
@@ -90,7 +90,7 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 type fifoEvictor[K comparable, V any] struct{}
 
 // evict removes the earliest inserted item.
-// Complexity: O(1). If an LFU list exists (policy changes), we unlink there too
+// O(1). If an LFU list exists (policy changes), we unlink there too
 // to maintain internal invariants.
 func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) bool {
 	if s.tail.prev == s.head {
@@ -104,7 +104,6 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 		}
 		s.removeFromLRU(oldest)
 
-		// If LFU structures are present, keep them consistent.
 		if s.lfuList != nil {
 			s.lfuList.remove(oldest)
 		}
@@ -120,7 +119,6 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 }
 
 // admissionLFUEvictor implements approximate LFU with admission control.
-// Approach:
 //   - Randomly sample up to N items from the shard's map (iteration order over
 //     a Go map is randomized; we early-break after N to get a cheap sample).
 //   - Choose the least-frequent; on ties, choose the older lastAccess.
@@ -129,7 +127,7 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 //   - If admission denies: return false (caller rejects the Set without evicting).
 //   - If admission allows: evict victim and return true.
 //
-// Rationale: bounded, allocation-free eviction without maintaining a heap or tree.
+// bounded, allocation-free eviction without maintaining a heap or tree.
 type admissionLFUEvictor[K comparable, V any] struct {
 	sampleSize int // desired sample size; clamped to [1, maxAdmissionLFUSampleSize]
 }
@@ -137,7 +135,7 @@ type admissionLFUEvictor[K comparable, V any] struct {
 // pickVictim performs a bounded scan over the shard's map and returns the
 // "worst" item under (frequency ASC, lastAccess ASC). If the shard is empty
 // it returns nil.
-// Complexity: O(sampleSize) expected. We rely on Go's randomized map iteration
+// O(sampleSize) expected. We rely on Go's randomized map iteration
 // order to approximate uniform sampling without extra RNG.
 func (e admissionLFUEvictor[K, V]) pickVictim(s *shard[K, V]) *cacheItem[V] {
 	if len(s.data) == 0 {
@@ -224,7 +222,7 @@ func (e admissionLFUEvictor[K, V]) evictWithAdmission(
 
 	freq := uint64(victim.frequency)
 	victimAge := victim.lastAccess
-	s.lastVictimFrequency = freq // stored for debugging/metrics
+	s.lastVictimFrequency = freq // stored for deb/metrics
 
 	// Admission gate: compare candidate(keyHash) vs victim(freq/age).
 	if !admission.shouldAdmit(keyHash, freq, victimAge) {
@@ -239,7 +237,6 @@ func (e admissionLFUEvictor[K, V]) evictWithAdmission(
 }
 
 // createEvictor constructs the policy implementation for the configured strategy.
-// Default is AdmissionLFU with a small fixed sample (defensive default).
 func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	switch policy {
 	case LRU:

@@ -122,7 +122,7 @@ func (bf *bloomFilter) reset() {
 }
 
 //	Frequency sketch: 4-bit Count–Min Sketch with periodic aging
-//	Purpose: approximate frequency estimates without per-key state.
+//	approximate frequency estimates without per-key state.
 //
 // frequencyBloomFilter is a 4-hash Count–Min Sketch with 4-bit counters, packed
 // 16 per uint64 word. Each increment CASes a single word; aging is a halving pass.
@@ -154,7 +154,7 @@ func newFrequencyBloomFilter(numCounters uint64) *frequencyBloomFilter {
 
 // increment bumps the four counters addressed by the four hashes (unless saturated),
 // and returns the *new* minimum of those four counters (standard CMS estimate).
-// Concurrency: per-increment cost is 4 CAS loops worst case (one per word).
+// per-increment cost is 4 CAS loops worst case (one per word).
 func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 	h1 := hashN(keyHash, fbf.mask, hash1Rotate)
 	h2 := hashN(keyHash, fbf.mask, hash2Rotate)
@@ -265,8 +265,7 @@ func (fbf *frequencyBloomFilter) age() {
 //  2. consecutiveMisses                — consecutive GET misses
 //
 // If either exceeds its threshold within a 1s window, detectScan() returns true.
-//
-// Concurrency: all fields are atomically updated and can be called under shard lock.
+// all fields are atomically updated and can be called under shard lock.
 type workloadDetector struct {
 	recentAdmissions    uint64 // count of admissions in current window
 	recentAdmissionTime int64  // window start (ns)
@@ -315,16 +314,11 @@ func (wd *workloadDetector) recordRejection() {
 	atomic.AddUint64(&wd.consecutiveMisses, 1)
 }
 
-//  Adaptive admission filter
-//  - Doorkeeper (Bloom) short-circuits "already seen" keys.
-//  - Frequency sketch estimates popularity.
-//  - Scan mode dials admission toward recency.
-//  - Eviction-pressure feedback nudges global probability up/down.
-//
-
-// adaptiveAdmissionFilter is per-shard and expected to run under the shard write lock
-// during admission/eviction decisions. The sketch uses atomics so it remains correct
-// even if called without external synchronization (e.g., future reuse).
+// Adaptive admission filter
+// - Doorkeeper (Bloom) short-circuits "already seen" keys.
+// - Frequency sketch estimates popularity.
+// - Scan mode dials admission toward recency.
+// - Eviction-pressure feedback nudges global probability up/down.
 type adaptiveAdmissionFilter struct {
 	frequencyFilter *frequencyBloomFilter
 	doorkeeper      *bloomFilter
@@ -366,7 +360,6 @@ func newAdaptiveAdmissionFilter(numCounters uint64, resetInterval time.Duration)
 }
 
 // shouldAdmit is called from the eviction path when a shard is at capacity.
-// Inputs:
 //
 //	keyHash          — 64-bit hash of the candidate
 //	victimFrequency  — estimated frequency of the sampled victim
@@ -463,7 +456,6 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, vict
 
 	prob := atomic.LoadUint32(&aaf.admissionProbability)
 
-	// Cap penalty at 50 percentage points (vf > 5 is clamped).
 	vf := victimFrequency
 	if vf > 5 {
 		vf = 5

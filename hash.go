@@ -7,7 +7,6 @@ import (
 )
 
 // xxHash64 (seed=0) partial reimplementation focused on hot-path characteristics.
-// Notes on design choices:
 //   - We keep the exact xxHash64 mixing/avalanche structure so the output
 //     distribution matches stock xxHash64 for the processed lanes.
 //   - Little-endian loads (binary.LittleEndian) are used per spec.
@@ -71,7 +70,6 @@ func newHasher[K comparable]() hasher[K] {
 }
 
 // hash returns a 64-bit hash for the given key.
-// Policy:
 //   - Built-in integer types go through xxHash64Avalanche to cheaply
 //     decorrelate small integers (common in sharding/IDs).
 //   - Strings choose FNV-1a vs xxHash64 based on length (see hashString).
@@ -101,10 +99,8 @@ func (h hasher[K]) hash(key K) uint64 {
 }
 
 // hashString chooses the hashing backend based on length.
-// Rationale:
-//   - ≤8B: FNV-1a usually beats xxHash on tiny payloads due to less arithmetic.
-//   - >8B: xxHash64 provides better distribution and throughput on longer inputs.
-//
+// ≤8B: FNV-1a usually beats xxHash on tiny payloads due to less arithmetic.
+// >8B: xxHash64 provides better distribution and throughput on longer inputs.
 // Endianness not relevant here; FNV and xxHash treat the byte slice as-is.
 func (h hasher[K]) hashString(s string) uint64 {
 	if len(s) <= stringByteLength {
