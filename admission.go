@@ -7,56 +7,44 @@ import (
 )
 
 const (
-	// Bloom/doorkeeper hash mixing (xxHash64-style avalanche). These constants are
-	// used to decorrelate low-entropy inputs before masking into a power-of-two bitset.
+	// Hash mixing (xxHash64-style avalanche), then mask into power-of-two bitsets.
 	bloomMixPrime1 = 0xff51afd7ed558ccd
 	bloomMixPrime2 = 0xc4ceb9fe1a85ec53
 
-	// Admission thresholds (policy-level, not hard caps).
-	// frequencyThreshold: if the estimated CMS frequency of a candidate reaches this value,
-	// it is admitted unconditionally (fast-path).
-	// baseAdmissionRate is informational here; the live value is seeded in newAdaptiveAdmissionFilter().
-	baseAdmissionRate  = 70 // %
-	frequencyThreshold = 3  // admit if estimated freq ≥ 3
+	// Admission policy.
+	baseAdmissionRate  = 70 // seed; live value set in newAdaptiveAdmissionFilter
+	frequencyThreshold = 3  // admit if estimated CMS freq ≥ 3
 
-	// Eviction-pressure feedback: we adapt the base admission probability up/down once
-	// per interval, based on the recent eviction count. These are deliberately coarse
-	// to keep SET hot paths branch-/atomic-light.
-	highEvictionRateThreshold = 100 // if evictions/sec > this → lower admission prob
-	lowEvictionRateThreshold  = 10  // if evictions/sec < this → raise admission prob
-	admissionProbabilityStep  = 5   // +/- step size in percentage points
+	// Eviction-pressure feedback (nudges global admission prob once per second).
+	highEvictionRateThreshold = 100
+	lowEvictionRateThreshold  = 10
+	admissionProbabilityStep  = 5
 
-	// Counter packing for the frequency sketch:
-	// - 4-bit counters (0..15) packed 16-per-uint64.
-	// - "aging" halves all counters to decay old history.
+	// 4-bit CMS counters (16 per uint64); periodic aging halves counts.
 	bitsPerWord   = 64
 	frequencyMask = 0x0F
 	maxFrequency  = 15
 	agingFactor   = 2
 
-	// Per-hash rotations to derive multiple hash functions from a single 64-bit key hash.
+	// Per-hash rotations for 4 CMS hashes.
 	hash1Rotate = 0
 	hash2Rotate = 17
 	hash3Rotate = 31
 	hash4Rotate = 47
 
-	// Scan detection knobs. When detectScan() returns true we switch to a more
-	// recency-biased policy and clamp probabilistic admission.
-	scanAdmissionThreshold = 100 // admissions/sec considered a scan if counted
-	scanMissThreshold      = 50  // consecutive GET misses considered a scan
+	// Scan detection (switch to recency-biased policy).
+	scanAdmissionThreshold = 100 // admissions/sec
+	scanMissThreshold      = 50  // consecutive misses
 
-	// Time thresholds (nanoseconds).
-	// During scan mode we prefer to keep victims that were touched recently.
-	// For tie-breaks in normal mode, very old victims lose to fresh candidates.
+	// Time thresholds (ns).
 	scanModeRecencyThreshold = 100e6 // 100ms
 	recencyTieBreakThreshold = 1e9   // 1s
 
-	// Feedback/adaptation cadence.
+	// Feedback cadence.
 	evictionPressureInterval = 1e9 // 1s
 )
 
-// hashN rotates+mixes a 64-bit input, then masks into a power-of-two bit-space.
-// Assumes mask = size-1 (size is a power-of-two), so `h & mask` == `h % size`.
+// hashN rotates+mixes a 64-bit value and masks into [0..mask]; mask should be size-1.
 func hashN(hash, mask uint64, rotate int) uint64 {
 	h := bits.RotateLeft64(hash, int(rotate))
 	h ^= h >> 33
@@ -67,18 +55,14 @@ func hashN(hash, mask uint64, rotate int) uint64 {
 	return h & mask
 }
 
-// Doorkeeper: a tiny 3-hash Bloom filter
-//
-// bloomFilter is a fixed-size bitset addressed by three independent hashes.
-// Concurrency: this structure is mutated under the shard's write lock; no atomics.
+// bloomFilter is a 3-hash doorkeeper bitset (caller provides any needed synchronization).
 type bloomFilter struct {
-	bits []uint64 // 16× 4B bytes per word; each bit is an event.
-	size uint64   // logical number of bits (power of two)
-	mask uint64   // size-1 for fast modulo
+	bits []uint64
+	size uint64
+	mask uint64
 }
 
-// newBloomFilter allocates a bitset rounded up to next power-of-two bits.
-// The underlying slice length is size/64 (at least 1).
+// newBloomFilter allocates a power-of-two-sized bitset (at least one uint64 word).
 func newBloomFilter(size uint64) *bloomFilter {
 	size = uint64(nextPowerOf2(int(size)))
 	arraySize := size / bitsPerWord
@@ -92,7 +76,7 @@ func newBloomFilter(size uint64) *bloomFilter {
 	}
 }
 
-// add sets three hashed bit-positions. Idempotent.
+// add sets three hashed bits for keyHash (idempotent).
 func (bf *bloomFilter) add(keyHash uint64) {
 	h1 := hashN(keyHash, bf.mask, hash1Rotate)
 	h2 := hashN(keyHash, bf.mask, hash2Rotate)
@@ -103,7 +87,7 @@ func (bf *bloomFilter) add(keyHash uint64) {
 	bf.bits[h3/bitsPerWord] |= 1 << (h3 % bitsPerWord)
 }
 
-// contains returns true if all three hashed bits are set (standard Bloom semantics).
+// contains returns true iff all three hashed bits are set.
 func (bf *bloomFilter) contains(keyHash uint64) bool {
 	h1 := hashN(keyHash, bf.mask, hash1Rotate)
 	h2 := hashN(keyHash, bf.mask, hash2Rotate)
@@ -116,28 +100,22 @@ func (bf *bloomFilter) contains(keyHash uint64) bool {
 	return bit1 != 0 && bit2 != 0 && bit3 != 0
 }
 
-// reset zeroes the bitset. Called under shard lock (so no atomics needed).
+// reset zeroes the bitset.
 func (bf *bloomFilter) reset() {
 	clear(bf.bits)
 }
 
-//	Frequency sketch: 4-bit Count–Min Sketch with periodic aging
-//	approximate frequency estimates without per-key state.
-//
-// frequencyBloomFilter is a 4-hash Count–Min Sketch with 4-bit counters, packed
-// 16 per uint64 word. Each increment CASes a single word; aging is a halving pass.
-// Concurrency: counter updates are lock-free per-word via CAS; safe for parallel use.
+// frequencyBloomFilter is a 4-hash Count–Min Sketch using 4-bit counters packed 16 per uint64.
 type frequencyBloomFilter struct {
-	counters []uint64 // len = size/16 words; each word packs 16 nybble counters
-	size     uint64   // number of individual 4-bit counters (power of two)
-	mask     uint64   // size-1 for fast modulo
+	counters []uint64
+	size     uint64
+	mask     uint64
 
-	totalIncrements uint64 // global increment count (for aging cadence)
-	agingThreshold  uint64 // trigger an aging pass after ~size*10 increments
+	totalIncrements uint64
+	agingThreshold  uint64
 }
 
-// newFrequencyBloomFilter allocates counters (size rounded to next power-of-two).
-// Memory: size/16 uint64 words (at least 1 word).
+// newFrequencyBloomFilter allocates the packed counter array (size rounded to power of two).
 func newFrequencyBloomFilter(numCounters uint64) *frequencyBloomFilter {
 	size := uint64(nextPowerOf2(int(numCounters)))
 	arraySize := size / 16
@@ -152,16 +130,13 @@ func newFrequencyBloomFilter(numCounters uint64) *frequencyBloomFilter {
 	}
 }
 
-// increment bumps the four counters addressed by the four hashes (unless saturated),
-// and returns the *new* minimum of those four counters (standard CMS estimate).
-// per-increment cost is 4 CAS loops worst case (one per word).
+// increment bumps all four counters for keyHash (unless saturated) and returns the new min estimate.
 func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 	h1 := hashN(keyHash, fbf.mask, hash1Rotate)
 	h2 := hashN(keyHash, fbf.mask, hash2Rotate)
 	h3 := hashN(keyHash, fbf.mask, hash3Rotate)
 	h4 := hashN(keyHash, fbf.mask, hash4Rotate)
 
-	// Query pass: min of four nybble counters.
 	freq := fbf.getCounterValue(h1)
 	if f2 := fbf.getCounterValue(h2); f2 < freq {
 		freq = f2
@@ -173,7 +148,6 @@ func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 		freq = f4
 	}
 
-	// Update pass: increment all four, if not saturated.
 	if freq < maxFrequency {
 		fbf.incrementCounter(h1)
 		fbf.incrementCounter(h2)
@@ -182,16 +156,13 @@ func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 		freq++
 	}
 
-	// Light-touch aging trigger (coarse-grained to avoid per-op overhead).
 	if atomic.AddUint64(&fbf.totalIncrements, 1) >= fbf.agingThreshold {
 		fbf.age()
 	}
-
 	return freq
 }
 
-// estimateFrequency returns the current CMS estimate (min of four counters).
-// This is a read-only query (no updates).
+// estimateFrequency reads the current CMS estimate (min of the four hashed counters).
 func (fbf *frequencyBloomFilter) estimateFrequency(keyHash uint64) uint64 {
 	h1 := hashN(keyHash, fbf.mask, hash1Rotate)
 	h2 := hashN(keyHash, fbf.mask, hash2Rotate)
@@ -208,11 +179,10 @@ func (fbf *frequencyBloomFilter) estimateFrequency(keyHash uint64) uint64 {
 	if f4 := fbf.getCounterValue(h4); f4 < freq {
 		freq = f4
 	}
-
 	return freq
 }
 
-// getCounterValue extracts a nybble (4-bit) counter at logical index.
+// getCounterValue extracts the 4-bit counter at the logical index.
 func (fbf *frequencyBloomFilter) getCounterValue(index uint64) uint64 {
 	arrayIndex := index / 16
 	counterIndex := index % 16
@@ -220,8 +190,7 @@ func (fbf *frequencyBloomFilter) getCounterValue(index uint64) uint64 {
 	return (fbf.counters[arrayIndex] >> shift) & frequencyMask
 }
 
-// incrementCounter performs a CAS loop to bump a single nybble within a packed word.
-// If the nybble is saturated (15), it is left unchanged.
+// incrementCounter CAS-increments a single 4-bit counter; saturated counters are left unchanged.
 func (fbf *frequencyBloomFilter) incrementCounter(index uint64) {
 	arrayIndex := index / 16
 	counterIndex := index % 16
@@ -240,11 +209,9 @@ func (fbf *frequencyBloomFilter) incrementCounter(index uint64) {
 	}
 }
 
-// age halves every nybble counter in-place via per-word CAS.
-// Vectorized form: shift the whole word right by 1 and mask off each nybble's MSB
-// so bits don't "spill" across nybble boundaries.
+// age halves every 4-bit counter in-place: shift right then mask each nibble (0b0111) to prevent spill.
 func (fbf *frequencyBloomFilter) age() {
-	const halfMask uint64 = 0x7777777777777777 // 0b0111 repeated per nybble
+	const halfMask uint64 = 0x7777777777777777
 	for i := range fbf.counters {
 		for {
 			current := atomic.LoadUint64(&fbf.counters[i])
@@ -257,38 +224,27 @@ func (fbf *frequencyBloomFilter) age() {
 	atomic.StoreUint64(&fbf.totalIncrements, 0)
 }
 
-//  Workload detector: cheap signals for scan/pollution detection
-//
-
-// workloadDetector tracks two signals:
-//  1. admissionRate (admissions/sec) — if maintained; see note in recordAdmission()
-//  2. consecutiveMisses                — consecutive GET misses
-//
-// If either exceeds its threshold within a 1s window, detectScan() returns true.
-// all fields are atomically updated and can be called under shard lock.
+// workloadDetector tracks admissions/sec (windowed) and consecutive misses; triggers scan mode on thresholds.
 type workloadDetector struct {
-	recentAdmissions    uint64 // count of admissions in current window
-	recentAdmissionTime int64  // window start (ns)
-	admissionRate       uint64 // computed admissions/sec (updated once per ~1s)
-	consecutiveMisses   uint64 // monotonic miss streak until reset
+	recentAdmissions    uint64
+	recentAdmissionTime int64
+	admissionRate       uint64
+	consecutiveMisses   uint64
 }
 
-// newWorkloadDetector seeds the time window.
+// newWorkloadDetector initializes the time window for rate calculations.
 func newWorkloadDetector() *workloadDetector {
 	return &workloadDetector{
 		recentAdmissionTime: time.Now().UnixNano(),
 	}
 }
 
-// detectScan recomputes admissionRate once per second and checks thresholds.
-// Note: admissionRate depends on recentAdmissions being incremented on admission.
-// If not incremented, the admissionRate branch will never trigger; the miss-streak
-// path is still fully effective.
+// detectScan updates admissionRate roughly once per second and returns true if rate or miss streak is high.
 func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 	now := time.Now().UnixNano()
 
 	elapsed := now - atomic.LoadInt64(&wd.recentAdmissionTime)
-	if elapsed > 1e9 { // 1s window
+	if elapsed > 1e9 {
 		admissions := atomic.LoadUint64(&wd.recentAdmissions)
 		if elapsed > 0 {
 			rate := admissions * 1e9 / uint64(elapsed)
@@ -302,49 +258,39 @@ func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 		atomic.LoadUint64(&wd.consecutiveMisses) > scanMissThreshold
 }
 
-// recordAdmission resets the miss streak on a successful admission.
+// recordAdmission bumps the windowed admissions count and resets the miss streak.
 func (wd *workloadDetector) recordAdmission() {
 	atomic.AddUint64(&wd.recentAdmissions, 1)
 	atomic.StoreUint64(&wd.consecutiveMisses, 0)
 }
 
-// recordRejection bumps the miss streak. On long cold streams this will
-// cause detectScan() to return true and switch the policy to scan mode.
+// recordRejection increases the consecutive miss streak (used by detectScan()).
 func (wd *workloadDetector) recordRejection() {
 	atomic.AddUint64(&wd.consecutiveMisses, 1)
 }
 
-// Adaptive admission filter
-// - Doorkeeper (Bloom) short-circuits "already seen" keys.
-// - Frequency sketch estimates popularity.
-// - Scan mode dials admission toward recency.
-// - Eviction-pressure feedback nudges global probability up/down.
+// adaptiveAdmissionFilter coordinates doorkeeper, CMS, scan mode, and eviction-pressure feedback.
 type adaptiveAdmissionFilter struct {
 	frequencyFilter *frequencyBloomFilter
 	doorkeeper      *bloomFilter
 	detector        *workloadDetector
 
-	// Probability of admitting a low-frequency key (0..100).
-	admissionProbability uint32
+	admissionProbability uint32 // base prob for low-freq items (0..100)
 	minProbability       uint32
 	maxProbability       uint32
 
-	// Eviction-pressure feedback (coarse, 1s cadence).
 	recentEvictions uint64
 	evictionWindow  int64
 
-	// Periodic doorkeeper reset to clear stale bits.
 	resetInterval int64
 	lastReset     int64
 
-	// Stats (all atomic).
 	admissionRequests uint64
 	admissionGrants   uint64
 	scanRejections    uint64
 }
 
-// newAdaptiveAdmissionFilter wires all subcomponents. The base admission
-// probability is seeded to 70% and limited to [5%, 95%].
+// newAdaptiveAdmissionFilter wires up components and seeds probabilities and timers.
 func newAdaptiveAdmissionFilter(numCounters uint64, resetInterval time.Duration) *adaptiveAdmissionFilter {
 	return &adaptiveAdmissionFilter{
 		frequencyFilter:      newFrequencyBloomFilter(numCounters),
@@ -359,32 +305,20 @@ func newAdaptiveAdmissionFilter(numCounters uint64, resetInterval time.Duration)
 	}
 }
 
-// shouldAdmit is called from the eviction path when a shard is at capacity.
-//
-//	keyHash          — 64-bit hash of the candidate
-//	victimFrequency  — estimated frequency of the sampled victim
-//	victimAge        — last-access time (ns) of the victim (0 if unavailable)
-//
-// Decision order:
-//  1. Doorkeeper fast-path: if seen recently → admit (and refresh sketch).
-//  2. Scan detection: if scan → admit by recency/min-probability.
-//  3. Otherwise use frequency comparison, tie-break by recency,
-//     else probabilistic admission adjusted by victim frequency.
-//
-// Also updates feedback (eviction pressure) and performs periodic doorkeeper resets.
+// shouldAdmit decides whether to admit a candidate at capacity using doorkeeper, scan mode, freq/recency, and probability.
 func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency uint64, victimAge int64) bool {
 	atomic.AddUint64(&aaf.admissionRequests, 1)
 
-	// Fast-path: "already seen" → admit and refresh sketch.
+	// Fast path: seen recently → refresh doorkeeper, sync sketch, admit.
 	if aaf.doorkeeper.contains(keyHash) {
-		aaf.doorkeeper.add(keyHash) // refresh
+		aaf.doorkeeper.add(keyHash)
 		_ = aaf.frequencyFilter.increment(keyHash)
 		aaf.detector.recordAdmission()
 		atomic.AddUint64(&aaf.admissionGrants, 1)
 		return true
 	}
 
-	// Scan-mode check (cheap): switches policy toward recency if true.
+	// Scan mode prefers recency.
 	isScanning := aaf.detector.detectScan(keyHash)
 	if isScanning {
 		atomic.AddUint64(&aaf.scanRejections, 1)
@@ -398,13 +332,12 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency 
 		return admit
 	}
 
-	// Normal mode: update sketch and doorkeeper, then run core decision logic.
+	// Normal mode: update sketch/doorkeeper and apply core policy.
 	newFreq := aaf.frequencyFilter.increment(keyHash)
 	aaf.doorkeeper.add(keyHash)
 
 	admit := aaf.makeAdmissionDecision(keyHash, newFreq, victimFrequency, victimAge)
 
-	// Background adaptations are intentionally coarse to keep the hot path light.
 	aaf.adjustAdmissionProbability()
 	aaf.checkPeriodicReset()
 
@@ -417,9 +350,7 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency 
 	return admit
 }
 
-// admitDuringScan prefers recency over frequency. If the victim hasn't been
-// touched recently (older than scanModeRecencyThreshold), we admit. Otherwise
-// fall back to a small min-probability to allow some churn.
+// admitDuringScan uses recency to keep fresh items; otherwise admits with a small minimum probability.
 func (aaf *adaptiveAdmissionFilter) admitDuringScan(keyHash uint64, victimAge int64) bool {
 	now := time.Now().UnixNano()
 	if victimAge > 0 && now-victimAge > scanModeRecencyThreshold {
@@ -428,16 +359,9 @@ func (aaf *adaptiveAdmissionFilter) admitDuringScan(keyHash uint64, victimAge in
 	return (keyHash % 100) < uint64(aaf.minProbability)
 }
 
-// makeAdmissionDecision implements the non-scan policy:
-//
-//   - If candidate freq ≥ threshold → admit.
-//   - Else if candidate freq > victim freq → admit.
-//   - Else if equal and >0 → break tie by victim recency (older loses),
-//     or with a 50/50 coin if recency is unknown.
-//   - Else → probabilistic admission: base probability minus a capped penalty
-//     derived from victim frequency (older/hotter victims reduce the chance).
-//
-// The penalty cap prevents "immortal" hot items from blocking churn forever.
+// makeAdmissionDecision applies the non-scan policy:
+// freq threshold/compare, recency tie-break
+// then probabilistic with capped victim penalty.
 func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, victimFrequency uint64, victimAge int64) bool {
 	if newFreq >= frequencyThreshold {
 		return true
@@ -467,9 +391,7 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, vict
 	return (keyHash % 100) < uint64(adjustedProb)
 }
 
-// adjustAdmissionProbability applies a once-per-interval nudge to the global
-// admission probability based on recent evictions. High pressure reduces the
-// chance of admitting low-frequency items; low pressure increases it.
+// adjustAdmissionProbability nudges the global probability once per interval based on recent evictions.
 func (aaf *adaptiveAdmissionFilter) adjustAdmissionProbability() {
 	now := time.Now().UnixNano()
 	window := atomic.LoadInt64(&aaf.evictionWindow)
@@ -500,8 +422,7 @@ func (aaf *adaptiveAdmissionFilter) adjustAdmissionProbability() {
 	}
 }
 
-// checkPeriodicReset clears the doorkeeper every resetInterval to avoid
-// saturating its bitset with long-term history.
+// checkPeriodicReset clears the doorkeeper on schedule to avoid long-term saturation.
 func (aaf *adaptiveAdmissionFilter) checkPeriodicReset() {
 	now := time.Now().UnixNano()
 	if now-aaf.lastReset > aaf.resetInterval {
@@ -510,20 +431,17 @@ func (aaf *adaptiveAdmissionFilter) checkPeriodicReset() {
 	}
 }
 
-// RecordEviction feeds back pressure to the adaptive probability logic.
-// Call this after an eviction is performed.
+// RecordEviction feeds back pressure after an eviction.
 func (aaf *adaptiveAdmissionFilter) RecordEviction() {
 	atomic.AddUint64(&aaf.recentEvictions, 1)
 }
 
-// GetFrequencyEstimate exposes the current CMS estimate for a given key hash.
-// Useful for debugging/telemetry; not used on the hot path.
+// GetFrequencyEstimate exposes the current CMS estimate for a key hash (telemetry/debug).
 func (aaf *adaptiveAdmissionFilter) GetFrequencyEstimate(keyHash uint64) uint64 {
 	return aaf.frequencyFilter.estimateFrequency(keyHash)
 }
 
-// GetStats returns cheap, approximate stats for observability. These are
-// maintained with atomics and may be slightly stale when read concurrently.
+// GetStats returns approximate counters and current probability (atomics; may be slightly stale).
 func (aaf *adaptiveAdmissionFilter) GetStats() (requests, grants, scanRejections uint64, admissionRate float64, currentProbability uint32) {
 	requests = atomic.LoadUint64(&aaf.admissionRequests)
 	grants = atomic.LoadUint64(&aaf.admissionGrants)
@@ -536,8 +454,7 @@ func (aaf *adaptiveAdmissionFilter) GetStats() (requests, grants, scanRejections
 	return
 }
 
-// Reset reinitializes the doorkeeper and decays the frequency sketch (via age()).
-// Intended for administrative "clear-like" operations, not for steady-state use.
+// Reset clears the doorkeeper and decays the sketch (administrative use).
 func (a *adaptiveAdmissionFilter) Reset() {
 	a.doorkeeper.reset()
 	a.frequencyFilter.age()

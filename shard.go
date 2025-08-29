@@ -5,56 +5,41 @@ import (
 	"sync/atomic"
 )
 
-// shard is a cache partition that confines contention to a subset of keys.
-// All structural mutations (map/links) are protected by mu.
-// Hot-path counters (size/hits/misses/evictions/expirations) are atomically updated.
-//
-//   - data:      key → *cacheItem[V]
-//   - LRU list:  intrusive doubly-linked list with sentinels {head, tail}
-//     head.next is MRU, tail.prev is LRU/oldest.
-//   - lfuList:   optional O(1) frequency-bucket list used by pure LFU.
-//   - admission: per-shard admission filter used by AdmissionLFU policy.
+// shard is a per-partition structure that confines contention; map/list mutations under mu, counters via atomics.
 type shard[K comparable, V any] struct {
 	mu   sync.RWMutex
 	data map[K]*cacheItem[V]
 
-	// LRU intrusive list sentinels.
-	// Invariant: head.prev == nil, tail.next == nil, and head.next...prev chain forms the list.
-	head *cacheItem[V] // MRU sentinel (head.next = most recently used item)
-	tail *cacheItem[V] // LRU sentinel (tail.prev = least recently used item)
+	// Intrusive LRU list sentinels (head.next = MRU, tail.prev = LRU).
+	// Invariant: head.prev == nil, tail.next == nil, and head↔…↔tail forms the chain.
+	head *cacheItem[V]
+	tail *cacheItem[V]
 
-	lfuList *lfuList[K, V] // Only allocated when policy == LFU.
+	lfuList *lfuList[K, V] // Allocated only for pure LFU policy.
 
-	size        int64 // number of live items in this shard (atomically adjusted)
-	hits        int64 // shard-local hit counter
-	misses      int64 // shard-local miss counter
-	evictions   int64 // shard-local eviction counter
-	expirations int64 // shard-local TTL expiration counter
+	size        int64 // live items (atomic)
+	hits        int64 // per-shard hits (atomic)
+	misses      int64 // per-shard misses (atomic)
+	evictions   int64 // per-shard evictions (atomic)
+	expirations int64 // per-shard TTL expirations (atomic)
 
-	// AdmissionLFU-only: reference to the adaptive admission filter.
+	// AdmissionLFU-only: shard-local adaptive admission filter.
 	admission *adaptiveAdmissionFilter
 
-	// For observability/debugging: frequency of the last evicted victim (AdmissionLFU).
+	// Observability: frequency of last evicted victim (AdmissionLFU).
 	lastVictimFrequency uint64
 }
 
-// initLRU initializes the intrusive LRU list to an empty state with sentinels.
-// We use a two-sentinel scheme (head/tail) to eliminate nil checks on insert/remove.
-//   - head.next == tail
-//   - tail.prev == head
+// initLRU sets up an empty LRU list with head/tail sentinels (no nil checks on operations).
 func (s *shard[K, V]) initLRU() {
 	s.head = &cacheItem[V]{}
 	s.tail = &cacheItem[V]{}
-	// Initialize empty list: head <-> tail
+	// head <-> tail (empty)
 	s.head.next = s.tail
 	s.tail.prev = s.head
 }
 
-// addToLRUHead inserts 'item' as MRU (immediately after head).
-//   - head.next == item
-//   - item.prev == head
-//   - item.next == oldNext
-//   - oldNext.prev == item
+// addToLRUHead inserts item as MRU directly after head (O(1)).
 func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext := s.head.next
 	// head -> item -> oldNext
@@ -65,10 +50,9 @@ func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext.prev = item
 }
 
-// removeFromLRU excises 'item' from the intrusive list by splicing its neighbors.
-// Post-condition: item.prev == nil && item.next == nil (defensive cleanup).
+// removeFromLRU unlinks item from the list by splicing neighbors; clears item links.
 func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
-	// Bridge the gap: prev -> next (skip item)
+	// prev -> next (skip item)
 	if item.prev != nil {
 		item.prev.next = item.next
 	}
@@ -79,15 +63,12 @@ func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
 	item.next = nil
 }
 
-// moveToLRUHead promotes 'item' to MRU position unless it is already MRU.
-// 1. Unlink item from current position (O(1)).
-// 2. Insert after head (same as addToLRUHead without reusing helper to avoid extra loads).
+// moveToLRUHead promotes item to MRU unless already MRU (unlink then insert after head).
 func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
-	// Fast-path: already MRU.
 	if s.head.next == item {
 		return
 	}
-	// Unlink from current position if linked.
+	// Unlink from current position.
 	if item.prev != nil {
 		item.prev.next = item.next
 	}
@@ -103,16 +84,9 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
 	oldNext.prev = item
 }
 
-// cleanup removes expired items and applies light, per-item frequency aging for AdmissionLFU.
-//
-//		Phase 1: Scan data map under write lock; collect keys to delete to avoid mutating
-//		         the map while ranging. Also apply in-place frequency halving for AdmissionLFU.
-//		Phase 2: Iterate the deletion list; for each key still present, unlink from lists,
-//		         recycle node, adjust size/stats.
-//
-//	  - Expiration is best-effort; lazy expiration also happens on reads.
-//	  - Frequency halving prevents "immortal" popularity for AdmissionLFU without scanning
-//	    global sketches—kept intentionally simple and cheap here.
+// cleanup removes expired items and halves per-item frequency for AdmissionLFU (cheap aging).
+// Phase 1: collect expired keys and apply in-place aging under write lock.
+// Phase 2: delete collected keys, unlink from structures, recycle nodes, update stats.
 func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool *sync.Pool, statsEnabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -123,16 +97,13 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 			keysToDelete = append(keysToDelete, key)
 			continue
 		}
-		// Lightweight per-item aging for AdmissionLFU to avoid stale high frequencies.
-		// This is intentionally coarse (shift) and only applied to items that have grown
-		// past 1 to reduce churn on mostly-cold entries.
+		// Lightweight aging (AdmissionLFU only) to prevent stale, permanently high frequencies.
 		if evictionPolicy == AdmissionLFU && item.frequency > 1 {
-			item.frequency >>= 1 // halve in place
+			item.frequency >>= 1
 		}
 	}
 
-	// destructive pass over collected keys. We re-check existence since
-	// items may have been concurrently removed/updated prior to acquiring the lock.
+	// Destructive pass over collected keys (re-check existence under lock).
 	for _, key := range keysToDelete {
 		if item, exists := s.data[key]; exists {
 			delete(s.data, key)
