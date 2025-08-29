@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  node1:
+    build: .
+    container_name: kioshun-node1
+    command: ["--bind", ":5011",
+              "--public", "node1:5011",
+              "--seeds", "node2:5012,node3:5013",
+              "--rf", "3",
+              "--wc", "2",
+              "--auth", "supersecret"]
+    ports: ["5011:5011"]
+    networks: [kioshun]
+    restart: unless-stopped
+
+  node2:
+    build: .
+    container_name: kioshun-node2
+    command: ["--bind", ":5012",
+              "--public", "node2:5012",
+              "--seeds", "node1:5011,node3:5013",
+              "--rf", "3",
+              "--wc", "2",
+              "--auth", "supersecret"]
+    ports: ["5012:5012"]
+    networks: [kioshun]
+    restart: unless-stopped
+
+  node3:
+    build: .
+    container_name: kioshun-node3
+    command: ["--bind", ":5013",
+              "--public", "node3:5013",
+              "--seeds", "node1:5011,node2:5012",
+              "--rf", "3",
+              "--wc", "2",
+              "--auth", "supersecret"]
+    ports: ["5013:5013"]
+    networks: [kioshun]
+    restart: unless-stopped
+
+networks:
+  kioshun:
+    driver: bridge
