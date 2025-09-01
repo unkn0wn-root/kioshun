@@ -22,8 +22,8 @@ type DistributedCache[K comparable, V any] struct {
 // NewDistributedCache wraps a started Node and returns a cache.Cache
 // compatible adapter. Call node.Start() before using the adapter, and Stop()
 // (or Close() on the adapter) during shutdown.
-func NewDistributedCache[K comparable, V any](n *Node[K, V]) *DistributedCacheAdapter[K, V] {
-	return &DistributedCacheAdapter[K, V]{n: n}
+func NewDistributedCache[K comparable, V any](n *Node[K, V]) *DistributedCache[K, V] {
+	return &DistributedCache[K, V]{n: n}
 }
 
 func (a *DistributedCacheAdapter[K, V]) getCtx(write bool) (context.Context, context.CancelFunc) {
