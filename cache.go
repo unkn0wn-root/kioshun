@@ -86,7 +86,7 @@ func DefaultConfig() Config {
 		ShardCount:             0,
 		CleanupInterval:        defaultCleanupInterval,
 		DefaultTTL:             defaultTTL,
-		EvictionPolicy:         LRU,
+		EvictionPolicy:         AdmissionLFU,
 		StatsEnabled:           true,
 		AdmissionResetInterval: 1 * time.Minute,
 	}
