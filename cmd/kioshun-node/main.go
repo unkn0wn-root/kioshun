@@ -142,6 +142,7 @@ func main() {
 	cfg.Handoff.MaxBytes = *hoffMaxBytes
 	cfg.Handoff.PerPeerCap = *hoffPeerCap
 	cfg.Handoff.PerPeerBytes = *hoffPeerBy
+
 	switch strings.ToLower(*hoffDrop) {
 	case "oldest":
 		cfg.Handoff.DropPolicy = cluster.DropOldest
@@ -165,7 +166,16 @@ func main() {
 	}
 
 	log.Printf("Kioshun node up at %s (bind %s) | rf=%d wc=%d lww=%v tls=%v mtls=%v handoff=%v rps=%d",
-		cfg.PublicURL, cfg.BindAddr, cfg.ReplicationFactor, cfg.WriteConcern, cfg.LWWEnabled, cfg.Sec.TLS.Enable, cfg.Sec.TLS.RequireClientCert, cfg.Handoff.IsEnabled(), cfg.Handoff.ReplayRPS)
+		cfg.PublicURL,
+		cfg.BindAddr,
+		cfg.ReplicationFactor,
+		cfg.WriteConcern,
+		cfg.LWWEnabled,
+		cfg.Sec.TLS.Enable,
+		cfg.Sec.TLS.RequireClientCert,
+		cfg.Handoff.IsEnabled(),
+		cfg.Handoff.ReplayRPS,
+	)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
