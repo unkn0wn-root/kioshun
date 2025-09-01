@@ -65,8 +65,11 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		hival = hdl
 	}
 	ptr := n.cfg.ReadPerTryTimeout
-	if ptr <= 0 || ptr > n.cfg.Sec.ReadTimeout {
+	if ptr <= 0 {
 		ptr = 200 * time.Millisecond
+	}
+	if rt := n.cfg.Sec.ReadTimeout; rt > 0 && ptr > rt {
+		ptr = rt
 	}
 
 	type ans struct {
@@ -124,8 +127,6 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	defer initial.Stop()
 	var ticker *time.Ticker
 
-	var lastErr error
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -133,9 +134,6 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 
 		case r := <-resCh:
 			inflight--
-			if r.err != nil {
-				lastErr = r.err
-			}
 			if r.hit {
 				vb, err := n.maybeDecompress(r.val, r.cp)
 				if err != nil {
@@ -154,9 +152,6 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 				nextIdx++
 				inflight++
 			} else if inflight == 0 && nextIdx >= len(cands) {
-				if lastErr != nil {
-					return zero, false, lastErr
-				}
 				return zero, false, nil
 			}
 
