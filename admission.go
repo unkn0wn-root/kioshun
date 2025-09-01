@@ -1,11 +1,11 @@
 package cache
 
 import (
-    "math/bits"
-    "sync/atomic"
-    "time"
+	"math/bits"
+	"sync/atomic"
+	"time"
 
-    "github.com/unkn0wn-root/kioshun/internal/mathutil"
+	"github.com/unkn0wn-root/kioshun/internal/mathutil"
 )
 
 const (
@@ -66,7 +66,7 @@ type bloomFilter struct {
 
 // newBloomFilter allocates a power-of-two-sized bitset (at least one uint64 word).
 func newBloomFilter(size uint64) *bloomFilter {
-    size = uint64(mathutil.NextPowerOf2(int(size)))
+	size = uint64(mathutil.NextPowerOf2(int(size)))
 	arraySize := size / bitsPerWord
 	if arraySize == 0 {
 		arraySize = 1
@@ -119,7 +119,7 @@ type frequencyBloomFilter struct {
 
 // newFrequencyBloomFilter allocates the packed counter array (size rounded to power of two).
 func newFrequencyBloomFilter(numCounters uint64) *frequencyBloomFilter {
-    size := uint64(mathutil.NextPowerOf2(int(numCounters)))
+	size := uint64(mathutil.NextPowerOf2(int(numCounters)))
 	arraySize := size / 16
 	if arraySize == 0 {
 		arraySize = 1
