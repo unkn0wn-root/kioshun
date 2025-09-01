@@ -1,4 +1,10 @@
-# Kioshun Cluste
+# Kioshun Cluster
+
+## Status
+
+> **Experimental:** the cluster implementation is under active development.
+  Backward compatibility is not guaranteed across minor releases. Review release notes before upgrading.
+  Wire messages are stable at present, but new fields/messages may be added as features evolve.
 
 This document describes the distributed cache cluster components and protocols used by `kioshun/cluster`. It focuses on the replication model, failure handling, and the wire protocol.
 
@@ -74,7 +80,7 @@ Key/Value: []byte (value may be gzip-compressed; Cp=true)
 Version: uint64 (HLC)
 ```
 
-## Hinted Handoff (Detail)
+## Hinted Handoff
 
 ```
 enqueue(write→peer) ──▶ per‑peer queue (max items/bytes, TTL, DropPolicy)
@@ -86,7 +92,7 @@ replay loop (RPS) ───────────────┘─▶ send �
 - Drops expired values (SET with already expired E) and aged hints (TTL).
 - Auto‑resume when backlog drains below hysteresis threshold.
 
-## Backfill (Detail)
+## Backfill
 
 ```
 Joiner → Donor: BackfillDigest(depth)
