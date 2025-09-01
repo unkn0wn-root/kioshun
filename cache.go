@@ -1,10 +1,12 @@
 package cache
 
 import (
-	"runtime"
-	"sync"
-	"sync/atomic"
-	"time"
+    "runtime"
+    "sync"
+    "sync/atomic"
+    "time"
+
+    "github.com/unkn0wn-root/kioshun/internal/mathutil"
 )
 
 const (
@@ -131,7 +133,7 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 			shardCount = maxPow2
 		}
 	}
-	shardCount = nextPowerOf2(shardCount)
+    shardCount = mathutil.NextPowerOf2(shardCount)
 
 	cache := &InMemoryCache[K, V]{
 		shards:    make([]*shard[K, V], shardCount),

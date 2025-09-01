@@ -26,7 +26,7 @@ func NewDistributedCache[K comparable, V any](n *Node[K, V]) *DistributedCache[K
 	return &DistributedCache[K, V]{n: n}
 }
 
-func (a *DistributedCacheAdapter[K, V]) getCtx(write bool) (context.Context, context.CancelFunc) {
+func (a *DistributedCache[K, V]) getCtx(write bool) (context.Context, context.CancelFunc) {
 	to := a.n.cfg.Sec.ReadTimeout
 	if write {
 		to = a.n.cfg.Sec.WriteTimeout
