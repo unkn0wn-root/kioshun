@@ -1,6 +1,8 @@
 package cluster
 
-import "time"
+import (
+	"time"
+)
 
 type NodeID string
 
@@ -100,6 +102,11 @@ type Config struct {
 	Seeds             []string
 	ReplicationFactor int
 	WriteConcern      int
+	// Client read tuning
+	ReadMaxFanout     int
+	ReadHedgeDelay    time.Duration
+	ReadHedgeInterval time.Duration
+	ReadPerTryTimeout time.Duration
 	GossipInterval    time.Duration
 	SuspicionAfter    time.Duration
 	TombstoneAfter    time.Duration
@@ -122,6 +129,10 @@ func Default() Config {
 	return Config{
 		ReplicationFactor: 2,
 		WriteConcern:      1,
+		ReadMaxFanout:     2,
+		ReadHedgeDelay:    3 * time.Millisecond,
+		ReadHedgeInterval: 3 * time.Millisecond,
+		ReadPerTryTimeout: 200 * time.Millisecond,
 		GossipInterval:    500 * time.Millisecond,
 		SuspicionAfter:    2 * time.Second,
 		TombstoneAfter:    30 * time.Second,

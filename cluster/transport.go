@@ -8,27 +8,31 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	cbor "github.com/fxamacker/cbor/v2"
 )
 
+const ReadTimeoutPenalty = 2 * time.Second
+
 type peerConn struct {
-	addr       string
-	self       string
-	conn       net.Conn
-	r          *bufio.Reader
-	w          *bufio.Writer
-	mu         sync.Mutex
-	pend       sync.Map // reqID -> chan []byte
-	closed     chan struct{}
-	maxFrame   int
-	readTO     time.Duration
-	writeTO    time.Duration
-	idleTO     time.Duration
-	inflightCh chan struct{}
-	token      string
+	addr         string
+	self         string
+	conn         net.Conn
+	r            *bufio.Reader
+	w            *bufio.Writer
+	mu           sync.Mutex
+	pend         sync.Map // reqID -> chan []byte
+	closed       chan struct{}
+	maxFrame     int
+	readTO       time.Duration
+	writeTO      time.Duration
+	idleTO       time.Duration
+	inflightCh   chan struct{}
+	token        string
+	penaltyUntil int64
 }
 
 // dialPeer establishes a TCP/TLS connection, performs an optional Hello auth,
@@ -57,7 +61,6 @@ func dialPeer(self string, addr string, tlsConf *tls.Config, maxFrame int, readT
 		return nil, err
 	}
 
-	// if we’re on plain TCP, we can still set options explicitly here (optional with Control above).
 	if tlsConf == nil {
 		if tc, ok := c.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
@@ -218,6 +221,16 @@ func writeFrameBuf(w *bufio.Writer, payload []byte) error {
 	return w.Flush()
 }
 
+func writeFrame(w io.Writer, payload []byte) error {
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
 func (p *peerConn) request(msg any, id uint64, timeout time.Duration) ([]byte, error) {
 	select {
 	case p.inflightCh <- struct{}{}:
@@ -250,16 +263,18 @@ func (p *peerConn) request(msg any, id uint64, timeout time.Duration) ([]byte, e
 		return resp, nil
 	case <-timer.C:
 		p.pend.Delete(id)
+		// Penalize this peer for a short window on read/write timeout.
+		p.penalize(ReadTimeoutPenalty)
 		return nil, ErrTimeout
 	}
 }
 
-func writeFrame(w io.Writer, payload []byte) error {
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(payload)
-	return err
+// penalize marks the peer as temporarily undesirable.
+func (p *peerConn) penalize(d time.Duration) {
+	atomic.StoreInt64(&p.penaltyUntil, time.Now().Add(d).UnixNano())
+}
+
+// penalized reports whether the peer is currently under penalty.
+func (p *peerConn) penalized() bool {
+	return time.Now().UnixNano() < atomic.LoadInt64(&p.penaltyUntil)
 }

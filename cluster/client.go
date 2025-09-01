@@ -22,55 +22,164 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	var zero V
 	owners := n.ownersFor(key)
 	bk := n.kc.EncodeKey(key)
-	for _, own := range owners {
-		if own.Addr == n.cfg.PublicURL {
-			if v, ok := n.local.Get(key); ok {
-				n.heat.sample(bk)
-				return v, true, nil
-			}
-			n.heat.sample(bk)
-			break
-		}
+
+	if v, ok := n.local.Get(key); ok {
+		n.heat.sample(bk)
+		return v, true, nil
 	}
+	n.heat.sample(bk)
 
 	if len(owners) == 0 {
 		return zero, false, ErrNoOwner
 	}
 
-	// Primary is first owner. We try it and rely on transport backpressure.
-	p := n.getPeer(owners[0].Addr)
-	if p == nil {
-		return zero, false, ErrBadPeer
+	fast, slow := make([]*nodeMeta, 0, len(owners)), make([]*nodeMeta, 0, len(owners))
+	for _, o := range owners {
+		if o.Addr == n.cfg.PublicURL {
+			continue
+		}
+		if pc := n.getPeer(o.Addr); pc != nil && !pc.penalized() {
+			fast = append(fast, o)
+		} else {
+			slow = append(slow, o)
+		}
 	}
-
-	id := n.nextReqID()
-	msg := &MsgGet{Base: Base{T: MTGet, ID: id}, Key: bk}
-	raw, err := p.request(msg, id, n.cfg.Sec.ReadTimeout)
-	if err != nil {
-		return zero, false, err
-	}
-
-	var resp MsgGetResp
-	if err := cbor.Unmarshal(raw, &resp); err != nil {
-		return zero, false, err
-	}
-	if resp.Err != "" {
-		return zero, false, errors.New(resp.Err)
-	}
-	if !resp.Found {
+	cands := append(fast, slow...)
+	if len(cands) == 0 {
 		return zero, false, nil
 	}
 
-	valBytes, err := n.maybeDecompress(resp.Val, resp.Cp)
-	if err != nil {
-		return zero, false, err
+	maxFanout := n.cfg.ReadMaxFanout
+	if maxFanout <= 0 {
+		maxFanout = 2
+	}
+	if maxFanout > len(cands) {
+		maxFanout = len(cands)
+	}
+	hdl := n.cfg.ReadHedgeDelay
+	if hdl <= 0 {
+		hdl = 3 * time.Millisecond
+	}
+	hival := n.cfg.ReadHedgeInterval
+	if hival <= 0 {
+		hival = hdl
+	}
+	ptr := n.cfg.ReadPerTryTimeout
+	if ptr <= 0 || ptr > n.cfg.Sec.ReadTimeout {
+		ptr = 200 * time.Millisecond
 	}
 
-	v, err := n.codec.Decode(valBytes)
-	if err != nil {
-		return zero, false, err
+	type ans struct {
+		hit bool
+		val []byte
+		cp  bool
+		err error
 	}
-	return v, true, nil
+	resCh := make(chan ans, len(cands))
+
+	startLeg := func(i int) {
+		pc := n.getPeer(cands[i].Addr)
+		if pc == nil {
+			resCh <- ans{err: ErrBadPeer}
+			return
+		}
+
+		id := n.nextReqID()
+		msg := &MsgGet{Base: Base{T: MTGet, ID: id}, Key: bk}
+		raw, err := pc.request(msg, id, ptr)
+		if err != nil {
+			if errors.Is(err, ErrTimeout) {
+				pc.penalize(2 * time.Second)
+			}
+			resCh <- ans{err: err}
+			return
+		}
+
+		var r MsgGetResp
+		if e := cbor.Unmarshal(raw, &r); e != nil {
+			resCh <- ans{err: e}
+			return
+		}
+
+		if r.Err != "" && r.Err != ErrNotFound {
+			resCh <- ans{err: errors.New(r.Err)}
+			return
+		}
+		if r.Err == ErrNotFound || !r.Found {
+			resCh <- ans{} // miss: no hit, no error
+			return
+		}
+
+		resCh <- ans{hit: true, val: r.Val, cp: r.Cp}
+	}
+
+	// start first leg immediately, then stagger more
+	nextIdx := 0
+	inflight := 0
+	startLeg(nextIdx)
+	nextIdx++
+	inflight++
+
+	initial := time.NewTimer(hdl)
+	defer initial.Stop()
+	var ticker *time.Ticker
+
+	var lastErr error
+
+	for {
+		select {
+		case <-ctx.Done():
+			return zero, false, ctx.Err()
+
+		case r := <-resCh:
+			inflight--
+			if r.err != nil {
+				lastErr = r.err
+			}
+			if r.hit {
+				vb, err := n.maybeDecompress(r.val, r.cp)
+				if err != nil {
+					return zero, false, err
+				}
+				v, err := n.codec.Decode(vb)
+				if err != nil {
+					return zero, false, err
+				}
+				return v, true, nil
+			}
+
+			// keep pipeline filled up to maxFanout
+			if nextIdx < len(cands) && inflight < maxFanout {
+				startLeg(nextIdx)
+				nextIdx++
+				inflight++
+			} else if inflight == 0 && nextIdx >= len(cands) {
+				if lastErr != nil {
+					return zero, false, lastErr
+				}
+				return zero, false, nil
+			}
+
+		case <-initial.C:
+			// after first delay, start more up to maxFanout, spaced by hedge interval
+			for inflight < maxFanout && nextIdx < len(cands) {
+				startLeg(nextIdx)
+				nextIdx++
+				inflight++
+				if inflight < maxFanout && nextIdx < len(cands) {
+					if ticker == nil {
+						ticker = time.NewTicker(hival)
+						defer ticker.Stop()
+					}
+					select {
+					case <-ticker.C:
+					case <-ctx.Done():
+						return zero, false, ctx.Err()
+					}
+				}
+			}
+		}
+	}
 }
 
 func (n *Node[K, V]) Set(ctx context.Context, key K, val V, ttl time.Duration) error {
