@@ -2,7 +2,9 @@ version: "3.8"
 
 services:
   node1:
-    build: .
+    build:
+      context: ../..
+      dockerfile: _examples/cluster/Dockerfile
     container_name: kioshun-node1
     command: ["--bind", ":5011",
               "--public", "node1:5011",
@@ -15,7 +17,9 @@ services:
     restart: unless-stopped
 
   node2:
-    build: .
+    build:
+      context: ../..
+      dockerfile: _examples/cluster/Dockerfile
     container_name: kioshun-node2
     command: ["--bind", ":5012",
               "--public", "node2:5012",
@@ -28,7 +32,9 @@ services:
     restart: unless-stopped
 
   node3:
-    build: .
+    build:
+      context: ../..
+      dockerfile: _examples/cluster/Dockerfile
     container_name: kioshun-node3
     command: ["--bind", ":5013",
               "--public", "node3:5013",

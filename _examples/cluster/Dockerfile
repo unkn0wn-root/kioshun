@@ -3,6 +3,7 @@ WORKDIR /src
 
 # 1) Prime the module cache
 COPY go.mod ./
+COPY go.sum ./
 RUN go mod download
 
 # 2) Bring in the source and reconcile deps
