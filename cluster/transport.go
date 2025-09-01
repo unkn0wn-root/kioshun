@@ -15,7 +15,11 @@ import (
 	cbor "github.com/fxamacker/cbor/v2"
 )
 
-const ReadTimeoutPenalty = 2 * time.Second
+const (
+	penaltyBase   = 2 * time.Second // first timeout → 2s
+	penaltyMax    = 8 * time.Second // cap the penalty
+	backoffWindow = 5 * time.Second // time window to keep growing the streak
+)
 
 type peerConn struct {
 	addr         string
@@ -33,6 +37,8 @@ type peerConn struct {
 	inflightCh   chan struct{}
 	token        string
 	penaltyUntil int64
+	lastTimeout  int64
+	toStreak     uint32
 }
 
 // dialPeer establishes a TCP/TLS connection, performs an optional Hello auth,
@@ -263,15 +269,38 @@ func (p *peerConn) request(msg any, id uint64, timeout time.Duration) ([]byte, e
 		return resp, nil
 	case <-timer.C:
 		p.pend.Delete(id)
-		// Penalize this peer for a short window on read/write timeout.
-		p.penalize(ReadTimeoutPenalty)
+		p.penalizeTimeout() // backoff on repeated timeouts
 		return nil, ErrTimeout
 	}
 }
 
-// penalize marks the peer as temporarily undesirable.
-func (p *peerConn) penalize(d time.Duration) {
-	atomic.StoreInt64(&p.penaltyUntil, time.Now().Add(d).UnixNano())
+// penalizeTimeout bumps a short penalty - repeated timeouts within backoffWindow
+// grow the penalty (2s → 4s → 8s), capped by penaltyMax. O(1), timeout-path only.
+func (p *peerConn) penalizeTimeout() {
+	now := time.Now()
+	last := time.Unix(0, atomic.LoadInt64(&p.lastTimeout))
+	var streak uint32
+	if now.Sub(last) > backoffWindow {
+		// stale last-timeout: reset streak to 1
+		atomic.StoreUint32(&p.toStreak, 1)
+		streak = 1
+	} else {
+		// same window: increment
+		streak = atomic.AddUint32(&p.toStreak, 1)
+	}
+	atomic.StoreInt64(&p.lastTimeout, now.UnixNano())
+
+	// penalty = base << (streak-1), capped
+	shift := streak - 1
+	if shift > 3 { // 2s<<3 = 16s
+		shift = 3
+	}
+
+	d := penaltyBase << shift
+	if d > penaltyMax {
+		d = penaltyMax
+	}
+	atomic.StoreInt64(&p.penaltyUntil, now.Add(d).UnixNano())
 }
 
 // penalized reports whether the peer is currently under penalty.

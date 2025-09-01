@@ -92,7 +92,7 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		raw, err := pc.request(msg, id, ptr)
 		if err != nil {
 			if errors.Is(err, ErrTimeout) {
-				pc.penalize(2 * time.Second)
+				pc.penalizeTimeout()
 			}
 			resCh <- ans{err: err}
 			return
