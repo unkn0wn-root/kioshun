@@ -7,13 +7,16 @@ import (
 	cache "github.com/unkn0wn-root/kioshun"
 )
 
-// DistributedCache adapts a running Node to the cache.Cache interface
-// so existing code using kioshun's single-node Cache can switch to the
-// clustered backend without invasive changes. Methods that cannot be expressed
-// cluster-wide (e.g., Clear, Size, Stats) operate on the local shard only.
+// DistributedCache adapts a running Node to the cache.Cache interface so
+// existing code using kioshun's single-node Cache can switch to the clustered
+// backend without invasive changes. Methods that cannot be expressed
+// cluster‑wide (e.g., Clear, Size, Stats) operate on the local shard only.
 //
-// Note: the adapter does not expose context. It uses Node timeouts from Config
-// (ReadTimeout/WriteTimeout) to bound remote calls.
+// This adapter exposes two usage styles:
+//   1) Compatibility methods without context (Set/Get/Delete) that internally
+//      use Node's configured timeouts (ReadTimeout/WriteTimeout).
+//   2) Context-aware methods (SetCtx/GetCtx/DeleteCtx/GetOrLoadCtx) that accept
+//      a caller-provided context and surface errors.
 type DistributedCache[K comparable, V any] struct {
 	n *Node[K, V]
 }
