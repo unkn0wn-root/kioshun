@@ -13,8 +13,7 @@ import (
 // cluster-wide (e.g., Clear, Size, Stats) operate on the local shard only.
 //
 // Note: the adapter does not expose context. It uses Node timeouts from Config
-// (ReadTimeout/WriteTimeout) to bound remote calls. Errors on Get are treated
-// as cache misses to preserve the original interface contract.
+// (ReadTimeout/WriteTimeout) to bound remote calls.
 type DistributedCache[K comparable, V any] struct {
 	n *Node[K, V]
 }
@@ -24,6 +23,11 @@ type DistributedCache[K comparable, V any] struct {
 // (or Close() on the adapter) during shutdown.
 func NewDistributedCache[K comparable, V any](n *Node[K, V]) *DistributedCache[K, V] {
 	return &DistributedCache[K, V]{n: n}
+}
+
+// Alias for NewDistributedCache
+func NewClient[K comparable, V any](n *Node[K, V]) *DistributedCache[K, V] {
+	return NewDistributedCache[K, V](n)
 }
 
 func (a *DistributedCache[K, V]) getCtx(write bool) (context.Context, context.CancelFunc) {
@@ -44,8 +48,12 @@ func (a *DistributedCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	return a.n.Set(ctx, key, value, ttl)
 }
 
-// Get forwards to Node.Get with the configured read timeout. Errors are
-// returned as cache misses to match the cache.Cache interface.
+// SetCtx forwards to Node.Set using the provided context.
+func (a *DistributedCache[K, V]) SetCtx(ctx context.Context, key K, value V, ttl time.Duration) error {
+	return a.n.Set(ctx, key, value, ttl)
+}
+
+// Get forwards to Node.Get with the configured read timeout.
 func (a *DistributedCache[K, V]) Get(key K) (V, bool) {
 	ctx, cancel := a.getCtx(false)
 	defer cancel()
@@ -57,11 +65,25 @@ func (a *DistributedCache[K, V]) Get(key K) (V, bool) {
 	return v, ok
 }
 
-// Delete forwards to Node.Delete; returns true on success.
+func (a *DistributedCache[K, V]) GetCtx(ctx context.Context, key K) (V, bool, error) {
+	return a.n.Get(ctx, key)
+}
+
 func (a *DistributedCache[K, V]) Delete(key K) bool {
 	ctx, cancel := a.getCtx(true)
 	defer cancel()
 	return a.n.Delete(ctx, key) == nil
+}
+
+func (a *DistributedCache[K, V]) DeleteCtx(ctx context.Context, key K) error {
+	return a.n.Delete(ctx, key)
+}
+
+// GetOrLoadCtx delegates to Node.GetOrLoad, enabling single-flight loading via
+// the Node's Lease table on the primary owner. This is the preferred interface
+// for read-through caching at the application layer.
+func (a *DistributedCache[K, V]) GetOrLoadCtx(ctx context.Context, key K, loader func(context.Context) (V, time.Duration, error)) (V, error) {
+	return a.n.GetOrLoad(ctx, key, loader)
 }
 
 // Clear clears only the local in-memory shard.
