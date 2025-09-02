@@ -31,7 +31,7 @@
 
 ## Cluster Overview
 
-> <span style="color:#ff6600">**Experimental:**</span> the cluster implementation is under active development.
+> <span style="color:darkorange">**Experimental:**</span> the cluster implementation is under active development.
   Backward compatibility is not guaranteed across minor releases. Review release notes before upgrading.
 
 Kioshun can run as a **peer-to-peer mesh**: each service instance embeds a cluster node that discovers peers (*Seeds*), forms a weighted rendezvous ring, and replicates writes with configurable RF/WC. Reads route to the primary owner; read‑through population uses single‑flight leases.
