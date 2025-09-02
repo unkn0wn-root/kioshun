@@ -8,6 +8,58 @@
 
 This document describes the distributed cache cluster components and protocols used by `kioshun/cluster`. It focuses on the replication model, failure handling, and the wire protocol.
 
+## Usage Model (peer-to-peer)
+
+- Peer-to-peer mesh: each service instance runs a full cluster peer. Nodes discover each other via `Seeds`, gossip membership/weights, form a weighted rendezvous ring, and replicate directly. There is no coordinator or proxy.
+- In-process node: embed a `cluster.Node` in your service. Start it with a unique `PublicURL` and `BindAddr`, configure `Seeds` with known peers, then wrap it with `NewDistributedCache` to call `Set/Get`.
+
+### Kioshun Mesh-style vs. Redis-style
+
+- Redis Cluster: clients stay clients; they compute slot→node and connect over a client protocol.
+- Kioshun Cluster: your app becomes a node in the mesh. It gossips, can be chosen as an owner, stores a shard locally, and routes requests to primary owners when needed.
+
+### Quickstart
+
+Run the same service on three servers. Each instance is a peer in the mesh.
+
+On each server, env:
+
+```
+CACHE_BIND=:4443
+CACHE_PUBLIC=srv-a:4443   # use srv-b:4443 and srv-c:4443 on other servers
+CACHE_SEEDS=srv-a:4443,srv-b:4443,srv-c:4443
+CACHE_AUTH=supersecret
+```
+
+In code:
+
+```
+local := cache.NewWithDefaults[string, []byte]()
+
+cfg := cluster.Default()
+cfg.BindAddr = os.Getenv("CACHE_BIND")
+cfg.PublicURL = os.Getenv("CACHE_PUBLIC")
+cfg.Seeds = strings.Split(os.Getenv("CACHE_SEEDS"), ",")
+cfg.ReplicationFactor = 3
+cfg.WriteConcern = 2
+cfg.Sec.AuthToken = os.Getenv("CACHE_AUTH")
+
+node := cluster.NewNode[string, []byte](cfg, cluster.StringKeyCodec[string]{}, local, cluster.BytesCodec{})
+if err := node.Start(); err != nil { panic(err) }
+dc := cluster.NewDistributedCache[string, []byte](node)
+_ = dc.Set("k", []byte("v"), time.Minute)
+v, ok := dc.Get("k")
+_ = v; _ = ok
+```
+
+Key points:
+
+- Mesh like: every instance is a peer; it gossips, can be selected as an owner, and stores a shard locally.
+- Reachability: `CACHE_PUBLIC` must be routable between peers. Open the port in firewalls/security groups.
+- Durability: tune `ReplicationFactor` and `WriteConcern` (e.g., RF=3, WC=2).
+- Security: set the same `CACHE_AUTH` on all peers. Enable TLS in config if required.
+- Adapter scope: `Clear/Size/Stats` act on the local shard only.
+
 ## Architecture
 
 ```
@@ -115,4 +167,3 @@ Donor  → Joiner: Items [{K, V, E, Ver, Cp}] + next cursor
 - Handoff: set per‑peer caps and RPS to sustainable values. TTL high enough to cover expected downtimes.
 - Backfill: adjust depth for dataset size. Rune page size to donor capacity.
 - Timeouts: read/write/idle tuned to network characteristics; inflight caps per peer.
-
