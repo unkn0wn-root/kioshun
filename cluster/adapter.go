@@ -13,10 +13,10 @@ import (
 // cluster‑wide (e.g., Clear, Size, Stats) operate on the local shard only.
 //
 // This adapter exposes two usage styles:
-//   1) Compatibility methods without context (Set/Get/Delete) that internally
-//      use Node's configured timeouts (ReadTimeout/WriteTimeout).
-//   2) Context-aware methods (SetCtx/GetCtx/DeleteCtx/GetOrLoadCtx) that accept
-//      a caller-provided context and surface errors.
+//  1. Compatibility methods without context (Set/Get/Delete) that internally
+//     use Node's configured timeouts (ReadTimeout/WriteTimeout).
+//  2. Context-aware methods (SetCtx/GetCtx/DeleteCtx/GetOrLoadCtx) that accept
+//     a caller-provided context and surface errors.
 type DistributedCache[K comparable, V any] struct {
 	n *Node[K, V]
 }
