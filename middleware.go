@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	httpcache "github.com/unkn0wn-root/kioshun/internal/httpcache"
 )
 
 type CachedResponse struct {
@@ -30,7 +32,7 @@ type HTTPCacheMiddleware struct {
 	onSet       func(string, time.Duration)
 	hitHeader   string
 	missHeader  string
-	patternIdx  *patternIndex
+	patternIdx  *httpcache.PatternIndex
 	pathExtract func(string) string
 }
 
@@ -93,8 +95,8 @@ func NewHTTPCacheMiddleware(config MiddlewareConfig) *HTTPCacheMiddleware {
 		policy:      DefaultCachePolicy(config),
 		hitHeader:   config.HitHeader,
 		missHeader:  config.MissHeader,
-		patternIdx:  newPatternIndex(),
-		pathExtract: defaultPathExtractor,
+		patternIdx:  httpcache.NewPatternIndex(),
+		pathExtract: httpcache.DefaultPathExtractor,
 	}
 
 	if m.hitHeader == "" {
@@ -139,7 +141,7 @@ func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
 
 			// add to pattern index
 			if path := m.pathExtract(key); path != "" {
-				m.patternIdx.addKey(path, key)
+				m.patternIdx.AddKey(path, key)
 			}
 
 			if m.onSet != nil {
@@ -175,18 +177,18 @@ func (m *HTTPCacheMiddleware) Stats() Stats { return m.cache.Stats() }
 // Clear removes all cached entries
 func (m *HTTPCacheMiddleware) Clear() {
 	m.cache.Clear()
-	m.patternIdx.clear()
+	m.patternIdx.Clear()
 }
 
 // Invalidate removes cached entries matching a URL pattern
 func (m *HTTPCacheMiddleware) Invalidate(urlPattern string) int {
 	removed := 0
 
-	matchingKeys := m.patternIdx.getMatchingKeys(urlPattern)
+	matchingKeys := m.patternIdx.GetMatchingKeys(urlPattern)
 	for _, key := range matchingKeys {
 		if m.cache.Delete(key) {
 			if path := m.pathExtract(key); path != "" {
-				m.patternIdx.removeKey(path, key)
+				m.patternIdx.RemoveKey(path, key)
 			}
 			removed++
 		}
