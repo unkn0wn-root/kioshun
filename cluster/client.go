@@ -15,9 +15,11 @@ type DistCache[K comparable, V any] interface {
 	GetOrLoad(ctx context.Context, key K, loader func(context.Context) (V, time.Duration, error)) (V, error)
 }
 
-// Get performs an owner-routed read. It prefers the local shard when this
-// node is primary, otherwise it contacts the primary owner over the wire and
-// decodes the response (with optional compression).
+// Get: read-only, owner-routed read.
+// - If present locally, returns immediately.
+// - On miss: routes to the primary owner (with optional hedging) and decodes the response.
+// - No side effects: does NOT write, replicate, or repair on a miss.
+// - Use when you do not want population on miss (you have separate writers or are fine returning not-found).
 func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	var zero V
 	owners := n.ownersFor(key)
@@ -237,6 +239,15 @@ func (n *Node[K, V]) Delete(ctx context.Context, key K) error {
 	return n.repl.replicateDelete(ctx, bk, owners, ver)
 }
 
+// GetOrLoad: read-through with stampede protection and replication.
+// - If present locally, returns immediately.
+// - Otherwise, coordinates a single load on the primary owner via a lease:
+//   - If THIS node is primary, runs the provided loader, Set locally, and replicates to RF owners.
+//   - If a REMOTE node is primary, sends LeaseLoad. The remote primary runs its node.Loader
+//     (not the loader passed here), Set locally there, and replicates.
+//
+// - Prevents thundering herd: concurrent callers wait on the lease, so only one load+replicate happens.
+// - Use when you want population on miss and cluster-wide propagation with TTL.
 func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.Context) (V, time.Duration, error)) (V, error) {
 	var zero V
 	if v, ok := n.local.Get(key); ok {
@@ -291,10 +302,18 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 		return zero, ErrBadPeer
 	}
 
+	ttm := 5 * time.Second
+	if rt := n.cfg.Sec.ReadTimeout; rt > 0 && ttm > rt {
+		ttm = rt
+	}
+
 	id := n.nextReqID()
 	msg := &MsgLeaseLoad{Base: Base{T: MTLeaseLoad, ID: id}, Key: bk}
-	raw, err := p.request(msg, id, 5*time.Second)
+	raw, err := p.request(msg, id, ttm)
 	if err != nil {
+		if errors.Is(err, ErrPeerClosed) {
+			n.resetPeer(primary.Addr)
+		}
 		return zero, err
 	}
 
