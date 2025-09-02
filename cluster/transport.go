@@ -264,7 +264,7 @@ func (p *peerConn) request(msg any, id uint64, timeout time.Duration) ([]byte, e
 	select {
 	case resp, ok := <-ch:
 		if !ok {
-			return nil, errors.New("peer closed")
+			return nil, ErrPeerClosed
 		}
 		return resp, nil
 	case <-timer.C:

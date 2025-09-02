@@ -9,4 +9,5 @@ var (
 	ErrBadPeer      = errors.New("bad peer response")
 	ErrNoLoader     = errors.New("no loader configured on primary")
 	ErrLeaseTimeout = errors.New("lease timeout")
+	ErrPeerClosed   = errors.New("peer closed")
 )

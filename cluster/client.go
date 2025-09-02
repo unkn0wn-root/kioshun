@@ -91,8 +91,8 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		msg := &MsgGet{Base: Base{T: MTGet, ID: id}, Key: bk}
 		raw, err := pc.request(msg, id, ptr)
 		if err != nil {
-			if errors.Is(err, ErrTimeout) {
-				pc.penalizeTimeout()
+			if errors.Is(err, ErrPeerClosed) {
+				n.resetPeer(cands[i].Addr) // next getPeer() will redial
 			}
 			resCh <- ans{err: err}
 			return
