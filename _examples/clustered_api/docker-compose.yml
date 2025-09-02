@@ -1,0 +1,79 @@
+version: "3.9"
+
+networks:
+  mesh:
+    driver: bridge
+
+services:
+  api1:
+    build:
+      context: ../..
+      dockerfile: _examples/mesh_api/userapi/Dockerfile
+    container_name: kioshun-api1
+    environment:
+      - PORT=8081
+      - CACHE_BIND=:5011
+      - CACHE_PUBLIC=api1:5011
+      - CACHE_SEEDS=api1:5011,api2:5012,api3:5013
+      - CACHE_AUTH=supersecret
+      - SEED_USERS=200
+    networks: [mesh]
+    restart: unless-stopped
+
+  api2:
+    build:
+      context: ../..
+      dockerfile: _examples/mesh_api/userapi/Dockerfile
+    container_name: kioshun-api2
+    environment:
+      - PORT=8082
+      - CACHE_BIND=:5012
+      - CACHE_PUBLIC=api2:5012
+      - CACHE_SEEDS=api1:5011,api2:5012,api3:5013
+      - CACHE_AUTH=supersecret
+      - SEED_USERS=200
+    networks: [mesh]
+    restart: unless-stopped
+
+  api3:
+    build:
+      context: ../..
+      dockerfile: _examples/mesh_api/userapi/Dockerfile
+    container_name: kioshun-api3
+    environment:
+      - PORT=8083
+      - CACHE_BIND=:5013
+      - CACHE_PUBLIC=api3:5013
+      - CACHE_SEEDS=api1:5011,api2:5012,api3:5013
+      - CACHE_AUTH=supersecret
+      - SEED_USERS=200
+    networks: [mesh]
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: kioshun-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api1
+      - api2
+      - api3
+    networks: [mesh]
+
+  loadgen:
+    build:
+      context: ../..
+      dockerfile: _examples/mesh_api/loadgen/Dockerfile
+    container_name: kioshun-loadgen
+    environment:
+      - TARGET=http://nginx:8080
+      - DURATION=60s
+      - CONCURRENCY=100
+      - USERS=200
+    depends_on:
+      - nginx
+    networks: [mesh]
+    restart: "no"
