@@ -10,11 +10,12 @@
   [![CI](https://github.com/unkn0wn-root/kioshun/actions/workflows/test.yml/badge.svg)](https://github.com/unkn0wn-root/kioshun/actions)
 
 
-  *Thread-safe, sharded in-memory cache for Go*
+  *Thread-safe, sharded in-memory cache for Go - with an optional peer-to-peer cluster backend*
 </div>
 
 ## Table of Contents
 
+- [Cluster (Overview)](#cluster-overview)
 - [Architecture](#architecture)
   - [Sharded Design](#sharded-design)
   - [Evictions Implementation](#eviction-policy-implementation)
@@ -27,6 +28,47 @@
 - [Cache Invalidation Setup](#cache-invalidation-setup)
 - [Benchmark Results](_benchmarks/benchmarks.md)
 
+
+## Cluster Overview
+
+> **Experimental:** the cluster implementation is under active development.
+  Backward compatibility is not guaranteed across minor releases. Review release notes before upgrading.
+
+Kioshun can run as a **peer-to-peer mesh**: each service instance embeds a cluster node that discovers peers (*Seeds*), forms a weighted rendezvous ring, and replicates writes with configurable RF/WC. Reads route to the primary owner; read‑through population uses single‑flight leases.
+
+```
+┌─────────────┐      Gossip + Weights      ┌─────────────┐
+│  Service A  │◀──────────────────────────▶│  Service B  │
+│  + Node     │◀───────────▶◀───────────▶  │  + Node     │
+└──────┬──────┘                            └──────┬──────┘
+       │   Owner‑routed Get/Set (RF)              │
+       └──────────────▶◀──────────────────────────┘
+                  Service C + Node
+```
+
+Small multinode example:
+
+```
+# on each server
+CACHE_BIND=:4443
+CACHE_PUBLIC=srv-a:4443   # srv-b / srv-c on others
+CACHE_SEEDS=srv-a:4443,srv-b:4443,srv-c:4443
+CACHE_AUTH=supersecret
+
+// in code
+local := cache.NewWithDefaults[string, []byte]()
+cfg := cluster.Default()
+cfg.BindAddr = os.Getenv("CACHE_BIND")
+cfg.PublicURL = os.Getenv("CACHE_PUBLIC")
+cfg.Seeds = strings.Split(os.Getenv("CACHE_SEEDS"), ",")
+cfg.ReplicationFactor = 3; cfg.WriteConcern = 2
+cfg.Sec.AuthToken = os.Getenv("CACHE_AUTH")
+node := cluster.NewNode[string, []byte](cfg, cluster.StringKeyCodec[string]{}, local, cluster.BytesCodec{})
+if err := node.Start(); err != nil { panic(err) }
+dc := cluster.NewDistributedCache[string, []byte](node)
+```
+
+> See **CLUSTER.md** for more details.
 
 ## Architecture
 
