@@ -17,6 +17,25 @@ type bucketSig struct {
 
 const defaultBackfillDepth = 2 // 65,536 buckets
 
+// readyPollInterval picks a small poll period relative to configured cadences,
+// clamped into a sane range to avoid busy spinning or sluggish startup.
+func readyPollInterval(cfg Config) time.Duration {
+	p := 150 * time.Millisecond
+	if cfg.GossipInterval > 0 && cfg.GossipInterval/4 < p {
+		p = cfg.GossipInterval / 4
+	}
+	if cfg.WeightUpdate > 0 && cfg.WeightUpdate/4 < p {
+		p = cfg.WeightUpdate / 4
+	}
+	if p < 100*time.Millisecond {
+		p = 100 * time.Millisecond
+	}
+	if p > 500*time.Millisecond {
+		p = 500 * time.Millisecond
+	}
+	return p
+}
+
 func (n *Node[K, V]) backfillLoop() {
 	// Wait for initial membership/ring readiness with a bounded timeout
 	// to avoid running a no-op backfill before peers and ring are populated.
@@ -35,6 +54,9 @@ func (n *Node[K, V]) backfillLoop() {
 	}
 
 	deadline := time.Now().Add(timeout)
+	poll := readyPollInterval(n.cfg) // typically ~150ms
+	tk := time.NewTicker(poll)
+	defer tk.Stop()
 	for {
 		r := n.ring.Load().(*ring)
 		if len(n.peerAddrs()) > 0 || len(r.nodes) > 1 {
@@ -44,7 +66,7 @@ func (n *Node[K, V]) backfillLoop() {
 			break
 		}
 		select {
-		case <-time.After(150 * time.Millisecond):
+		case <-tk.C:
 		case <-n.stop:
 			return
 		}

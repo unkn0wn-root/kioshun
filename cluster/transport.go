@@ -104,7 +104,7 @@ func dialPeer(self string, addr string, tlsConf *tls.Config, maxFrame int, readT
 func (p *peerConn) hello() error {
 	id := uint64(time.Now().UnixNano())
 	msg := &MsgHello{Base: Base{T: MTHello, ID: id}, From: p.self, Token: p.token}
-	raw, err := cbor.Marshal(msg)
+	raw, err := cborEnc.Marshal(msg)
 	if err != nil {
 		return err
 	}
@@ -233,7 +233,7 @@ func (p *peerConn) request(msg any, id uint64, timeout time.Duration) ([]byte, e
 	}
 	defer func() { <-p.inflightCh }()
 
-	sel, err := cbor.Marshal(msg)
+	sel, err := cborEnc.Marshal(msg)
 	if err != nil {
 		return nil, err
 	}

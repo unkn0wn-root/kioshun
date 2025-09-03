@@ -121,7 +121,7 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		msg := &MsgGet{Base: Base{T: MTGet, ID: id}, Key: bk}
 		raw, err := pc.request(msg, id, ptr)
 		if err != nil {
-			if errors.Is(err, ErrPeerClosed) {
+			if isFatalTransport(err) {
 				n.resetPeer(cands[i].Addr) // next getPeer() will redial
 			}
 			resCh <- ans{err: err}
@@ -332,7 +332,7 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 	msg := &MsgLeaseLoad{Base: Base{T: MTLeaseLoad, ID: id}, Key: bk}
 	raw, err := p.request(msg, id, ttm)
 	if err != nil {
-		if errors.Is(err, ErrPeerClosed) {
+		if isFatalTransport(err) {
 			n.resetPeer(primary.Addr)
 		}
 		return zero, err

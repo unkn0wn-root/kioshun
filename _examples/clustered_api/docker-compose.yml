@@ -8,7 +8,7 @@ services:
   api1:
     build:
       context: ../..
-      dockerfile: _examples/mesh_api/userapi/Dockerfile
+      dockerfile: _examples/clustered_api/userapi/Dockerfile
     container_name: kioshun-api1
     environment:
       - PORT=8081
@@ -23,7 +23,7 @@ services:
   api2:
     build:
       context: ../..
-      dockerfile: _examples/mesh_api/userapi/Dockerfile
+      dockerfile: _examples/clustered_api/userapi/Dockerfile
     container_name: kioshun-api2
     environment:
       - PORT=8082
@@ -38,7 +38,7 @@ services:
   api3:
     build:
       context: ../..
-      dockerfile: _examples/mesh_api/userapi/Dockerfile
+      dockerfile: _examples/clustered_api/userapi/Dockerfile
     container_name: kioshun-api3
     environment:
       - PORT=8083
@@ -66,7 +66,7 @@ services:
   loadgen:
     build:
       context: ../..
-      dockerfile: _examples/mesh_api/loadgen/Dockerfile
+      dockerfile: _examples/clustered_api/loadgen/Dockerfile
     container_name: kioshun-loadgen
     environment:
       - TARGET=http://nginx:8080
