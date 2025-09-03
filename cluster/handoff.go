@@ -400,14 +400,22 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 			msg := &MsgSet{Base: Base{T: MTSet, ID: id}, Key: hi.key, Val: hi.val, Exp: hi.exp, Ver: hi.ver, Cp: hi.cp}
 			raw, err := pc.request(msg, id, h.node.cfg.Sec.WriteTimeout)
 			if err != nil {
-				h.node.resetPeer(addr)
+				if isFatalTransport(err) {
+					h.node.resetPeer(addr)
+				}
 				h.scheduleRetry(q, hi, backoff)
 				continue
 			}
 
 			var resp MsgSetResp
-			if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
+			if e := cbor.Unmarshal(raw, &resp); e != nil {
+				// framing/decoding error: likely broken stream → reset
 				h.node.resetPeer(addr)
+				h.scheduleRetry(q, hi, backoff)
+				continue
+			}
+			if !resp.OK {
+				// application-level negative ack: don't reset, just retry
 				h.scheduleRetry(q, hi, backoff)
 				continue
 			}

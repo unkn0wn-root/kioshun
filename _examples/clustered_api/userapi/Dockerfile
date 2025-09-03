@@ -2,7 +2,7 @@ FROM golang:1.22-alpine AS build
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    cd _examples/mesh_api/userapi && go build -o /out/userapi ./
+    cd _examples/clustered_api/userapi && go build -o /out/userapi ./
 
 FROM alpine:3.19
 RUN adduser -D app

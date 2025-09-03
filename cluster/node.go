@@ -657,7 +657,7 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 		n.verMu.RLock()
 		old := n.version[keyStr]
 		n.verMu.RUnlock()
-		// Ddrop older versions (LWW); equal version is idempotent.
+		// Drop older versions (LWW); equal version is idempotent.
 		if old > s.Ver {
 			return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: true}
 		}
