@@ -73,8 +73,8 @@ func (n *Node[K, V]) rebalanceOnce() {
 		ver := n.clock.Next()
 		msg := &MsgSet{
 			Base: Base{
-				T: MTSet,
-				ID: id
+				T:  MTSet,
+				ID: id,
 			},
 			Key: bk,
 			Val: bv,

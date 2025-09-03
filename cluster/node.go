@@ -21,7 +21,11 @@ import (
 	cbor "github.com/fxamacker/cbor/v2"
 )
 
-const ErrNotFound = "notfound"
+const (
+	errKeyTooLarge   = "key too large"
+	errValueTooLarge = "value too large"
+	errUnauthorized  = "unauthorized"
+)
 
 var readBufPool = newBufPool([]int{
 	1 << 10,  // 1 KiB
@@ -348,7 +352,7 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 
 		ack := MsgHelloResp{Base: Base{T: MTHelloResp, ID: base.ID}, OK: authOK}
 		if !authOK {
-			ack.Err = "unauthorized"
+			ack.Err = errUnauthorized
 		}
 
 		raw, _ := cborEnc.Marshal(&ack)
@@ -650,7 +654,7 @@ func (n *Node[K, V]) rpcGet(g MsgGet) MsgGetResp {
 					T:  MTGetResp,
 					ID: g.ID,
 				},
-				Err: "value too large",
+				Err: errValueTooLarge,
 			}
 		}
 		b2, cp := n.maybeCompress(b)
@@ -719,7 +723,7 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 				ID: s.ID,
 			},
 			OK:  false,
-			Err: "key too large",
+			Err: errKeyTooLarge,
 		}
 	}
 
@@ -730,7 +734,7 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 				ID: s.ID,
 			},
 			OK:  false,
-			Err: "value too large",
+			Err: errValueTooLarge,
 		}
 	}
 
@@ -753,7 +757,7 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 				ID: s.ID,
 			},
 			OK:  false,
-			Err: "value too large",
+			Err: errValueTooLarge,
 		}
 	}
 
@@ -833,7 +837,7 @@ func (n *Node[K, V]) rpcSetBulk(sb MsgSetBulk) MsgSetBulkResp {
 					ID: sb.ID,
 				},
 				OK:  false,
-				Err: "key too large",
+				Err: errKeyTooLarge,
 			}
 		}
 
@@ -844,7 +848,7 @@ func (n *Node[K, V]) rpcSetBulk(sb MsgSetBulk) MsgSetBulkResp {
 					ID: sb.ID,
 				},
 				OK:  false,
-				Err: "value too large",
+				Err: errValueTooLarge,
 			}
 		}
 
@@ -879,7 +883,7 @@ func (n *Node[K, V]) rpcSetBulk(sb MsgSetBulk) MsgSetBulkResp {
 					ID: sb.ID,
 				},
 				OK:  false,
-				Err: "value too large",
+				Err: errValueTooLarge,
 			}
 		}
 
@@ -931,7 +935,7 @@ func (n *Node[K, V]) rpcDel(d MsgDel) MsgDelResp {
 				ID: d.ID,
 			},
 			OK:  false,
-			Err: "key too large",
+			Err: errKeyTooLarge,
 		}
 	}
 

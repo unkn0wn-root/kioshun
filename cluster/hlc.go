@@ -14,6 +14,7 @@ const (
 func packHLC(physMS int64, logical uint16) uint64 {
 	return (uint64(physMS) << hlcLogicalBits) | uint64(logical)
 }
+
 // unpackHLC decodes a 64-bit HLC into physical milliseconds and logical.
 func unpackHLC(ts uint64) (physMS int64, logical uint16) {
 	return int64(ts >> hlcLogicalBits), uint16(ts & hlcLogicalMask)
