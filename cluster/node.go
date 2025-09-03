@@ -164,18 +164,39 @@ func (n *Node[K, V]) initTLS() {
 		return nil
 	}
 
+	minVer := n.cfg.Sec.TLS.MinVersion
+	if minVer == 0 {
+		minVer = tls.VersionTLS13
+	}
+
+	prefer := n.cfg.Sec.TLS.PreferServerCipherSuites
+
+	var suites []uint16
+	if len(n.cfg.Sec.TLS.CipherSuites) > 0 {
+		suites = append(suites, n.cfg.Sec.TLS.CipherSuites...)
+	} else if minVer < tls.VersionTLS13 {
+		suites = []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		}
+	}
+
+	var curves []tls.CurveID
+	if len(n.cfg.Sec.TLS.CurvePreferences) > 0 {
+		curves = append(curves, n.cfg.Sec.TLS.CurvePreferences...)
+	} else {
+		curves = []tls.CurveID{tls.X25519, tls.CurveP256}
+	}
+
 	if cert, err := tls.LoadX509KeyPair(n.cfg.Sec.TLS.CertFile, n.cfg.Sec.TLS.KeyFile); err == nil {
 		tc := &tls.Config{
 			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			PreferServerCipherSuites: true,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			},
-			CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
+			MinVersion:               minVer,
+			PreferServerCipherSuites: prefer,
+			CipherSuites:             suites,
+			CurvePreferences:         curves,
 		}
 		if n.cfg.Sec.TLS.RequireClientCert {
 			tc.ClientAuth = tls.RequireAndVerifyClientCert
@@ -184,7 +205,7 @@ func (n *Node[K, V]) initTLS() {
 		n.tlsServerConf = tc
 	}
 
-	cc := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: loadCertPool(n.cfg.Sec.TLS.CAFile)}
+	cc := &tls.Config{MinVersion: minVer, RootCAs: loadCertPool(n.cfg.Sec.TLS.CAFile)}
 	if n.cfg.Sec.TLS.CertFile != "" && n.cfg.Sec.TLS.KeyFile != "" {
 		if cert, err := tls.LoadX509KeyPair(n.cfg.Sec.TLS.CertFile, n.cfg.Sec.TLS.KeyFile); err == nil {
 			cc.Certificates = []tls.Certificate{cert}

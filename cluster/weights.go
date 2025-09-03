@@ -12,7 +12,7 @@ const (
 func computeWeight(load NodeLoad) uint64 {
 	var fm float64 = 0.5
 	if load.FreeMemBytes > 0 {
-		fm = clamp01(float64(load.FreeMemBytes) / float64(memRef))
+		fm = clamp(float64(load.FreeMemBytes) / float64(memRef))
 	}
 
 	cpu := 0.5

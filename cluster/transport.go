@@ -205,31 +205,24 @@ func (p *peerConn) writeFrame(payload []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	_ = p.conn.SetWriteDeadline(time.Now().Add(p.writeTO))
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := p.w.Write(hdr[:]); err != nil {
-		return err
-	}
-	if _, err := p.w.Write(payload); err != nil {
-		return err
-	}
-	return p.w.Flush()
+	return writeFrameBuf(p.w, payload)
 }
 
 func writeFrameBuf(w *bufio.Writer, payload []byte) error {
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	if _, err := w.Write(payload); err != nil {
+	if err := writeFrame(w, payload); err != nil {
 		return err
 	}
 	return w.Flush()
 }
 
 func writeFrame(w io.Writer, payload []byte) error {
-	return writeFrameBuf(p.w, payload)
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
 }
 
 func (p *peerConn) request(msg any, id uint64, timeout time.Duration) ([]byte, error) {

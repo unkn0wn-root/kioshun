@@ -1,17 +1,22 @@
 package cluster
 
 import (
+	"crypto/tls"
 	"time"
 )
 
 type NodeID string
 
 type TLSMode struct {
-	Enable            bool
-	CertFile          string
-	KeyFile           string
-	CAFile            string
-	RequireClientCert bool
+	Enable                   bool
+	CertFile                 string
+	KeyFile                  string
+	CAFile                   string
+	RequireClientCert        bool
+	MinVersion               uint16
+	PreferServerCipherSuites bool
+	CipherSuites             []uint16
+	CurvePreferences         []tls.CurveID
 }
 
 type Security struct {
@@ -52,10 +57,10 @@ type HandoffConfig struct {
 	AutopauseBytes int64
 }
 
-func (h *HandoffConfig) IsEnabled() bool { return h.Enable == nil || *h.Enable }
+func (h *HandoffConfig) IsEnabled() bool {
+	return h.Enable == nil || *h.Enable
+}
 
-// FillDefaults applies conservative defaults and computes autopause hysteresis
-// thresholds (90% pause, ~60% resume) to provide stability under pressure.
 func (h *HandoffConfig) FillDefaults() {
 	if h.Enable == nil {
 		b := true
@@ -155,6 +160,9 @@ func Default() Config {
 			LeaseLoadQPS:         0,
 			ReadBufSize:          32 << 10,
 			WriteBufSize:         32 << 10,
+			TLS: TLSMode{
+				PreferServerCipherSuites: true,
+			},
 		},
 		PerConnWorkers: 64,
 		PerConnQueue:   128,
