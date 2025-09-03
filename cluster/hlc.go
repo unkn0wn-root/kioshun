@@ -5,6 +5,28 @@ import (
 	"time"
 )
 
+const (
+	hlcLogicalBits = 16
+	hlcLogicalMask = (1 << hlcLogicalBits) - 1
+)
+
+func packHLC(physMS int64, logical uint16) uint64 {
+	return (uint64(physMS) << hlcLogicalBits) | uint64(logical)
+}
+func unpackHLC(ts uint64) (physMS int64, logical uint16) {
+	return int64(ts >> hlcLogicalBits), uint16(ts & hlcLogicalMask)
+}
+
+func maxOf(a, b, c int64) int64 {
+	if b > a {
+		a = b
+	}
+	if c > a {
+		a = c
+	}
+	return a
+}
+
 // hlc is a 64-bit Hybrid Logical Clock:
 // layout: [48 bits physical millis][16 bits logical counter].
 // Next() yields strictly monotonic timestamps for local events.
@@ -15,7 +37,9 @@ type hlc struct {
 	logical uint16 // last logical
 }
 
-func newHLC() *hlc { return &hlc{} }
+func newHLC() *hlc {
+	return &hlc{}
+}
 
 // Next returns a strictly monotonic timestamp for local events.
 func (h *hlc) Next() uint64 {
@@ -27,26 +51,18 @@ func (h *hlc) Next() uint64 {
 	} else {
 		h.logical++
 	}
-	v := (uint64(h.physMS) << 16) | uint64(h.logical)
+	v := packHLC(h.physMS, h.logical)
 	h.mu.Unlock()
 	return v
 }
 
 // Observe incorporates a remote HLC into our state to avoid regressions.
 func (h *hlc) Observe(remote uint64) {
-	rp := int64(remote >> 16)
-	rl := uint16(remote & 0xFFFF)
+	rp, rl := unpackHLC(remote)
 	now := time.Now().UnixMilli()
 
 	h.mu.Lock()
-	// move to the max of (local, remote, now) with proper logical bump when ties.
-	phys := h.physMS
-	if now > phys {
-		phys = now
-	}
-	if rp > phys {
-		phys = rp
-	}
+	phys := maxOf(h.physMS, now, rp)
 	switch {
 	case phys == rp && phys == h.physMS:
 		if rl >= h.logical {

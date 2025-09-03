@@ -58,10 +58,7 @@ func (n *Node[K, V]) rebalanceOnce() {
 		}
 
 		bk := n.kc.EncodeKey(k)
-		exp := int64(0)
-		if ttl > 0 {
-			exp = time.Now().Add(ttl).UnixNano()
-		}
+		exp := absExpiry(ttl)
 		p := n.getPeer(primary.Addr)
 		if p == nil {
 			continue

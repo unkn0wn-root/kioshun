@@ -60,6 +60,15 @@ func newHintQueue(cfg HandoffConfig) *hintQueue {
 	}
 }
 
+// removeElementLocked removes an element and updates all counters.
+func (q *hintQueue) removeElementLocked(e *list.Element) {
+	hi := e.Value.(*hintItem)
+	delete(q.index, string(hi.key))
+	q.ll.Remove(e)
+	q.items--
+	q.bytes -= hi.size
+}
+
 // enqueue adds or coalesces a hint. It keeps only the newest version per key.
 // Returns (accepted, bytesDelta, itemsDelta) for manager-wide accounting.
 func (q *hintQueue) enqueue(it *hintItem) (bool, int64, int) {
@@ -89,34 +98,24 @@ func (q *hintQueue) enqueue(it *hintItem) (bool, int64, int) {
 	wouldItems := q.items + 1
 	wouldBytes := q.bytes + it.size
 
+	overCap := func(items int, bytes int64) bool {
+		return (q.maxItems > 0 && items > q.maxItems) ||
+			(q.maxBytes > 0 && bytes > q.maxBytes)
+	}
+
 	switch q.drop {
-	case DropNone:
-		if (q.maxItems > 0 && wouldItems > q.maxItems) || (q.maxBytes > 0 && wouldBytes > q.maxBytes) {
-			return false, 0, 0
-		}
-	case DropNewest:
-		if (q.maxItems > 0 && wouldItems > q.maxItems) || (q.maxBytes > 0 && wouldBytes > q.maxBytes) {
-			return false, 0, 0
-		}
 	case DropOldest:
-		for (q.maxItems > 0 && wouldItems > q.maxItems) || (q.maxBytes > 0 && wouldBytes > q.maxBytes) {
+		for overCap(wouldItems, wouldBytes) {
 			fe := q.ll.Front()
 			if fe == nil {
 				break
 			}
-			fhi := fe.Value.(*hintItem)
-			delete(q.index, string(fhi.key))
-			q.ll.Remove(fe)
-			q.items--
-			q.bytes -= fhi.size
+			q.removeElementLocked(fe)
 			wouldItems = q.items + 1
 			wouldBytes = q.bytes + it.size
 		}
-	}
-
-	// possibly re-check for DropNewest after DropOldest loop
-	if q.drop == DropNewest {
-		if (q.maxItems > 0 && wouldItems > q.maxItems) || (q.maxBytes > 0 && wouldBytes > q.maxBytes) {
+	default: // DropNone and DropNewest: reject when over cap
+		if overCap(wouldItems, wouldBytes) {
 			return false, 0, 0
 		}
 	}
@@ -141,10 +140,7 @@ func (q *hintQueue) popReady(now int64) *hintItem {
 
 		it := fe.Value.(*hintItem)
 		if it.expired(q.ttl, now) {
-			delete(q.index, string(it.key))
-			q.ll.Remove(fe)
-			q.items--
-			q.bytes -= it.size
+			q.removeElementLocked(fe)
 			continue
 		}
 
@@ -152,10 +148,7 @@ func (q *hintQueue) popReady(now int64) *hintItem {
 			return nil // head-of-line backoff. Keep simple to avoid scans
 		}
 
-		delete(q.index, string(it.key))
-		q.ll.Remove(fe)
-		q.items--
-		q.bytes -= it.size
+		q.removeElementLocked(fe)
 		return it
 	}
 }
@@ -222,6 +215,7 @@ func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver 
 		return
 	}
 
+	const hintOverheadSet = int64(24) // bookkeeping bytes per SET
 	it := &hintItem{
 		key:     append([]byte(nil), key...),
 		val:     append([]byte(nil), val...),
@@ -230,7 +224,7 @@ func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver 
 		cp:      cp,
 		isDel:   false,
 		addedAt: time.Now().UnixNano(),
-		size:    int64(len(key) + len(val) + 24),
+		size:    int64(len(key)+len(val)) + hintOverheadSet,
 	}
 	h.enqueue(addr, it)
 }
@@ -240,6 +234,7 @@ func (h *handoff[K, V]) enqueueDel(addr string, key []byte, ver uint64) {
 		return
 	}
 
+	const hintOverheadDel = int64(16) // bookkeeping bytes per DEL
 	it := &hintItem{
 		key:     append([]byte(nil), key...),
 		val:     nil,
@@ -248,7 +243,7 @@ func (h *handoff[K, V]) enqueueDel(addr string, key []byte, ver uint64) {
 		cp:      false,
 		isDel:   true,
 		addedAt: time.Now().UnixNano(),
-		size:    int64(len(key) + 16),
+		size:    int64(len(key)) + hintOverheadDel,
 	}
 	h.enqueue(addr, it)
 }
@@ -356,6 +351,13 @@ func (h *handoff[K, V]) loop() {
 	}
 }
 
+// scheduleRetry updates backoff state and requeues the item.
+func (h *handoff[K, V]) scheduleRetry(q *hintQueue, hi *hintItem, backoff func(int) time.Duration) {
+	hi.tries++
+	hi.nextAt = time.Now().Add(backoff(hi.tries)).UnixNano()
+	q.requeue(hi)
+}
+
 func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 	// fairshare round-robin over peers to avoid starving any one queue.
 	h.mu.Lock()
@@ -388,9 +390,7 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 		if pc == nil {
 			pc = h.node.ensurePeer(addr)
 			if pc == nil {
-				hi.tries++
-				hi.nextAt = time.Now().Add(backoff(hi.tries)).UnixNano()
-				q.requeue(hi)
+				h.scheduleRetry(q, hi, backoff)
 				continue
 			}
 		}
@@ -401,18 +401,14 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 			raw, err := pc.request(msg, id, h.node.cfg.Sec.WriteTimeout)
 			if err != nil {
 				h.node.resetPeer(addr)
-				hi.tries++
-				hi.nextAt = time.Now().Add(backoff(hi.tries)).UnixNano()
-				q.requeue(hi)
+				h.scheduleRetry(q, hi, backoff)
 				continue
 			}
 
 			var resp MsgSetResp
 			if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
 				h.node.resetPeer(addr)
-				hi.tries++
-				hi.nextAt = time.Now().Add(backoff(hi.tries)).UnixNano()
-				q.requeue(hi)
+				h.scheduleRetry(q, hi, backoff)
 				continue
 			}
 			// success: drop
@@ -423,17 +419,13 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 		msg := &MsgDel{Base: Base{T: MTDelete, ID: id}, Key: hi.key, Ver: hi.ver}
 		raw, err := pc.request(msg, id, h.node.cfg.Sec.WriteTimeout)
 		if err != nil {
-			hi.tries++
-			hi.nextAt = time.Now().Add(backoff(hi.tries)).UnixNano()
-			q.requeue(hi)
+			h.scheduleRetry(q, hi, backoff)
 			continue
 		}
 
 		var resp MsgDelResp
 		if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
-			hi.tries++
-			hi.nextAt = time.Now().Add(backoff(hi.tries)).UnixNano()
-			q.requeue(hi)
+			h.scheduleRetry(q, hi, backoff)
 			continue
 		}
 		return true
@@ -450,7 +442,10 @@ func (h *handoff[K, V]) Stop() {
 	}
 }
 
-func (h *handoff[K, V]) Pause() { h.paused.Store(true) }
+func (h *handoff[K, V]) Pause() {
+	h.paused.Store(true)
+}
+
 func (h *handoff[K, V]) Resume() {
 	h.paused.Store(false)
 }

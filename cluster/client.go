@@ -15,6 +15,51 @@ type DistCache[K comparable, V any] interface {
 	GetOrLoad(ctx context.Context, key K, loader func(context.Context) (V, time.Duration, error)) (V, error)
 }
 
+type readTunNode struct {
+	fanout        int
+	hedgeDelay    time.Duration
+	hedgeInterval time.Duration
+	perTry        time.Duration
+}
+
+func (n *Node[K, V]) rtn() readTunNode {
+	t := readTunNode{
+		fanout:        n.cfg.ReadMaxFanout,
+		hedgeDelay:    n.cfg.ReadHedgeDelay,
+		hedgeInterval: n.cfg.ReadHedgeInterval,
+		perTry:        n.cfg.ReadPerTryTimeout,
+	}
+	if t.fanout <= 0 {
+		t.fanout = 2
+	}
+	if t.hedgeDelay <= 0 {
+		t.hedgeDelay = 3 * time.Millisecond
+	}
+	if t.hedgeInterval <= 0 {
+		t.hedgeInterval = t.hedgeDelay
+	}
+	if t.perTry <= 0 {
+		t.perTry = 200 * time.Millisecond
+	}
+	if rt := n.cfg.Sec.ReadTimeout; rt > 0 && t.perTry > rt {
+		t.perTry = rt
+	}
+	return t
+}
+
+func (n *Node[K, V]) lwwSetVersion(bk []byte, ver uint64) {
+	n.verMu.Lock()
+	n.version[string(bk)] = ver
+	n.verMu.Unlock()
+}
+
+func absExpiry(ttl time.Duration) int64 {
+	if ttl <= 0 {
+		return 0
+	}
+	return time.Now().Add(ttl).UnixNano()
+}
+
 // Get: read-only, owner-routed read.
 // - If present locally, returns immediately.
 // - On miss: routes to the primary owner (with optional hedging) and decodes the response.
@@ -25,11 +70,10 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	owners := n.ownersFor(key)
 	bk := n.kc.EncodeKey(key)
 
+	defer n.heat.sample(bk)
 	if v, ok := n.local.Get(key); ok {
-		n.heat.sample(bk)
 		return v, true, nil
 	}
-	n.heat.sample(bk)
 
 	if len(owners) == 0 {
 		return zero, false, ErrNoOwner
@@ -51,28 +95,12 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		return zero, false, nil
 	}
 
-	maxFanout := n.cfg.ReadMaxFanout
-	if maxFanout <= 0 {
-		maxFanout = 2
-	}
+	tu := n.rtn()
+	maxFanout := tu.fanout
 	if maxFanout > len(cands) {
 		maxFanout = len(cands)
 	}
-	hdl := n.cfg.ReadHedgeDelay
-	if hdl <= 0 {
-		hdl = 3 * time.Millisecond
-	}
-	hival := n.cfg.ReadHedgeInterval
-	if hival <= 0 {
-		hival = hdl
-	}
-	ptr := n.cfg.ReadPerTryTimeout
-	if ptr <= 0 {
-		ptr = 200 * time.Millisecond
-	}
-	if rt := n.cfg.Sec.ReadTimeout; rt > 0 && ptr > rt {
-		ptr = rt
-	}
+	hdl, hival, ptr := tu.hedgeDelay, tu.hedgeInterval, tu.perTry
 
 	type ans struct {
 		hit bool
@@ -208,9 +236,7 @@ func (n *Node[K, V]) Set(ctx context.Context, key K, val V, ttl time.Duration) e
 	if owners[0].Addr == n.cfg.PublicURL {
 		_ = n.local.Set(key, val, ttl)
 		if n.cfg.LWWEnabled {
-			n.verMu.Lock()
-			n.version[string(bk)] = ver
-			n.verMu.Unlock()
+			n.lwwSetVersion(bk, ver)
 		}
 	}
 	return n.repl.replicateSet(ctx, bk, bv, exp, ver, owners)
@@ -231,9 +257,7 @@ func (n *Node[K, V]) Delete(ctx context.Context, key K) error {
 	if owners[0].Addr == n.cfg.PublicURL {
 		n.local.Delete(key)
 		if n.cfg.LWWEnabled {
-			n.verMu.Lock()
-			n.version[string(bk)] = ver
-			n.verMu.Unlock()
+			n.lwwSetVersion(bk, ver)
 		}
 	}
 	return n.repl.replicateDelete(ctx, bk, owners, ver)
@@ -263,26 +287,23 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 	keyStr := string(bk)
 	primary := owners[0]
 	if primary.Addr == n.cfg.PublicURL {
-		_, acquired := n.leases.acquire(keyStr)
-		if acquired {
-			v, ttl, err := loader(ctx)
+
+		if _, acquired := n.leases.acquire(keyStr); acquired {
+			var v V
+			var ttl time.Duration
+			var err error
+			defer func() { n.leases.release(keyStr, err) }()
+
+			v, ttl, err = loader(ctx)
 			if err == nil {
 				_ = n.local.Set(key, v, ttl)
 				bv, _ := n.codec.Encode(v)
-				exp := int64(0)
-				if ttl > 0 {
-					exp = time.Now().Add(ttl).UnixNano()
-				}
-
 				ver := n.clock.Next()
-				_ = n.repl.replicateSet(ctx, bk, bv, exp, ver, owners)
+				_ = n.repl.replicateSet(ctx, bk, bv, absExpiry(ttl), ver, owners)
 				if n.cfg.LWWEnabled {
-					n.verMu.Lock()
-					n.version[keyStr] = ver
-					n.verMu.Unlock()
+					n.lwwSetVersion(bk, ver)
 				}
 			}
-			n.leases.release(keyStr, err)
 			return v, err
 		}
 

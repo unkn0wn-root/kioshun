@@ -71,15 +71,8 @@ func (r *replicator[K, V]) replicateSet(ctx context.Context, key []byte, val []b
 			if own.Addr == r.node.cfg.PublicURL {
 				continue
 			}
-
-			if pc := r.node.getPeer(own.Addr); pc != nil {
-				go sendOne(own.Addr, pc)
-			} else {
-				// enqueue immediately if we don't even have a connection
-				if r.node.hh != nil {
-					r.node.hh.enqueueSet(own.Addr, key, b2, exp, ver, cp)
-				}
-			}
+			pc := r.node.getPeer(own.Addr)
+			go sendOne(own.Addr, pc)
 		}
 		return nil
 	}
@@ -193,13 +186,8 @@ func (r *replicator[K, V]) replicateDelete(ctx context.Context, key []byte, owne
 			if own.Addr == r.node.cfg.PublicURL {
 				continue
 			}
-			if pc := r.node.getPeer(own.Addr); pc != nil {
-				go sendOne(own.Addr, pc)
-			} else {
-				if r.node.hh != nil {
-					r.node.hh.enqueueDel(own.Addr, key, ver)
-				}
-			}
+			pc := r.node.getPeer(own.Addr)
+			go sendOne(own.Addr, pc)
 		}
 		return nil
 	}
