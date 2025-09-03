@@ -22,6 +22,7 @@ type readTunNode struct {
 	perTry        time.Duration
 }
 
+// rtn resolves read-tuning parameters (fanout, hedging cadence, and per-try timeout)
 func (n *Node[K, V]) rtn() readTunNode {
 	t := readTunNode{
 		fanout:        n.cfg.ReadMaxFanout,
@@ -47,12 +48,14 @@ func (n *Node[K, V]) rtn() readTunNode {
 	return t
 }
 
+// lwwSetVersion records the latest observed version for a key under LWW.
 func (n *Node[K, V]) lwwSetVersion(bk []byte, ver uint64) {
 	n.verMu.Lock()
 	n.version[string(bk)] = ver
 	n.verMu.Unlock()
 }
 
+// absExpiry converts a TTL to an absolute expiration in UnixNano; 0 if none.
 func absExpiry(ttl time.Duration) int64 {
 	if ttl <= 0 {
 		return 0
@@ -207,6 +210,10 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	}
 }
 
+// Set encodes and writes the value for key with TTL, assigning a new HLC
+// version and replicating to the owner set. If the local node is primary,
+// it commits locally first for a fast-path and then replicates. Write concern
+// is enforced by the replicator; on peer failures hinted handoff is enqueued.
 func (n *Node[K, V]) Set(ctx context.Context, key K, val V, ttl time.Duration) error {
 	bk := n.kc.EncodeKey(key)
 	if n.cfg.Sec.MaxKeySize > 0 && len(bk) > n.cfg.Sec.MaxKeySize {
@@ -242,6 +249,8 @@ func (n *Node[K, V]) Set(ctx context.Context, key K, val V, ttl time.Duration) e
 	return n.repl.replicateSet(ctx, bk, bv, exp, ver, owners)
 }
 
+// Delete removes key cluster-wide by assigning a tombstone version and
+// replicating the delete to owners. Locally deletes immediately when primary.
 func (n *Node[K, V]) Delete(ctx context.Context, key K) error {
 	bk := n.kc.EncodeKey(key)
 	if n.cfg.Sec.MaxKeySize > 0 && len(bk) > n.cfg.Sec.MaxKeySize {

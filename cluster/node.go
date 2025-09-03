@@ -21,7 +21,11 @@ import (
 	cbor "github.com/fxamacker/cbor/v2"
 )
 
-const ErrNotFound = "notfound"
+const (
+	errKeyTooLarge   = "key too large"
+	errValueTooLarge = "value too large"
+	errUnauthorized  = "unauthorized"
+)
 
 var readBufPool = newBufPool([]int{
 	1 << 10,  // 1 KiB
@@ -73,6 +77,9 @@ type Node[K comparable, V any] struct {
 	stop          chan struct{}
 }
 
+// NewNode constructs an unstarted cluster Node with the provided configuration,
+// key codec, local in-memory cache, and value codec. Call Start to begin
+// listening and background loops.
 func NewNode[K comparable, V any](cfg Config, keyc KeyCodec[K], c *cache.InMemoryCache[K, V], codec Codec[V]) *Node[K, V] {
 	cfg.Handoff.FillDefaults()
 
@@ -114,6 +121,9 @@ func NewNode[K comparable, V any](cfg Config, keyc KeyCodec[K], c *cache.InMemor
 	return n
 }
 
+// Start begins listening for peer/client connections, dials configured seeds
+// to accelerate ring formation, and launches background loops for gossip,
+// weight updates, rebalance, and backfill.
 func (n *Node[K, V]) Start() error {
 	ln, err := net.Listen("tcp", n.cfg.BindAddr)
 	if err != nil {
@@ -137,6 +147,8 @@ func (n *Node[K, V]) Start() error {
 	return nil
 }
 
+// Stop shuts down background loops, rate limiters, leases, hinted handoff,
+// and closes all peer connections. It is idempotent.
 func (n *Node[K, V]) Stop() {
 	close(n.stop)
 	if n.leaseLimiter != nil {
@@ -151,6 +163,8 @@ func (n *Node[K, V]) Stop() {
 	n.closePeers()
 }
 
+// initTLS configures server and client TLS based on security settings,
+// including certificate/key loading, CA pools, cipher suites, and curves.
 func (n *Node[K, V]) initTLS() {
 	loadCertPool := func(p string) *x509.CertPool {
 		if p == "" {
@@ -218,6 +232,7 @@ func (n *Node[K, V]) nextReqID() uint64 {
 	return atomic.AddUint64(&n.reqID, 1)
 }
 
+// closePeers closes and clears all cached peer connections.
 func (n *Node[K, V]) closePeers() {
 	n.peersMu.Lock()
 	defer n.peersMu.Unlock()
@@ -227,6 +242,7 @@ func (n *Node[K, V]) closePeers() {
 	n.peers = make(map[string]*peerConn)
 }
 
+// getPeer returns a cached peer connection for addr, or nil if absent.
 func (n *Node[K, V]) getPeer(addr string) *peerConn {
 	n.peersMu.RLock()
 	p := n.peers[addr]
@@ -234,6 +250,7 @@ func (n *Node[K, V]) getPeer(addr string) *peerConn {
 	return p
 }
 
+// acceptLoop accepts inbound TCP connections and hands each to serveConn.
 func (n *Node[K, V]) acceptLoop(ln net.Listener) {
 	tune := func(tc *net.TCPConn) {
 		_ = tc.SetNoDelay(true)
@@ -258,6 +275,9 @@ func (n *Node[K, V]) acceptLoop(ln net.Listener) {
 	}
 }
 
+// serveConn handles one inbound connection: optional TLS handshake and auth,
+// then a per-connection worker pool that decodes frames and dispatches RPCs.
+// Responses are CBOR-encoded and written with per-connection serialization.
 func (n *Node[K, V]) serveConn(c net.Conn) {
 	defer c.Close()
 
@@ -332,7 +352,7 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 
 		ack := MsgHelloResp{Base: Base{T: MTHelloResp, ID: base.ID}, OK: authOK}
 		if !authOK {
-			ack.Err = "unauthorized"
+			ack.Err = errUnauthorized
 		}
 
 		raw, _ := cborEnc.Marshal(&ack)
@@ -346,7 +366,7 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 	}
 
 	// Per-connection worker pool - incoming frames are queued and processed
-	// concurrently up to PerConnWorkers with backpressure on the channel.
+	// up to PerConnWorkers with backpressure on the channel.
 	workers := n.cfg.PerConnWorkers
 	if workers <= 0 {
 		workers = 64
@@ -483,6 +503,7 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 	}
 }
 
+// ownersFor returns the rendezvous owners for key
 func (n *Node[K, V]) ownersFor(key K) []*nodeMeta {
 	var keyHash uint64
 	if kh, ok := any(n.kc).(KeyHasher[K]); ok {
@@ -516,9 +537,19 @@ func (n *Node[K, V]) ownersFor(key K) []*nodeMeta {
 
 type bytesBuffer struct{ b []byte }
 
-func (bb *bytesBuffer) Write(p []byte) (int, error) { bb.b = append(bb.b, p...); return len(p), nil }
-func (bb *bytesBuffer) Bytes() []byte               { return bb.b }
-func (bb *bytesBuffer) Len() int                    { return len(bb.b) }
+func (bb *bytesBuffer) Write(p []byte) (int, error) {
+	bb.b = append(bb.b, p...)
+	return len(p), nil
+}
+
+func (bb *bytesBuffer) Bytes() []byte {
+	return bb.b
+}
+
+func (bb *bytesBuffer) Len() int {
+	return len(bb.b)
+}
+
 func (bb *bytesBuffer) ReadFrom(r io.Reader) (int64, error) {
 	var total int64
 	var tmp [32 << 10]byte
@@ -551,6 +582,9 @@ func (br *bytesReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// maybeCompress gzip-compresses b when above configured threshold, returning
+// the compressed bytes and a flag. If compression is not beneficial it
+// returns the original slice and cp=false.
 func (n *Node[K, V]) maybeCompress(b []byte) (out []byte, cp bool) {
 	thr := n.cfg.Sec.CompressionThreshold
 	if thr <= 0 || len(b) < thr {
@@ -567,6 +601,9 @@ func (n *Node[K, V]) maybeCompress(b []byte) (out []byte, cp bool) {
 	}
 	return buf.Bytes(), true
 }
+
+// maybeDecompress inflates gzip-compressed data when cp=true, otherwise the
+// input is returned as-is. Callers must not mutate the returned buffer.
 func (n *Node[K, V]) maybeDecompress(b []byte, cp bool) ([]byte, error) {
 	if !cp {
 		return b, nil
@@ -585,32 +622,70 @@ func (n *Node[K, V]) maybeDecompress(b []byte, cp bool) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+// rpcGet serves a local GET from an inbound peer request, returning the
+// encoded (and maybe compressed) value or a not-found marker.
 func (n *Node[K, V]) rpcGet(g MsgGet) MsgGetResp {
 	k, err := n.kc.DecodeKey(g.Key)
 	if err != nil {
-		return MsgGetResp{Base: Base{T: MTGetResp, ID: g.ID}, Err: err.Error()}
+		return MsgGetResp{
+			Base: Base{
+				T:  MTGetResp,
+				ID: g.ID,
+			},
+			Err: err.Error(),
+		}
 	}
 
 	if v, ok := n.local.Get(k); ok {
 		b, err := n.codec.Encode(v)
 		if err != nil {
-			return MsgGetResp{Base: Base{T: MTGetResp, ID: g.ID}, Err: err.Error()}
+			return MsgGetResp{
+				Base: Base{
+					T:  MTGetResp,
+					ID: g.ID,
+				},
+				Err: err.Error(),
+			}
 		}
 
 		if n.cfg.Sec.MaxValueSize > 0 && len(b) > n.cfg.Sec.MaxValueSize {
-			return MsgGetResp{Base: Base{T: MTGetResp, ID: g.ID}, Err: "value too large"}
+			return MsgGetResp{
+				Base: Base{
+					T:  MTGetResp,
+					ID: g.ID,
+				},
+				Err: errValueTooLarge,
+			}
 		}
 		b2, cp := n.maybeCompress(b)
-		return MsgGetResp{Base: Base{T: MTGetResp, ID: g.ID}, Found: true, Val: b2, Cp: cp, Exp: 0}
+		return MsgGetResp{
+			Base: Base{
+				T:  MTGetResp,
+				ID: g.ID,
+			},
+			Found: true,
+			Val:   b2,
+			Cp:    cp,
+			Exp:   0,
+		}
 	}
-	return MsgGetResp{Base: Base{T: MTGetResp, ID: g.ID}, Found: false, Err: ErrNotFound}
+	return MsgGetResp{
+		Base: Base{
+			T:  MTGetResp,
+			ID: g.ID,
+		},
+		Found: false,
+		Err:   ErrNotFound,
+	}
 }
 
+// rpcGetBulk serves multiple local GETs in one request.
 func (n *Node[K, V]) rpcGetBulk(g MsgGetBulk) MsgGetBulkResp {
 	vals := make([][]byte, len(g.Keys))
 	hits := make([]bool, len(g.Keys))
 	exps := make([]int64, len(g.Keys))
 	cps := make([]bool, len(g.Keys))
+
 	for i, kb := range g.Keys {
 		k, err := n.kc.DecodeKey(kb)
 		if err != nil {
@@ -626,30 +701,76 @@ func (n *Node[K, V]) rpcGetBulk(g MsgGetBulk) MsgGetBulkResp {
 			vals[i], cps[i], hits[i], exps[i] = b2, cp, true, 0
 		}
 	}
-	return MsgGetBulkResp{Base: Base{T: MTGetBulkResp, ID: g.ID}, Hits: hits, Vals: vals, Exps: exps, Cps: cps}
+	return MsgGetBulkResp{
+		Base: Base{
+			T:  MTGetBulkResp,
+			ID: g.ID,
+		},
+		Hits: hits,
+		Vals: vals,
+		Exps: exps,
+		Cps:  cps,
+	}
 }
 
+// rpcSet applies a replicated SET: sanity-check sizes, honor LWW (drop older
+// versions), decode value, import into local cache, and update version table.
 func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 	if n.cfg.Sec.MaxKeySize > 0 && len(s.Key) > n.cfg.Sec.MaxKeySize {
-		return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: false, Err: "key too large"}
+		return MsgSetResp{
+			Base: Base{
+				T:  MTSetResp,
+				ID: s.ID,
+			},
+			OK:  false,
+			Err: errKeyTooLarge,
+		}
 	}
 
 	if n.cfg.Sec.MaxValueSize > 0 && len(s.Val) > n.cfg.Sec.MaxValueSize {
-		return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: false, Err: "value too large"}
+		return MsgSetResp{
+			Base: Base{
+				T:  MTSetResp,
+				ID: s.ID,
+			},
+			OK:  false,
+			Err: errValueTooLarge,
+		}
 	}
 
 	vbytes, err := n.maybeDecompress(s.Val, s.Cp)
 	if err != nil {
-		return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: false, Err: err.Error()}
+		return MsgSetResp{
+			Base: Base{
+				T:  MTSetResp,
+				ID: s.ID,
+			},
+			OK:  false,
+			Err: err.Error(),
+		}
 	}
 
 	if n.cfg.Sec.MaxValueSize > 0 && len(vbytes) > n.cfg.Sec.MaxValueSize {
-		return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: false, Err: "value too large"}
+		return MsgSetResp{
+			Base: Base{
+				T:  MTSetResp,
+				ID: s.ID,
+			},
+			OK:  false,
+			Err: errValueTooLarge,
+		}
 	}
 
 	k, err := n.kc.DecodeKey(s.Key)
 	if err != nil {
-		return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: false, Err: err.Error()}
+		return MsgSetResp{
+			Base: Base{
+				T:  MTSetResp,
+				ID: s.ID,
+			},
+			OK:  false,
+			Err: err.Error(),
+		}
 	}
 
 	if n.cfg.LWWEnabled {
@@ -657,15 +778,29 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 		n.verMu.RLock()
 		old := n.version[keyStr]
 		n.verMu.RUnlock()
+
 		// Drop older versions (LWW); equal version is idempotent.
 		if old > s.Ver {
-			return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: true}
+			return MsgSetResp{
+				Base: Base{
+					T:  MTSetResp,
+					ID: s.ID,
+				},
+				OK: true,
+			}
 		}
 	}
 
 	val, err := n.codec.Decode(vbytes)
 	if err != nil {
-		return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: false, Err: err.Error()}
+		return MsgSetResp{
+			Base: Base{
+				T:  MTSetResp,
+				ID: s.ID,
+			},
+			OK:  false,
+			Err: err.Error(),
+		}
 	}
 
 	n.local.Import([]cache.Item[K, V]{{
@@ -681,37 +816,87 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 		n.verMu.Unlock()
 		n.clock.Observe(s.Ver)
 	}
-	return MsgSetResp{Base: Base{T: MTSetResp, ID: s.ID}, OK: true}
+	return MsgSetResp{
+		Base: Base{
+			T:  MTSetResp,
+			ID: s.ID,
+		},
+		OK: true,
+	}
 }
 
+// rpcSetBulk applies many replicated SETs. Each item is validated, LWW-checked,
+// decoded, and then imported in a batch for efficiency.
 func (n *Node[K, V]) rpcSetBulk(sb MsgSetBulk) MsgSetBulkResp {
 	items := make([]cache.Item[K, V], 0, len(sb.Items))
 	for _, kv := range sb.Items {
 		if n.cfg.Sec.MaxKeySize > 0 && len(kv.K) > n.cfg.Sec.MaxKeySize {
-			return MsgSetBulkResp{Base: Base{T: MTSetBulkResp, ID: sb.ID}, OK: false, Err: "key too large"}
+			return MsgSetBulkResp{
+				Base: Base{
+					T:  MTSetBulkResp,
+					ID: sb.ID,
+				},
+				OK:  false,
+				Err: errKeyTooLarge,
+			}
 		}
 
 		if n.cfg.Sec.MaxValueSize > 0 && len(kv.V) > n.cfg.Sec.MaxValueSize {
-			return MsgSetBulkResp{Base: Base{T: MTSetBulkResp, ID: sb.ID}, OK: false, Err: "value too large"}
+			return MsgSetBulkResp{
+				Base: Base{
+					T:  MTSetBulkResp,
+					ID: sb.ID,
+				},
+				OK:  false,
+				Err: errValueTooLarge,
+			}
 		}
 
 		k, err := n.kc.DecodeKey(kv.K)
 		if err != nil {
-			return MsgSetBulkResp{Base: Base{T: MTSetBulkResp, ID: sb.ID}, OK: false, Err: err.Error()}
+			return MsgSetBulkResp{
+				Base: Base{
+					T:  MTSetBulkResp,
+					ID: sb.ID,
+				},
+				OK:  false,
+				Err: err.Error(),
+			}
 		}
 
 		vbytes, err := n.maybeDecompress(kv.V, kv.Cp)
 		if err != nil {
-			return MsgSetBulkResp{Base: Base{T: MTSetBulkResp, ID: sb.ID}, OK: false, Err: err.Error()}
+			return MsgSetBulkResp{
+				Base: Base{
+					T:  MTSetBulkResp,
+					ID: sb.ID,
+				},
+				OK:  false,
+				Err: err.Error(),
+			}
 		}
 
 		if n.cfg.Sec.MaxValueSize > 0 && len(vbytes) > n.cfg.Sec.MaxValueSize {
-			return MsgSetBulkResp{Base: Base{T: MTSetBulkResp, ID: sb.ID}, OK: false, Err: "value too large"}
+			return MsgSetBulkResp{
+				Base: Base{
+					T:  MTSetBulkResp,
+					ID: sb.ID,
+				},
+				OK:  false,
+				Err: errValueTooLarge,
+			}
 		}
 
 		val, err := n.codec.Decode(vbytes)
 		if err != nil {
-			return MsgSetBulkResp{Base: Base{T: MTSetBulkResp, ID: sb.ID}, OK: false, Err: err.Error()}
+			return MsgSetBulkResp{
+				Base: Base{
+					T:  MTSetBulkResp,
+					ID: sb.ID,
+				},
+				OK:  false,
+				Err: err.Error(),
+			}
 		}
 
 		if n.cfg.LWWEnabled {
@@ -732,17 +917,38 @@ func (n *Node[K, V]) rpcSetBulk(sb MsgSetBulk) MsgSetBulkResp {
 		}
 	}
 	n.local.Import(items)
-	return MsgSetBulkResp{Base: Base{T: MTSetBulkResp, ID: sb.ID}, OK: true}
+	return MsgSetBulkResp{
+		Base: Base{
+			T:  MTSetBulkResp,
+			ID: sb.ID,
+		},
+		OK: true,
+	}
 }
 
+// rpcDel applies a replicated DELETE honoring LWW by dropping stale versions.
 func (n *Node[K, V]) rpcDel(d MsgDel) MsgDelResp {
 	if n.cfg.Sec.MaxKeySize > 0 && len(d.Key) > n.cfg.Sec.MaxKeySize {
-		return MsgDelResp{Base: Base{T: MTDeleteResp, ID: d.ID}, OK: false, Err: "key too large"}
+		return MsgDelResp{
+			Base: Base{
+				T:  MTDeleteResp,
+				ID: d.ID,
+			},
+			OK:  false,
+			Err: errKeyTooLarge,
+		}
 	}
 
 	k, err := n.kc.DecodeKey(d.Key)
 	if err != nil {
-		return MsgDelResp{Base: Base{T: MTDeleteResp, ID: d.ID}, OK: false, Err: err.Error()}
+		return MsgDelResp{
+			Base: Base{
+				T:  MTDeleteResp,
+				ID: d.ID,
+			},
+			OK:  false,
+			Err: err.Error(),
+		}
 	}
 
 	if n.cfg.LWWEnabled {
@@ -750,7 +956,13 @@ func (n *Node[K, V]) rpcDel(d MsgDel) MsgDelResp {
 		old := n.version[string(d.Key)]
 		n.verMu.RUnlock()
 		if old > d.Ver {
-			return MsgDelResp{Base: Base{T: MTDeleteResp, ID: d.ID}, OK: true}
+			return MsgDelResp{
+				Base: Base{
+					T:  MTDeleteResp,
+					ID: d.ID,
+				},
+				OK: true,
+			}
 		}
 		n.verMu.Lock()
 		n.version[string(d.Key)] = d.Ver
@@ -761,24 +973,55 @@ func (n *Node[K, V]) rpcDel(d MsgDel) MsgDelResp {
 	return MsgDelResp{Base: Base{T: MTDeleteResp, ID: d.ID}, OK: ok}
 }
 
+// rpcLeaseLoad enforces single-flight loading on the primary: if not present
+// locally and Loader is configured, the primary loads, sets, replicates to
+// owners, and replies with the value. Callers waiting on the same key block on
+// the lease and return the result.
 func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 	if n.leaseLimiter != nil && !n.leaseLimiter.Allow() {
-		return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Err: "rate limited"}
+		return MsgLeaseLoadResp{
+			Base: Base{
+				T:  MTLeaseLoadResp,
+				ID: ll.ID,
+			},
+			Err: "rate limited",
+		}
 	}
 
 	k, err := n.kc.DecodeKey(ll.Key)
 	if err != nil {
-		return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Err: err.Error()}
+		return MsgLeaseLoadResp{
+			Base: Base{
+				T:  MTLeaseLoadResp,
+				ID: ll.ID,
+			},
+			Err: err.Error(),
+		}
 	}
 
 	if v, ok := n.local.Get(k); ok {
 		b, _ := n.codec.Encode(v)
 		b2, cp := n.maybeCompress(b)
-		return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Found: true, Val: b2, Cp: cp, Exp: 0}
+		return MsgLeaseLoadResp{
+			Base: Base{
+				T:  MTLeaseLoadResp,
+				ID: ll.ID,
+			},
+			Found: true,
+			Val:   b2,
+			Cp:    cp,
+			Exp:   0,
+		}
 	}
 
 	if n.Loader == nil {
-		return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Err: ErrNoLoader.Error()}
+		return MsgLeaseLoadResp{
+			Base: Base{
+				T:  MTLeaseLoadResp,
+				ID: ll.ID,
+			},
+			Err: ErrNoLoader.Error(),
+		}
 	}
 
 	keyStr := string(ll.Key)
@@ -786,6 +1029,7 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 	if acquired {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
 		v, ttl, err := n.Loader(ctx, k)
 		if err == nil {
 			_ = n.local.Set(k, v, ttl)
@@ -795,6 +1039,7 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 			if ttl > 0 {
 				exp = time.Now().Add(ttl).UnixNano()
 			}
+
 			ver := n.clock.Next()
 			_ = n.repl.replicateSet(ctx, ll.Key, bv, exp, ver, owners)
 			if n.cfg.LWWEnabled {
@@ -806,26 +1051,63 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 
 		n.leases.release(keyStr, err)
 		if err != nil {
-			return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Err: err.Error()}
+			return MsgLeaseLoadResp{
+				Base: Base{
+					T:  MTLeaseLoadResp,
+					ID: ll.ID,
+				},
+				Err: err.Error(),
+			}
 		}
 
 		b, _ := n.codec.Encode(v)
 		b2, cp := n.maybeCompress(b)
-		return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Found: true, Val: b2, Cp: cp, Exp: 0}
+		return MsgLeaseLoadResp{
+			Base: Base{
+				T:  MTLeaseLoadResp,
+				ID: ll.ID,
+			},
+			Found: true,
+			Val:   b2,
+			Cp:    cp,
+			Exp:   0,
+		}
 	}
 
 	if err := n.leases.wait(context.Background(), keyStr); err != nil {
-		return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Err: err.Error()}
+		return MsgLeaseLoadResp{
+			Base: Base{
+				T:  MTLeaseLoadResp,
+				ID: ll.ID,
+			},
+			Err: err.Error(),
+		}
 	}
 
 	if v, ok := n.local.Get(k); ok {
 		b, _ := n.codec.Encode(v)
 		b2, cp := n.maybeCompress(b)
-		return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Found: true, Val: b2, Cp: cp, Exp: 0}
+		return MsgLeaseLoadResp{
+			Base: Base{
+				T:  MTLeaseLoadResp,
+				ID: ll.ID,
+			},
+			Found: true,
+			Val:   b2,
+			Cp:    cp,
+			Exp:   0,
+		}
 	}
-	return MsgLeaseLoadResp{Base: Base{T: MTLeaseLoadResp, ID: ll.ID}, Found: false}
+	return MsgLeaseLoadResp{
+		Base: Base{
+			T:  MTLeaseLoadResp,
+			ID: ll.ID,
+		},
+		Found: false,
+	}
 }
 
+// sampleLoad collects local shard stats and coarse memory info for gossip.
 func (n *Node[K, V]) sampleLoad() NodeLoad {
 	st := n.local.Stats()
 	var ms runtime.MemStats
@@ -834,9 +1116,15 @@ func (n *Node[K, V]) sampleLoad() NodeLoad {
 	if ms.Sys > ms.HeapAlloc {
 		free = uint64(ms.Sys - ms.HeapAlloc)
 	}
-	return NodeLoad{Size: st.Size, Evictions: st.Evictions, FreeMemBytes: free, CPUu16: 0}
+	return NodeLoad{
+		Size:         st.Size,
+		Evictions:    st.Evictions,
+		FreeMemBytes: free,
+		CPUu16:       0,
+	}
 }
 
+// gossipLoop periodically sends a gossip message to all peers.
 func (n *Node[K, V]) gossipLoop() {
 	ticker := time.NewTicker(n.cfg.GossipInterval)
 	defer ticker.Stop()
@@ -850,6 +1138,8 @@ func (n *Node[K, V]) gossipLoop() {
 	}
 }
 
+// sendGossip snapshots membership/seen, current load and hot keys, and sends
+// a gossip message to connected peers.
 func (n *Node[K, V]) sendGossip() {
 	_, seen, epoch := n.mem.snapshot()
 	seenStr := make(map[string]int64, len(seen))
@@ -879,6 +1169,7 @@ func (n *Node[K, V]) sendGossip() {
 	}
 }
 
+// peerAddrs returns the addresses of currently known peer connections.
 func (n *Node[K, V]) peerAddrs() []string {
 	n.peersMu.RLock()
 	defer n.peersMu.RUnlock()
@@ -889,10 +1180,14 @@ func (n *Node[K, V]) peerAddrs() []string {
 	return out
 }
 
+// ingestGossip merges remote membership observations, updates the sender's
+// weight, and mirrors the sender's hot keys for a short period.
 func (n *Node[K, V]) ingestGossip(g *MsgGossip) {
 	now := time.Now().UnixNano()
+
 	n.mem.ensure(NodeID(g.From), g.From)
 	n.mem.integrate(NodeID(g.From), g.From, g.Peers, g.Seen, g.Epoch, now)
+
 	if meta, ok := n.mem.peers[NodeID(g.From)]; ok {
 		atomic.StoreUint64(&meta.weight, computeWeight(g.Load))
 	}
@@ -907,6 +1202,8 @@ func (n *Node[K, V]) ingestGossip(g *MsgGossip) {
 	}
 }
 
+// weightLoop recomputes the ring from alive members, ensures outbound
+// connections to new peers, cleans up mirrored hot keys, and prunes tombstones.
 func (n *Node[K, V]) weightLoop() {
 	t := time.NewTicker(n.cfg.WeightUpdate)
 	defer t.Stop()
@@ -917,12 +1214,14 @@ func (n *Node[K, V]) weightLoop() {
 			alive := n.mem.alive(now.UnixNano(), n.cfg.SuspicionAfter)
 			r := newRing(n.cfg.ReplicationFactor)
 			r.nodes = alive
+
 			n.ring.Store(r)
 			for _, m := range alive {
 				if m.Addr != "" && m.Addr != n.cfg.PublicURL {
 					_ = n.ensurePeer(m.Addr)
 				}
 			}
+
 			n.cleanupHot(now.UnixNano())
 			n.mem.pruneTombstones(now.UnixNano(), n.cfg.TombstoneAfter)
 		case <-n.stop:
@@ -931,6 +1230,7 @@ func (n *Node[K, V]) weightLoop() {
 	}
 }
 
+// cleanupHot removes expired mirrored hot keys from the local hot set.
 func (n *Node[K, V]) cleanupHot(now int64) {
 	n.hotMu.Lock()
 	for k, exp := range n.hotSet {
@@ -941,6 +1241,8 @@ func (n *Node[K, V]) cleanupHot(now int64) {
 	n.hotMu.Unlock()
 }
 
+// ensurePeer returns an existing peer connection or dials a new one (with
+// TLS/auth if configured), records it in membership, and caches it.
 func (n *Node[K, V]) ensurePeer(addr string) *peerConn {
 	n.peersMu.RLock()
 	p := n.peers[addr]
@@ -959,6 +1261,7 @@ func (n *Node[K, V]) ensurePeer(addr string) *peerConn {
 	if n.cfg.Sec.TLS.Enable {
 		tlsConf = n.tlsClientConf
 	}
+
 	// establish transport with auth/TLS and configure inflight limits.
 	pc, err := dialPeer(
 		n.cfg.PublicURL,
@@ -974,11 +1277,13 @@ func (n *Node[K, V]) ensurePeer(addr string) *peerConn {
 	if err != nil {
 		return nil
 	}
+
 	n.peers[addr] = pc
 	n.mem.ensure(NodeID(addr), addr)
 	return pc
 }
 
+// resetPeer closes and removes a cached peer connection for addr.
 func (n *Node[K, V]) resetPeer(addr string) {
 	n.peersMu.Lock()
 	if p, ok := n.peers[addr]; ok && p != nil {

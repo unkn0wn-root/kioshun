@@ -25,6 +25,7 @@ func newRateLimiter(max int, interval time.Duration) *rateLimiter {
 	return rl
 }
 
+// refill resets the available tokens to max at fixed intervals.
 func (r *rateLimiter) refill() {
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
@@ -51,4 +52,5 @@ func (r *rateLimiter) Allow() bool {
 	return true
 }
 
+// Stop terminates the refill goroutine.
 func (r *rateLimiter) Stop() { close(r.stopCh) }

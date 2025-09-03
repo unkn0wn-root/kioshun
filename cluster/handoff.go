@@ -49,6 +49,9 @@ type hintQueue struct {
 }
 
 // newHintQueue builds a per-peer queue with caps and TTL used by the manager.
+// newHintQueue initializes a queue for one peer with capacity/bytes limits and
+// a TTL for dropping stale hints. It tracks elements both by FIFO list and an
+// index to coalesce updates per key.
 func newHintQueue(cfg HandoffConfig) *hintQueue {
 	return &hintQueue{
 		index:    make(map[string]*list.Element),
@@ -70,7 +73,6 @@ func (q *hintQueue) removeElementLocked(e *list.Element) {
 }
 
 // enqueue adds or coalesces a hint. It keeps only the newest version per key.
-// Returns (accepted, bytesDelta, itemsDelta) for manager-wide accounting.
 func (q *hintQueue) enqueue(it *hintItem) (bool, int64, int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -128,7 +130,6 @@ func (q *hintQueue) enqueue(it *hintItem) (bool, int64, int) {
 }
 
 // popReady pops the oldest item if it's ready (nextAt<=now) and not expired.
-// Returns nil if queue empty or head is not yet ready (head-of-line backoff).
 func (q *hintQueue) popReady(now int64) *hintItem {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -187,6 +188,9 @@ type handoff[K comparable, V any] struct {
 	rr         uint32 // round-robin cursor over peers
 }
 
+// newHandoff creates a hinted-handoff manager for a node and starts the
+// background replay loop if enabled. Replay drains per-peer queues with
+// token-bucket rate limiting and exponential backoff on failures.
 func newHandoff[K comparable, V any](n *Node[K, V]) *handoff[K, V] {
 	h := &handoff[K, V]{
 		node:  n,
@@ -210,6 +214,9 @@ func (h *handoff[K, V]) queue(addr string) *hintQueue {
 	return q
 }
 
+// enqueueSet enqueues a SET hint for addr with value bytes (optionally
+// compressed), absolute expiry, and version. Dropped when handoff disabled or
+// auto-paused due to backlog.
 func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver uint64, cp bool) {
 	if !h.cfg.IsEnabled() {
 		return
@@ -229,6 +236,8 @@ func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver 
 	h.enqueue(addr, it)
 }
 
+// enqueueDel enqueues a DELETE hint for addr with a version. The value field
+// is empty for deletes. Dropped when handoff disabled or auto-paused.
 func (h *handoff[K, V]) enqueueDel(addr string, key []byte, ver uint64) {
 	if !h.cfg.IsEnabled() {
 		return
@@ -248,6 +257,9 @@ func (h *handoff[K, V]) enqueueDel(addr string, key []byte, ver uint64) {
 	h.enqueue(addr, it)
 }
 
+// enqueue inserts or coalesces a hint in the per-peer queue and updates
+// manager-wide counters, auto-pausing new enqueues when thresholds are
+// exceeded to allow draining.
 func (h *handoff[K, V]) enqueue(addr string, it *hintItem) {
 	// when auto-paused due to backlog, drop newest enqueues to allow draining.
 	if h.paused.Load() {
@@ -271,6 +283,9 @@ func (h *handoff[K, V]) enqueue(addr string, it *hintItem) {
 	}
 }
 
+// loop drives replay at a configured RPS using per-tick slices. It supports
+// operator pause and auto-pause based on backlog. Items that fail are
+// rescheduled with exponential backoff.
 func (h *handoff[K, V]) loop() {
 	if h.cfg.ReplayRPS <= 0 {
 		<-h.stop
@@ -352,12 +367,18 @@ func (h *handoff[K, V]) loop() {
 }
 
 // scheduleRetry updates backoff state and requeues the item.
+// scheduleRetry sets the next eligible time and requeues an item after a
+// failure using the provided backoff function.
 func (h *handoff[K, V]) scheduleRetry(q *hintQueue, hi *hintItem, backoff func(int) time.Duration) {
 	hi.tries++
 	hi.nextAt = time.Now().Add(backoff(hi.tries)).UnixNano()
 	q.requeue(hi)
 }
 
+// replayOne attempts to send a single hint across peers using round-robin
+// fairness. On success the item is dropped; on failure it is rescheduled.
+// Returns true when an item was processed (success or scheduled), false when
+// no ready items were found.
 func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 	// fairshare round-robin over peers to avoid starving any one queue.
 	h.mu.Lock()
@@ -397,7 +418,18 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 
 		id := h.node.nextReqID()
 		if !hi.isDel {
-			msg := &MsgSet{Base: Base{T: MTSet, ID: id}, Key: hi.key, Val: hi.val, Exp: hi.exp, Ver: hi.ver, Cp: hi.cp}
+			msg := &MsgSet{
+				Base: Base{
+					T:  MTSet,
+					ID: id,
+				},
+				Key: hi.key,
+				Val: hi.val,
+				Exp: hi.exp,
+				Ver: hi.ver,
+				Cp:  hi.cp,
+			}
+
 			raw, err := pc.request(msg, id, h.node.cfg.Sec.WriteTimeout)
 			if err != nil {
 				if isFatalTransport(err) {
@@ -441,6 +473,7 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 	return false
 }
 
+// Stop shuts down the handoff replay loop.
 func (h *handoff[K, V]) Stop() {
 	select {
 	case <-h.stop:
@@ -450,10 +483,12 @@ func (h *handoff[K, V]) Stop() {
 	}
 }
 
+// Pause prevents new items from being enqueued; replay may continue.
 func (h *handoff[K, V]) Pause() {
 	h.paused.Store(true)
 }
 
+// Resume re-enables enqueues after a manual or automatic pause.
 func (h *handoff[K, V]) Resume() {
 	h.paused.Store(false)
 }

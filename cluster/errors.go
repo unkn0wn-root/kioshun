@@ -7,6 +7,8 @@ import (
 	"syscall"
 )
 
+const ErrNotFound = "notfound"
+
 var (
 	ErrNoOwner      = errors.New("no owner for key")
 	ErrTimeout      = errors.New("timeout")

@@ -25,6 +25,10 @@ func absExpiryAt(base time.Time, ttl time.Duration) int64 {
 	return base.Add(ttl).UnixNano()
 }
 
+// rpcBackfillDigest builds digests for the requested prefix depth considering
+// only keys that the target node should own (according to this donor's ring).
+// It returns per-bucket counts and XOR(hash^version) so the joiner can detect
+// which buckets differ and page only those keys.
 func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDigestResp {
 	depth := int(req.Depth)
 	if depth <= 0 || depth > 8 {
@@ -77,6 +81,10 @@ func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDige
 	return MsgBackfillDigestResp{Base: Base{T: MTBackfillDigestResp, ID: req.ID}, Depth: uint8(depth), Buckets: out}
 }
 
+// rpcBackfillKeys returns the next page of keys within a given hash-prefix
+// bucket that the target should own, ordered by 64-bit key hash. Pagination is
+// driven by the last 8-byte hash cursor provided by the caller. Values may be
+// compressed, and expirations are converted to absolute nanoseconds.
 func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp {
 	prefix := req.Prefix
 	depth := len(prefix)

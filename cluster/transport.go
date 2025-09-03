@@ -101,6 +101,8 @@ func dialPeer(self string, addr string, tlsConf *tls.Config, maxFrame int, readT
 	return pc, nil
 }
 
+// hello performs an authentication handshake by sending MsgHello and expecting
+// a positive MsgHelloResp.
 func (p *peerConn) hello() error {
 	id := uint64(time.Now().UnixNano())
 	msg := &MsgHello{Base: Base{T: MTHello, ID: id}, From: p.self, Token: p.token}
@@ -108,6 +110,7 @@ func (p *peerConn) hello() error {
 	if err != nil {
 		return err
 	}
+
 	if err := p.writeFrame(raw); err != nil {
 		return err
 	}
@@ -121,6 +124,7 @@ func (p *peerConn) hello() error {
 	if err := cbor.Unmarshal(respRaw, &base); err != nil {
 		return err
 	}
+
 	if base.T != MTHelloResp {
 		return errors.New("bad hello resp")
 	}
@@ -138,6 +142,7 @@ func (p *peerConn) hello() error {
 	return nil
 }
 
+// close closes the underlying connection and marks the peer as closed.
 func (p *peerConn) close() {
 	_ = p.conn.Close()
 	select {
@@ -147,6 +152,8 @@ func (p *peerConn) close() {
 	}
 }
 
+// failAll closes all pending request channels and the connection to unblock
+// waiters when the connection is no longer usable.
 func (p *peerConn) failAll(err error) {
 	// notify all pending requests that the connection failed.
 	p.pend.Range(func(_, chAny any) bool {
@@ -159,7 +166,8 @@ func (p *peerConn) failAll(err error) {
 	p.close()
 }
 
-// readLoop continuously reads frames and unblocks waiters with matching IDs.
+// readLoop continuously reads frames, demultiplexes them by request ID, and
+// delivers payloads to the waiting channels created by request().
 func (p *peerConn) readLoop() {
 	for {
 		buf, err := p.readFrame()
@@ -181,6 +189,7 @@ func (p *peerConn) readLoop() {
 	}
 }
 
+// readFrame reads one length-prefixed frame with deadlines and size checks.
 func (p *peerConn) readFrame() ([]byte, error) {
 	_ = p.conn.SetReadDeadline(time.Now().Add(p.readTO))
 	var hdr [4]byte
@@ -201,6 +210,7 @@ func (p *peerConn) readFrame() ([]byte, error) {
 	return buf, nil
 }
 
+// writeFrame writes one length-prefixed frame with a write deadline.
 func (p *peerConn) writeFrame(payload []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -208,6 +218,7 @@ func (p *peerConn) writeFrame(payload []byte) error {
 	return writeFrameBuf(p.w, payload)
 }
 
+// writeFrameBuf writes a frame and flushes the buffered writer.
 func writeFrameBuf(w *bufio.Writer, payload []byte) error {
 	if err := writeFrame(w, payload); err != nil {
 		return err
@@ -215,6 +226,7 @@ func writeFrameBuf(w *bufio.Writer, payload []byte) error {
 	return w.Flush()
 }
 
+// writeFrame writes a 4-byte big-endian length header followed by payload.
 func writeFrame(w io.Writer, payload []byte) error {
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
@@ -225,6 +237,9 @@ func writeFrame(w io.Writer, payload []byte) error {
 	return err
 }
 
+// request sends a message and waits for a response with matching ID or until
+// timeout. It bounds per-peer concurrency via inflightCh and applies timeout
+// penalties on repeated expirations to avoid hot-looping on bad peers.
 func (p *peerConn) request(msg any, id uint64, timeout time.Duration) ([]byte, error) {
 	select {
 	case p.inflightCh <- struct{}{}:

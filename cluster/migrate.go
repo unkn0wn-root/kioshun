@@ -6,6 +6,8 @@ import (
 	cbor "github.com/fxamacker/cbor/v2"
 )
 
+// rebalancerLoop periodically runs a bounded rebalance pass that migrates
+// locally owned-but-not-primary keys to their current primary owner.
 func (n *Node[K, V]) rebalancerLoop() {
 	iv := n.cfg.RebalanceInterval
 	if iv <= 0 {
@@ -24,6 +26,9 @@ func (n *Node[K, V]) rebalancerLoop() {
 	}
 }
 
+// rebalanceOnce scans up to RebalanceLimit local keys and, for keys whose
+// primary owner moved away, pushes their latest value to the new primary and
+// deletes the local copy on success.
 func (n *Node[K, V]) rebalanceOnce() {
 	keys := n.local.Keys()
 	if len(keys) == 0 {
@@ -66,7 +71,17 @@ func (n *Node[K, V]) rebalanceOnce() {
 
 		id := n.nextReqID()
 		ver := n.clock.Next()
-		msg := &MsgSet{Base: Base{T: MTSet, ID: id}, Key: bk, Val: bv, Exp: exp, Ver: ver}
+		msg := &MsgSet{
+			Base: Base{
+				T:  MTSet,
+				ID: id,
+			},
+			Key: bk,
+			Val: bv,
+			Exp: exp,
+			Ver: ver,
+		}
+
 		raw, err := p.request(msg, id, 2*time.Second)
 		if err != nil {
 			continue

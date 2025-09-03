@@ -110,6 +110,8 @@ func (s *spaceSaving) export() []HotKey {
 	return out
 }
 
+// siftUp restores the min-heap property by moving the node at i up toward the
+// root while its count is less than its parent.
 func (s *spaceSaving) siftUp(i int) {
 	for i > 0 {
 		p := (i - 1) / 2
@@ -121,6 +123,8 @@ func (s *spaceSaving) siftUp(i int) {
 	}
 }
 
+// siftDown restores the min-heap property by moving the node at i down to the
+// smallest child while its count is greater than that child.
 func (s *spaceSaving) siftDown(i int) {
 	n := len(s.h)
 	for {
@@ -143,12 +147,14 @@ func (s *spaceSaving) siftDown(i int) {
 	}
 }
 
+// swap exchanges two heap nodes and updates their indices in the map.
 func (s *spaceSaving) swap(i, j int) {
 	s.h[i], s.h[j] = s.h[j], s.h[i]
 	s.idx[s.h[i].K] = i
 	s.idx[s.h[j].K] = j
 }
 
+// addSat64 adds two uint64 numbers with saturation at max uint64 on overflow.
 func addSat64(a, b uint64) uint64 {
 	c := a + b
 	if c < a {
@@ -188,4 +194,6 @@ func (h *heat) sample(key []byte) {
 	}
 }
 
-func (h *heat) exportTopK() []HotKey { return h.ss.export() }
+func (h *heat) exportTopK() []HotKey {
+	return h.ss.export()
+}

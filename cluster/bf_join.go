@@ -17,8 +17,7 @@ type bucketSig struct {
 
 const defaultBackfillDepth = 2 // 65,536 buckets
 
-// readyPollInterval picks a small poll period relative to configured cadences,
-// clamped into a sane range to avoid busy spinning or sluggish startup.
+// readyPollInterval picks a small poll period relative to configured cadences.
 func readyPollInterval(cfg Config) time.Duration {
 	p := 150 * time.Millisecond
 	if cfg.GossipInterval > 0 && cfg.GossipInterval/4 < p {
@@ -36,10 +35,15 @@ func readyPollInterval(cfg Config) time.Duration {
 	return p
 }
 
+// backfillLoop waits until the node has a minimally ready view of the
+// cluster (some peers connected or a ring with >1 node), then performs an
+// initial state backfill from peers. After startup it periodically runs a
+// light repair pass to reconcile keys that may have diverged due to
+// membership changes or temporary failures.
+// Wait for initial membership/ring readiness with a bounded timeout
+// to avoid running a no-op backfill before peers and ring are populated.
+// Conditions to proceed: at least one peer connected OR ring has >1 node.
 func (n *Node[K, V]) backfillLoop() {
-	// Wait for initial membership/ring readiness with a bounded timeout
-	// to avoid running a no-op backfill before peers and ring are populated.
-	// Conditions to proceed: at least one peer connected OR ring has >1 node.
 	timeout := 3 * time.Second
 	if n.cfg.GossipInterval > 0 {
 		if d := 3 * n.cfg.GossipInterval; d > timeout {
@@ -86,6 +90,14 @@ func (n *Node[K, V]) backfillLoop() {
 	}
 }
 
+// backfillOnce reconciles this node's owned keyspace with peers by:
+//  1. Computing local per-bucket digests for owned keys.
+//  2. Asking each donor for its digests targeted at this node.
+//  3. For buckets that differ, paging through donor keys in hash order
+//     using a cursor, decoding values, and importing successfully decoded
+//     items into the local shard (and LWW version table when enabled).
+//
+// The donor list excludes self and peers we are not connected to.
 func (n *Node[K, V]) backfillOnce(depth int, page int) {
 	donors := n.peerAddrs()
 	self := n.cfg.PublicURL
@@ -128,7 +140,8 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 				continue // already in sync for this bucket
 			}
 
-			// Page through differing buckets using last key-hash cursor.
+			// Page through differing buckets using last key-hash cursor to keep
+			// pagination deterministic and avoid duplicates/skips across pages.
 			var cursor []byte
 			for {
 				kReq := &MsgBackfillKeysReq{
@@ -149,7 +162,8 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 					break
 				}
 
-				// decode + import only keys that successfully decoded and passed limits.
+				// Decode and import only keys that successfully decode and pass
+				// size/time limits; errors are skipped to keep repair moving.
 				toImport := make([]cache.Item[K, V], 0, len(kr.Items))
 				for _, kv := range kr.Items {
 					k, err := n.kc.DecodeKey(kv.K)
@@ -189,6 +203,8 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 							n.clock.Observe(last)
 						}
 					}
+					// Update our running local digest with imported batch to avoid
+					// asking for keys we've already reconciled in this pass.
 					local = n.updateLocalDigestWithBatch(local, depth, toImport)
 				}
 
@@ -202,6 +218,11 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 	}
 }
 
+// computeLocalDigests returns an orderless digest per key-hash prefix
+// bucket for keys this node currently owns. The digest includes count and
+// XOR(hash^version) so that donors and joiners can cheaply detect drift
+// without moving all keys. Depth is clamped to [1,8] bytes of the 64-bit
+// key hash in big-endian order.
 func (n *Node[K, V]) computeLocalDigests(depth int) map[string]bucketSig {
 	if depth <= 0 || depth > 8 {
 		depth = 2
@@ -229,8 +250,8 @@ func (n *Node[K, V]) computeLocalDigests(depth int) map[string]bucketSig {
 		binary.BigEndian.PutUint64(hb[:], h64)
 		prefix := string(hb[:depth])
 
-		// include version in the digest to detect divergence even when
-		// counts match (XORing hash with version is inexpensive and orderless).
+		// Include version in the digest to detect divergence even when counts
+		// match (XORing hash with version is inexpensive and orderless).
 		var ver uint64
 		if n.cfg.LWWEnabled {
 			n.verMu.RLock()
@@ -245,6 +266,9 @@ func (n *Node[K, V]) computeLocalDigests(depth int) map[string]bucketSig {
 	return m
 }
 
+// updateLocalDigestWithBatch updates an existing local digest with a set
+// of imported items so subsequent comparisons consider already-synced
+// keys and avoid re-requesting them in the same backfill run.
 func (n *Node[K, V]) updateLocalDigestWithBatch(m map[string]bucketSig, depth int, batch []cache.Item[K, V]) map[string]bucketSig {
 	for _, it := range batch {
 		kb := n.kc.EncodeKey(it.Key)
