@@ -57,7 +57,22 @@ func hashN(hash, mask uint64, rotate int) uint64 {
 	return h & mask
 }
 
-// bloomFilter is a 3-hash doorkeeper bitset (caller provides any needed synchronization).
+// acceptWithProb returns true with probability using high bits of an avalanche-mixed hash.
+func acceptWithProb(hash uint64, prob uint32) bool {
+	if prob >= 100 {
+		return true
+	}
+	if prob == 0 {
+		return false
+	}
+
+	r := uint32(xxHash64Avalanche(hash) >> 32)
+	threshold := uint32((uint64(prob) * (uint64(1) << 32)) / 100)
+	return r < threshold
+}
+
+// bloomFilter is a 3-hash doorkeeper bitset
+// caller provides any needed synchronization
 type bloomFilter struct {
 	bits []uint64
 	size uint64
@@ -107,7 +122,8 @@ func (bf *bloomFilter) reset() {
 	clear(bf.bits)
 }
 
-// frequencyBloomFilter is a 4-hash Count–Min Sketch using 4-bit counters packed 16 per uint64.
+// frequencyBloomFilter is a 4-hash Count–Min Sketch
+// using 4-bit counters packed 16 per uint64.
 type frequencyBloomFilter struct {
 	counters []uint64
 	size     uint64
@@ -117,7 +133,7 @@ type frequencyBloomFilter struct {
 	agingThreshold  uint64
 }
 
-// newFrequencyBloomFilter allocates the packed counter array (size rounded to power of two).
+// newFrequencyBloomFilter allocates the packed counter array.
 func newFrequencyBloomFilter(numCounters uint64) *frequencyBloomFilter {
 	size := uint64(mathutil.NextPowerOf2(int(numCounters)))
 	arraySize := size / 16
@@ -132,7 +148,8 @@ func newFrequencyBloomFilter(numCounters uint64) *frequencyBloomFilter {
 	}
 }
 
-// increment bumps all four counters for keyHash (unless saturated) and returns the new min estimate.
+// increment bumps all four counters for keyHash (unless saturated)
+// and returns the new min estimate.
 func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 	h1 := hashN(keyHash, fbf.mask, hash1Rotate)
 	h2 := hashN(keyHash, fbf.mask, hash2Rotate)
@@ -192,7 +209,8 @@ func (fbf *frequencyBloomFilter) getCounterValue(index uint64) uint64 {
 	return (fbf.counters[arrayIndex] >> shift) & frequencyMask
 }
 
-// incrementCounter CAS-increments a single 4-bit counter; saturated counters are left unchanged.
+// incrementCounter CAS-increments a single 4-bit counter
+// saturated counters are left unchanged.
 func (fbf *frequencyBloomFilter) incrementCounter(index uint64) {
 	arrayIndex := index / 16
 	counterIndex := index % 16
@@ -211,7 +229,8 @@ func (fbf *frequencyBloomFilter) incrementCounter(index uint64) {
 	}
 }
 
-// age halves every 4-bit counter in-place: shift right then mask each nibble (0b0111) to prevent spill.
+// age halves every 4-bit counter in-place:
+// shift right then mask each nibble (0b0111) to prevent spill.
 func (fbf *frequencyBloomFilter) age() {
 	const halfMask uint64 = 0x7777777777777777
 	for i := range fbf.counters {
@@ -226,7 +245,8 @@ func (fbf *frequencyBloomFilter) age() {
 	atomic.StoreUint64(&fbf.totalIncrements, 0)
 }
 
-// workloadDetector tracks admissions/sec (windowed) and consecutive misses; triggers scan mode on thresholds.
+// workloadDetector tracks admissions/sec (windowed) and consecutive misses
+// triggers scan mode on thresholds.
 type workloadDetector struct {
 	recentAdmissions    uint64
 	recentAdmissionTime int64
@@ -241,10 +261,10 @@ func newWorkloadDetector() *workloadDetector {
 	}
 }
 
-// detectScan updates admissionRate roughly once per second and returns true if rate or miss streak is high.
+// detectScan updates admissionRate roughly once per second
+// and returns true if rate or miss streak is high.
 func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 	now := time.Now().UnixNano()
-
 	elapsed := now - atomic.LoadInt64(&wd.recentAdmissionTime)
 	if elapsed > 1e9 {
 		admissions := atomic.LoadUint64(&wd.recentAdmissions)
@@ -255,7 +275,6 @@ func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 		atomic.StoreUint64(&wd.recentAdmissions, 0)
 		atomic.StoreInt64(&wd.recentAdmissionTime, now)
 	}
-
 	return atomic.LoadUint64(&wd.admissionRate) > scanAdmissionThreshold ||
 		atomic.LoadUint64(&wd.consecutiveMisses) > scanMissThreshold
 }
@@ -273,23 +292,19 @@ func (wd *workloadDetector) recordRejection() {
 
 // adaptiveAdmissionFilter coordinates doorkeeper, CMS, scan mode, and eviction-pressure feedback.
 type adaptiveAdmissionFilter struct {
-	frequencyFilter *frequencyBloomFilter
-	doorkeeper      *bloomFilter
-	detector        *workloadDetector
-
+	frequencyFilter      *frequencyBloomFilter
+	doorkeeper           *bloomFilter
+	detector             *workloadDetector
 	admissionProbability uint32 // base prob for low-freq items (0..100)
 	minProbability       uint32
 	maxProbability       uint32
-
-	recentEvictions uint64
-	evictionWindow  int64
-
-	resetInterval int64
-	lastReset     int64
-
-	admissionRequests uint64
-	admissionGrants   uint64
-	scanRejections    uint64
+	recentEvictions      uint64
+	evictionWindow       int64
+	resetInterval        int64
+	lastReset            int64
+	admissionRequests    uint64
+	admissionGrants      uint64
+	scanRejections       uint64
 }
 
 // newAdaptiveAdmissionFilter wires up components and seeds probabilities and timers.
@@ -337,9 +352,7 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, victimFrequency 
 	// Normal mode: update sketch/doorkeeper and apply core policy.
 	newFreq := aaf.frequencyFilter.increment(keyHash)
 	aaf.doorkeeper.add(keyHash)
-
 	admit := aaf.makeAdmissionDecision(keyHash, newFreq, victimFrequency, victimAge)
-
 	aaf.adjustAdmissionProbability()
 	aaf.checkPeriodicReset()
 
@@ -358,7 +371,7 @@ func (aaf *adaptiveAdmissionFilter) admitDuringScan(keyHash uint64, victimAge in
 	if victimAge > 0 && now-victimAge > scanModeRecencyThreshold {
 		return true
 	}
-	return (keyHash % 100) < uint64(aaf.minProbability)
+	return acceptWithProb(keyHash, aaf.minProbability)
 }
 
 // makeAdmissionDecision applies the non-scan policy:
@@ -377,7 +390,7 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, vict
 			victimRecency := now - victimAge
 			return victimRecency > recencyTieBreakThreshold
 		}
-		return (keyHash % 2) == 0
+		return acceptWithProb(keyHash, 50)
 	}
 
 	prob := atomic.LoadUint32(&aaf.admissionProbability)
@@ -386,11 +399,12 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, newFreq, vict
 	if vf > 5 {
 		vf = 5
 	}
+
 	adjustedProb := int64(prob) - int64(vf*10)
 	if adjustedProb < int64(aaf.minProbability) {
 		adjustedProb = int64(aaf.minProbability)
 	}
-	return (keyHash % 100) < uint64(adjustedProb)
+	return acceptWithProb(keyHash, uint32(adjustedProb))
 }
 
 // adjustAdmissionProbability nudges the global probability once per interval based on recent evictions.

@@ -522,8 +522,11 @@ func TestVictimFrequencyTracking(t *testing.T) {
 
 	initialEvictions := cache.Stats().Evictions
 
-	// Add new item that should trigger eviction
-	cache.Set("new_item", 3, time.Hour)
+	// AdmissionLFU is probabilistic. Retry with distinct keys to trigger an eviction.
+	// With ~50% fallback admit probability here, 20 attempts fail with prob ~9.5e-7.
+	for i := 0; i < 20 && cache.Stats().Evictions == initialEvictions; i++ {
+		cache.Set(fmt.Sprintf("new_item_%d", i), 3, time.Hour)
+	}
 
 	finalEvictions := cache.Stats().Evictions
 
