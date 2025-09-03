@@ -33,6 +33,7 @@ func NewClient[K comparable, V any](n *Node[K, V]) *DistributedCache[K, V] {
 	return NewDistributedCache[K, V](n)
 }
 
+// getCtx returns a context with timeout derived from node security settings.
 func (a *DistributedCache[K, V]) getCtx(write bool) (context.Context, context.CancelFunc) {
 	to := a.n.cfg.Sec.ReadTimeout
 	if write {

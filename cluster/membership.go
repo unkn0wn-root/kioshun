@@ -12,6 +12,8 @@ type membership struct {
 	epoch uint64
 }
 
+// newMembership creates an empty membership view with per-node metadata and
+// last-seen timestamps used for liveness and ring construction.
 func newMembership() *membership {
 	return &membership{
 		peers: make(map[NodeID]*nodeMeta),
@@ -19,6 +21,8 @@ func newMembership() *membership {
 	}
 }
 
+// snapshot returns copies of peers and seen maps along with the current epoch
+// so callers can take a consistent view without holding locks.
 func (m *membership) snapshot() (map[NodeID]*nodeMeta, map[NodeID]int64, uint64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -81,6 +85,7 @@ func (m *membership) alive(now int64, suspicionAfter time.Duration) []*nodeMeta 
 	return out
 }
 
+// pruneTombstones removes nodes that have not been seen for tombstoneAfter.
 func (m *membership) pruneTombstones(now int64, tombstoneAfter time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -93,6 +98,7 @@ func (m *membership) pruneTombstones(now int64, tombstoneAfter time.Duration) {
 	}
 }
 
+// ensure ensures a node entry exists and bumps its seen timestamp to now.
 func (m *membership) ensure(id NodeID, addr string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

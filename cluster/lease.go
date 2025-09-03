@@ -22,6 +22,8 @@ type leaseTable struct {
 	stopCh chan struct{}
 }
 
+// newLeaseTable creates a per-key lease table with an optional TTL to break
+// stuck leases. A background sweeper closes expired leases when ttl>0.
 func newLeaseTable(ttl time.Duration) *leaseTable {
 	t := &leaseTable{
 		m:      make(map[string]*inflight),
@@ -34,6 +36,8 @@ func newLeaseTable(ttl time.Duration) *leaseTable {
 	return t
 }
 
+// acquire obtains a lease for key if none exists and returns (lease, true).
+// When a lease already exists, returns the existing lease and false.
 func (t *leaseTable) acquire(key string) (*inflight, bool) {
 	t.mu.Lock()
 	if f, ok := t.m[key]; ok {
@@ -47,6 +51,7 @@ func (t *leaseTable) acquire(key string) (*inflight, bool) {
 	return f, true
 }
 
+// release removes the lease and notifies waiters with the provided error.
 func (t *leaseTable) release(key string, err error) {
 	t.mu.Lock()
 	f, ok := t.m[key]
@@ -61,6 +66,8 @@ func (t *leaseTable) release(key string, err error) {
 	}
 }
 
+// wait blocks until the lease for key completes or ctx is done, returning
+// the terminal error set by the releaser (nil on success).
 func (t *leaseTable) wait(ctx context.Context, key string) error {
 	t.mu.Lock()
 	f := t.m[key]
@@ -76,6 +83,8 @@ func (t *leaseTable) wait(ctx context.Context, key string) error {
 	}
 }
 
+// sweeper periodically scans for and force-closes expired leases to prevent
+// indefinite blocking when holders crash or hang.
 func (t *leaseTable) sweeper() {
 	tick := time.NewTicker(t.ttl / 2)
 	defer tick.Stop()
@@ -98,6 +107,7 @@ func (t *leaseTable) sweeper() {
 	}
 }
 
+// Stop shuts down the sweeper goroutine.
 func (t *leaseTable) Stop() {
 	select {
 	case <-t.stopCh:

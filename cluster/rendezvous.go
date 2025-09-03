@@ -14,6 +14,8 @@ type nodeMeta struct {
 	salt   uint64 // per-node salt (pre-hashed ID)
 }
 
+// newMeta initializes per-node rendezvous metadata with a default weight and
+// a precomputed salt derived from the node ID.
 func newMeta(id NodeID, addr string) *nodeMeta {
 	return &nodeMeta{
 		ID: id, Addr: addr,
@@ -22,6 +24,7 @@ func newMeta(id NodeID, addr string) *nodeMeta {
 	}
 }
 
+// Weight returns the current scaled weight as a [0,1] float.
 func (n *nodeMeta) Weight() float64 {
 	return float64(atomic.LoadUint64(&n.weight)) / 1_000_000.0
 }
@@ -33,6 +36,8 @@ type ring struct {
 
 func newRing(rf int) *ring { return &ring{rf: rf} }
 
+// ownersFromKeyHash returns the top rf owners for a 64-bit key hash using
+// weighted rendezvous hashing. Node salt keeps per-node independence.
 func (r *ring) ownersFromKeyHash(keyHash uint64) []*nodeMeta {
 	// compute rendezvous scores per node using a per-node salt and mix64.
 	// weighted ordering is achieved by scaling scores by node weight.
@@ -65,6 +70,8 @@ func (r *ring) ownersFromKeyHash(keyHash uint64) []*nodeMeta {
 	return out
 }
 
+// ownersTopNFromKeyHash returns the top N candidates by weighted rendezvous
+// score. Used for hot-key shadowing beyond rf.
 func (r *ring) ownersTopNFromKeyHash(keyHash uint64, n int) []*nodeMeta {
 	// variant that returns the top-N candidates for hot-key shadowing.
 	type pair struct {
