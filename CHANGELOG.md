@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.1](https://github.com/unkn0wn-root/kioshun/compare/v0.3.0...v0.3.1) (2025-09-03)
+
+
+### Features
+
+* add clustered api to examples dir ([90047df](https://github.com/unkn0wn-root/kioshun/commit/90047dfe759fa1188da4ba083be2cca9ec7fad4e))
+
 ## [0.3.0](https://github.com/unkn0wn-root/kioshun/compare/v0.2.3...v0.3.0) (2025-09-02)
 
 
