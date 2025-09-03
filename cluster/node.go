@@ -628,11 +628,8 @@ func (n *Node[K, V]) rpcGet(g MsgGet) MsgGetResp {
 	k, err := n.kc.DecodeKey(g.Key)
 	if err != nil {
 		return MsgGetResp{
-			Base: Base{
-				T:  MTGetResp,
-				ID: g.ID,
-			},
-			Err: err.Error(),
+			Base: Base{T: MTGetResp, ID: g.ID},
+			Err:  err.Error(),
 		}
 	}
 
@@ -640,29 +637,20 @@ func (n *Node[K, V]) rpcGet(g MsgGet) MsgGetResp {
 		b, err := n.codec.Encode(v)
 		if err != nil {
 			return MsgGetResp{
-				Base: Base{
-					T:  MTGetResp,
-					ID: g.ID,
-				},
-				Err: err.Error(),
+				Base: Base{T: MTGetResp, ID: g.ID},
+				Err:  err.Error(),
 			}
 		}
 
 		if n.cfg.Sec.MaxValueSize > 0 && len(b) > n.cfg.Sec.MaxValueSize {
 			return MsgGetResp{
-				Base: Base{
-					T:  MTGetResp,
-					ID: g.ID,
-				},
-				Err: errValueTooLarge,
+				Base: Base{T: MTGetResp, ID: g.ID},
+				Err:  errValueTooLarge,
 			}
 		}
 		b2, cp := n.maybeCompress(b)
 		return MsgGetResp{
-			Base: Base{
-				T:  MTGetResp,
-				ID: g.ID,
-			},
+			Base:  Base{T: MTGetResp, ID: g.ID},
 			Found: true,
 			Val:   b2,
 			Cp:    cp,
@@ -670,10 +658,7 @@ func (n *Node[K, V]) rpcGet(g MsgGet) MsgGetResp {
 		}
 	}
 	return MsgGetResp{
-		Base: Base{
-			T:  MTGetResp,
-			ID: g.ID,
-		},
+		Base:  Base{T: MTGetResp, ID: g.ID},
 		Found: false,
 		Err:   ErrNotFound,
 	}
@@ -702,10 +687,7 @@ func (n *Node[K, V]) rpcGetBulk(g MsgGetBulk) MsgGetBulkResp {
 		}
 	}
 	return MsgGetBulkResp{
-		Base: Base{
-			T:  MTGetBulkResp,
-			ID: g.ID,
-		},
+		Base: Base{T: MTGetBulkResp, ID: g.ID},
 		Hits: hits,
 		Vals: vals,
 		Exps: exps,
@@ -718,58 +700,43 @@ func (n *Node[K, V]) rpcGetBulk(g MsgGetBulk) MsgGetBulkResp {
 func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 	if n.cfg.Sec.MaxKeySize > 0 && len(s.Key) > n.cfg.Sec.MaxKeySize {
 		return MsgSetResp{
-			Base: Base{
-				T:  MTSetResp,
-				ID: s.ID,
-			},
-			OK:  false,
-			Err: errKeyTooLarge,
+			Base: Base{T: MTSetResp, ID: s.ID},
+			OK:   false,
+			Err:  errKeyTooLarge,
 		}
 	}
 
 	if n.cfg.Sec.MaxValueSize > 0 && len(s.Val) > n.cfg.Sec.MaxValueSize {
 		return MsgSetResp{
-			Base: Base{
-				T:  MTSetResp,
-				ID: s.ID,
-			},
-			OK:  false,
-			Err: errValueTooLarge,
+			Base: Base{T: MTSetResp, ID: s.ID},
+			OK:   false,
+			Err:  errValueTooLarge,
 		}
 	}
 
 	vbytes, err := n.maybeDecompress(s.Val, s.Cp)
 	if err != nil {
 		return MsgSetResp{
-			Base: Base{
-				T:  MTSetResp,
-				ID: s.ID,
-			},
-			OK:  false,
-			Err: err.Error(),
+			Base: Base{T: MTSetResp, ID: s.ID},
+			OK:   false,
+			Err:  err.Error(),
 		}
 	}
 
 	if n.cfg.Sec.MaxValueSize > 0 && len(vbytes) > n.cfg.Sec.MaxValueSize {
 		return MsgSetResp{
-			Base: Base{
-				T:  MTSetResp,
-				ID: s.ID,
-			},
-			OK:  false,
-			Err: errValueTooLarge,
+			Base: Base{T: MTSetResp, ID: s.ID},
+			OK:   false,
+			Err:  errValueTooLarge,
 		}
 	}
 
 	k, err := n.kc.DecodeKey(s.Key)
 	if err != nil {
 		return MsgSetResp{
-			Base: Base{
-				T:  MTSetResp,
-				ID: s.ID,
-			},
-			OK:  false,
-			Err: err.Error(),
+			Base: Base{T: MTSetResp, ID: s.ID},
+			OK:   false,
+			Err:  err.Error(),
 		}
 	}
 
@@ -782,11 +749,8 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 		// Drop older versions (LWW); equal version is idempotent.
 		if old > s.Ver {
 			return MsgSetResp{
-				Base: Base{
-					T:  MTSetResp,
-					ID: s.ID,
-				},
-				OK: true,
+				Base: Base{T: MTSetResp, ID: s.ID},
+				OK:   true,
 			}
 		}
 	}
@@ -794,12 +758,9 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 	val, err := n.codec.Decode(vbytes)
 	if err != nil {
 		return MsgSetResp{
-			Base: Base{
-				T:  MTSetResp,
-				ID: s.ID,
-			},
-			OK:  false,
-			Err: err.Error(),
+			Base: Base{T: MTSetResp, ID: s.ID},
+			OK:   false,
+			Err:  err.Error(),
 		}
 	}
 
@@ -816,12 +777,10 @@ func (n *Node[K, V]) rpcSet(s MsgSet) MsgSetResp {
 		n.verMu.Unlock()
 		n.clock.Observe(s.Ver)
 	}
+
 	return MsgSetResp{
-		Base: Base{
-			T:  MTSetResp,
-			ID: s.ID,
-		},
-		OK: true,
+		Base: Base{T: MTSetResp, ID: s.ID},
+		OK:   true,
 	}
 }
 
@@ -832,70 +791,52 @@ func (n *Node[K, V]) rpcSetBulk(sb MsgSetBulk) MsgSetBulkResp {
 	for _, kv := range sb.Items {
 		if n.cfg.Sec.MaxKeySize > 0 && len(kv.K) > n.cfg.Sec.MaxKeySize {
 			return MsgSetBulkResp{
-				Base: Base{
-					T:  MTSetBulkResp,
-					ID: sb.ID,
-				},
-				OK:  false,
-				Err: errKeyTooLarge,
+				Base: Base{T: MTSetBulkResp, ID: sb.ID},
+				OK:   false,
+				Err:  errKeyTooLarge,
 			}
 		}
 
 		if n.cfg.Sec.MaxValueSize > 0 && len(kv.V) > n.cfg.Sec.MaxValueSize {
 			return MsgSetBulkResp{
-				Base: Base{
-					T:  MTSetBulkResp,
-					ID: sb.ID,
-				},
-				OK:  false,
-				Err: errValueTooLarge,
+				Base: Base{T: MTSetBulkResp, ID: sb.ID},
+				OK:   false,
+				Err:  errValueTooLarge,
 			}
 		}
 
 		k, err := n.kc.DecodeKey(kv.K)
 		if err != nil {
 			return MsgSetBulkResp{
-				Base: Base{
-					T:  MTSetBulkResp,
-					ID: sb.ID,
-				},
-				OK:  false,
-				Err: err.Error(),
+				Base: Base{T: MTSetBulkResp, ID: sb.ID},
+				OK:   false,
+				Err:  err.Error(),
 			}
 		}
 
 		vbytes, err := n.maybeDecompress(kv.V, kv.Cp)
 		if err != nil {
 			return MsgSetBulkResp{
-				Base: Base{
-					T:  MTSetBulkResp,
-					ID: sb.ID,
-				},
-				OK:  false,
-				Err: err.Error(),
+				Base: Base{T: MTSetBulkResp, ID: sb.ID},
+				OK:   false,
+				Err:  err.Error(),
 			}
 		}
 
 		if n.cfg.Sec.MaxValueSize > 0 && len(vbytes) > n.cfg.Sec.MaxValueSize {
 			return MsgSetBulkResp{
-				Base: Base{
-					T:  MTSetBulkResp,
-					ID: sb.ID,
-				},
-				OK:  false,
-				Err: errValueTooLarge,
+				Base: Base{T: MTSetBulkResp, ID: sb.ID},
+				OK:   false,
+				Err:  errValueTooLarge,
 			}
 		}
 
 		val, err := n.codec.Decode(vbytes)
 		if err != nil {
 			return MsgSetBulkResp{
-				Base: Base{
-					T:  MTSetBulkResp,
-					ID: sb.ID,
-				},
-				OK:  false,
-				Err: err.Error(),
+				Base: Base{T: MTSetBulkResp, ID: sb.ID},
+				OK:   false,
+				Err:  err.Error(),
 			}
 		}
 
@@ -918,11 +859,8 @@ func (n *Node[K, V]) rpcSetBulk(sb MsgSetBulk) MsgSetBulkResp {
 	}
 	n.local.Import(items)
 	return MsgSetBulkResp{
-		Base: Base{
-			T:  MTSetBulkResp,
-			ID: sb.ID,
-		},
-		OK: true,
+		Base: Base{T: MTSetBulkResp, ID: sb.ID},
+		OK:   true,
 	}
 }
 
@@ -930,24 +868,18 @@ func (n *Node[K, V]) rpcSetBulk(sb MsgSetBulk) MsgSetBulkResp {
 func (n *Node[K, V]) rpcDel(d MsgDel) MsgDelResp {
 	if n.cfg.Sec.MaxKeySize > 0 && len(d.Key) > n.cfg.Sec.MaxKeySize {
 		return MsgDelResp{
-			Base: Base{
-				T:  MTDeleteResp,
-				ID: d.ID,
-			},
-			OK:  false,
-			Err: errKeyTooLarge,
+			Base: Base{T: MTDeleteResp, ID: d.ID},
+			OK:   false,
+			Err:  errKeyTooLarge,
 		}
 	}
 
 	k, err := n.kc.DecodeKey(d.Key)
 	if err != nil {
 		return MsgDelResp{
-			Base: Base{
-				T:  MTDeleteResp,
-				ID: d.ID,
-			},
-			OK:  false,
-			Err: err.Error(),
+			Base: Base{T: MTDeleteResp, ID: d.ID},
+			OK:   false,
+			Err:  err.Error(),
 		}
 	}
 
@@ -957,20 +889,21 @@ func (n *Node[K, V]) rpcDel(d MsgDel) MsgDelResp {
 		n.verMu.RUnlock()
 		if old > d.Ver {
 			return MsgDelResp{
-				Base: Base{
-					T:  MTDeleteResp,
-					ID: d.ID,
-				},
-				OK: true,
+				Base: Base{T: MTDeleteResp, ID: d.ID},
+				OK:   true,
 			}
 		}
+
 		n.verMu.Lock()
 		n.version[string(d.Key)] = d.Ver
 		n.verMu.Unlock()
 		n.clock.Observe(d.Ver)
 	}
 	ok := n.local.Delete(k)
-	return MsgDelResp{Base: Base{T: MTDeleteResp, ID: d.ID}, OK: ok}
+	return MsgDelResp{
+		Base: Base{T: MTDeleteResp, ID: d.ID},
+		OK:   ok,
+	}
 }
 
 // rpcLeaseLoad enforces single-flight loading on the primary: if not present
@@ -980,22 +913,16 @@ func (n *Node[K, V]) rpcDel(d MsgDel) MsgDelResp {
 func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 	if n.leaseLimiter != nil && !n.leaseLimiter.Allow() {
 		return MsgLeaseLoadResp{
-			Base: Base{
-				T:  MTLeaseLoadResp,
-				ID: ll.ID,
-			},
-			Err: "rate limited",
+			Base: Base{T: MTLeaseLoadResp, ID: ll.ID},
+			Err:  "rate limited",
 		}
 	}
 
 	k, err := n.kc.DecodeKey(ll.Key)
 	if err != nil {
 		return MsgLeaseLoadResp{
-			Base: Base{
-				T:  MTLeaseLoadResp,
-				ID: ll.ID,
-			},
-			Err: err.Error(),
+			Base: Base{T: MTLeaseLoadResp, ID: ll.ID},
+			Err:  err.Error(),
 		}
 	}
 
@@ -1003,10 +930,7 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 		b, _ := n.codec.Encode(v)
 		b2, cp := n.maybeCompress(b)
 		return MsgLeaseLoadResp{
-			Base: Base{
-				T:  MTLeaseLoadResp,
-				ID: ll.ID,
-			},
+			Base:  Base{T: MTLeaseLoadResp, ID: ll.ID},
 			Found: true,
 			Val:   b2,
 			Cp:    cp,
@@ -1016,11 +940,8 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 
 	if n.Loader == nil {
 		return MsgLeaseLoadResp{
-			Base: Base{
-				T:  MTLeaseLoadResp,
-				ID: ll.ID,
-			},
-			Err: ErrNoLoader.Error(),
+			Base: Base{T: MTLeaseLoadResp, ID: ll.ID},
+			Err:  ErrNoLoader.Error(),
 		}
 	}
 
@@ -1052,21 +973,15 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 		n.leases.release(keyStr, err)
 		if err != nil {
 			return MsgLeaseLoadResp{
-				Base: Base{
-					T:  MTLeaseLoadResp,
-					ID: ll.ID,
-				},
-				Err: err.Error(),
+				Base: Base{T: MTLeaseLoadResp, ID: ll.ID},
+				Err:  err.Error(),
 			}
 		}
 
 		b, _ := n.codec.Encode(v)
 		b2, cp := n.maybeCompress(b)
 		return MsgLeaseLoadResp{
-			Base: Base{
-				T:  MTLeaseLoadResp,
-				ID: ll.ID,
-			},
+			Base:  Base{T: MTLeaseLoadResp, ID: ll.ID},
 			Found: true,
 			Val:   b2,
 			Cp:    cp,
@@ -1076,11 +991,8 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 
 	if err := n.leases.wait(context.Background(), keyStr); err != nil {
 		return MsgLeaseLoadResp{
-			Base: Base{
-				T:  MTLeaseLoadResp,
-				ID: ll.ID,
-			},
-			Err: err.Error(),
+			Base: Base{T: MTLeaseLoadResp, ID: ll.ID},
+			Err:  err.Error(),
 		}
 	}
 
@@ -1088,10 +1000,7 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 		b, _ := n.codec.Encode(v)
 		b2, cp := n.maybeCompress(b)
 		return MsgLeaseLoadResp{
-			Base: Base{
-				T:  MTLeaseLoadResp,
-				ID: ll.ID,
-			},
+			Base:  Base{T: MTLeaseLoadResp, ID: ll.ID},
 			Found: true,
 			Val:   b2,
 			Cp:    cp,
@@ -1099,10 +1008,7 @@ func (n *Node[K, V]) rpcLeaseLoad(ll MsgLeaseLoad) MsgLeaseLoadResp {
 		}
 	}
 	return MsgLeaseLoadResp{
-		Base: Base{
-			T:  MTLeaseLoadResp,
-			ID: ll.ID,
-		},
+		Base:  Base{T: MTLeaseLoadResp, ID: ll.ID},
 		Found: false,
 	}
 }
@@ -1173,6 +1079,7 @@ func (n *Node[K, V]) sendGossip() {
 func (n *Node[K, V]) peerAddrs() []string {
 	n.peersMu.RLock()
 	defer n.peersMu.RUnlock()
+
 	out := make([]string, 0, len(n.peers))
 	for a := range n.peers {
 		out = append(out, a)
