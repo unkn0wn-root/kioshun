@@ -3,20 +3,26 @@ package cluster
 import "sync"
 
 type bufPool struct {
-	sizes []int
-	pools []sync.Pool
+	sizes       []int
+	pools       []sync.Pool
+	indexBySize map[int]int
 }
 
 // newBufPool creates fixed-size byte slice pools for a small set of common
 // buffer sizes to reduce allocations on hot paths (framed I/O).
 func newBufPool(sizes []int) *bufPool {
-	bp := &bufPool{sizes: sizes, pools: make([]sync.Pool, len(sizes))}
+	bp := &bufPool{
+		sizes:       sizes,
+		pools:       make([]sync.Pool, len(sizes)),
+		indexBySize: make(map[int]int, len(sizes)),
+	}
 	for i, sz := range sizes {
 		size := sz
 		bp.pools[i].New = func() any {
 			b := make([]byte, size)
 			return b
 		}
+		bp.indexBySize[sz] = i
 	}
 	return bp
 }
@@ -46,13 +52,9 @@ func (bp *bufPool) get(n int) []byte {
 // put returns a buffer to the matching bucket by capacity. non-pooled sizes
 // are dropped on the floor to avoid unbounded pool growth.
 func (bp *bufPool) put(b []byte) {
-	c := cap(b)
-	for i, sz := range bp.sizes {
-		if c == sz {
-			// restore to full capacity before putting back.
-			b = b[:sz]
-			bp.pools[i].Put(b)
-			return
-		}
+	if i, ok := bp.indexBySize[cap(b)]; ok {
+		// restore to full capacity before putting back.
+		b = b[:bp.sizes[i]]
+		bp.pools[i].Put(b)
 	}
 }

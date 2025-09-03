@@ -3,8 +3,6 @@ package cluster
 import (
 	"sync"
 	"time"
-
-	"github.com/cespare/xxhash/v2"
 )
 
 type membership struct {
@@ -46,7 +44,7 @@ func (m *membership) integrate(from NodeID, addr string, peersAddrs []string, se
 	}
 
 	if _, ok := m.peers[from]; !ok {
-		m.peers[from] = &nodeMeta{ID: from, Addr: addr, weight: 500_000, salt: xxhash.Sum64String(string(from))}
+		m.peers[from] = newMeta(from, addr)
 	} else {
 		m.peers[from].Addr = addr
 	}
@@ -56,7 +54,7 @@ func (m *membership) integrate(from NodeID, addr string, peersAddrs []string, se
 	for _, a := range peersAddrs {
 		id := NodeID(a)
 		if _, ok := m.peers[id]; !ok {
-			m.peers[id] = &nodeMeta{ID: id, Addr: a, weight: 500_000, salt: xxhash.Sum64String(string(id))}
+			m.peers[id] = newMeta(id, a)
 		}
 	}
 
@@ -99,7 +97,7 @@ func (m *membership) ensure(id NodeID, addr string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.peers[id]; !ok {
-		m.peers[id] = &nodeMeta{ID: id, Addr: addr, weight: 500_000, salt: xxhash.Sum64String(string(id))}
+		m.peers[id] = newMeta(id, addr)
 	}
 	m.seen[id] = time.Now().UnixNano()
 }

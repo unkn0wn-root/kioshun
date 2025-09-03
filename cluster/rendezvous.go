@@ -3,6 +3,8 @@ package cluster
 import (
 	"sort"
 	"sync/atomic"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 type nodeMeta struct {
@@ -10,6 +12,14 @@ type nodeMeta struct {
 	Addr   string
 	weight uint64 // scaled 0..1_000_000
 	salt   uint64 // per-node salt (pre-hashed ID)
+}
+
+func newMeta(id NodeID, addr string) *nodeMeta {
+	return &nodeMeta{
+		ID: id, Addr: addr,
+		weight: 500_000,
+		salt:   xxhash.Sum64String(string(id)),
+	}
 }
 
 func (n *nodeMeta) Weight() float64 {
@@ -22,16 +32,6 @@ type ring struct {
 }
 
 func newRing(rf int) *ring { return &ring{rf: rf} }
-
-// mix64: fast 64-bit mixer (SplitMix64 finalizer).
-func mix64(x uint64) uint64 {
-	x ^= x >> 30
-	x *= 0xbf58476d1ce4e5b9
-	x ^= x >> 27
-	x *= 0x94d049bb133111eb
-	x ^= x >> 31
-	return x
-}
 
 func (r *ring) ownersFromKeyHash(keyHash uint64) []*nodeMeta {
 	// compute rendezvous scores per node using a per-node salt and mix64.
@@ -93,4 +93,14 @@ func (r *ring) ownersTopNFromKeyHash(keyHash uint64, n int) []*nodeMeta {
 		out[i] = arr[i].n
 	}
 	return out
+}
+
+// mix64: fast 64-bit mixer (SplitMix64 finalizer).
+func mix64(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
 }

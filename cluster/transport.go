@@ -173,9 +173,10 @@ func (p *peerConn) readLoop() {
 		}
 		if chAny, ok := p.pend.Load(base.ID); ok {
 			p.pend.Delete(base.ID)
-			ch := chAny.(chan []byte)
-			ch <- buf
-			close(ch)
+			if ch, ok := chAny.(chan []byte); ok {
+				ch <- buf
+				close(ch)
+			}
 		}
 	}
 }
@@ -228,13 +229,7 @@ func writeFrameBuf(w *bufio.Writer, payload []byte) error {
 }
 
 func writeFrame(w io.Writer, payload []byte) error {
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(payload)
-	return err
+	return writeFrameBuf(p.w, payload)
 }
 
 func (p *peerConn) request(msg any, id uint64, timeout time.Duration) ([]byte, error) {

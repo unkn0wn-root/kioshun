@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -115,57 +114,6 @@ func NewNode[K comparable, V any](cfg Config, keyc KeyCodec[K], c *cache.InMemor
 	return n
 }
 
-func (n *Node[K, V]) initTLS() {
-	cert, err := tls.LoadX509KeyPair(n.cfg.Sec.TLS.CertFile, n.cfg.Sec.TLS.KeyFile)
-	if err == nil {
-		tc := &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			PreferServerCipherSuites: true,
-			// @Note: david - this should be configurable
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			},
-			CurvePreferences: []tls.CurveID{
-				tls.X25519, tls.CurveP256,
-			},
-		}
-		if n.cfg.Sec.TLS.RequireClientCert {
-			tc.ClientAuth = tls.RequireAndVerifyClientCert
-			if n.cfg.Sec.TLS.CAFile != "" {
-				ca := x509.NewCertPool()
-				pem, _ := os.ReadFile(n.cfg.Sec.TLS.CAFile)
-				ca.AppendCertsFromPEM(pem)
-				tc.ClientCAs = ca
-			}
-		}
-		n.tlsServerConf = tc
-	}
-
-	cc := &tls.Config{MinVersion: tls.VersionTLS12}
-	if n.cfg.Sec.TLS.CAFile != "" {
-		ca := x509.NewCertPool()
-		pem, _ := os.ReadFile(n.cfg.Sec.TLS.CAFile)
-		ca.AppendCertsFromPEM(pem)
-		cc.RootCAs = ca
-	}
-
-	if n.cfg.Sec.TLS.CertFile != "" && n.cfg.Sec.TLS.KeyFile != "" {
-		if cert, err := tls.LoadX509KeyPair(n.cfg.Sec.TLS.CertFile, n.cfg.Sec.TLS.KeyFile); err == nil {
-			cc.Certificates = []tls.Certificate{cert}
-		}
-	}
-	n.tlsClientConf = cc
-}
-
-func (n *Node[K, V]) logf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "[kioshun] "+format+"\n", args...)
-}
-
-func (n *Node[K, V]) nextReqID() uint64 { return atomic.AddUint64(&n.reqID, 1) }
 func (n *Node[K, V]) Start() error {
 	ln, err := net.Listen("tcp", n.cfg.BindAddr)
 	if err != nil {
@@ -201,6 +149,52 @@ func (n *Node[K, V]) Stop() {
 		n.hh.Stop()
 	}
 	n.closePeers()
+}
+
+func (n *Node[K, V]) initTLS() {
+	loadCertPool := func(p string) *x509.CertPool {
+		if p == "" {
+			return nil
+		}
+		ca := x509.NewCertPool()
+		if pem, err := os.ReadFile(p); err == nil {
+			ca.AppendCertsFromPEM(pem)
+			return ca
+		}
+		return nil
+	}
+
+	if cert, err := tls.LoadX509KeyPair(n.cfg.Sec.TLS.CertFile, n.cfg.Sec.TLS.KeyFile); err == nil {
+		tc := &tls.Config{
+			Certificates:             []tls.Certificate{cert},
+			MinVersion:               tls.VersionTLS12,
+			PreferServerCipherSuites: true,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			},
+			CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
+		}
+		if n.cfg.Sec.TLS.RequireClientCert {
+			tc.ClientAuth = tls.RequireAndVerifyClientCert
+			tc.ClientCAs = loadCertPool(n.cfg.Sec.TLS.CAFile)
+		}
+		n.tlsServerConf = tc
+	}
+
+	cc := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: loadCertPool(n.cfg.Sec.TLS.CAFile)}
+	if n.cfg.Sec.TLS.CertFile != "" && n.cfg.Sec.TLS.KeyFile != "" {
+		if cert, err := tls.LoadX509KeyPair(n.cfg.Sec.TLS.CertFile, n.cfg.Sec.TLS.KeyFile); err == nil {
+			cc.Certificates = []tls.Certificate{cert}
+		}
+	}
+	n.tlsClientConf = cc
+}
+
+func (n *Node[K, V]) nextReqID() uint64 {
+	return atomic.AddUint64(&n.reqID, 1)
 }
 
 func (n *Node[K, V]) closePeers() {
@@ -369,70 +363,58 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 					continue
 				}
 
+				send := func(v any) {
+					out, _ := cborEnc.Marshal(v)
+					writeResp(out)
+				}
+
 				switch base.T {
 				case MTGet:
 					var g MsgGet
 					if cborDec.Unmarshal(buf, &g) == nil {
-						resp := n.rpcGet(g)
-						out, _ := cborEnc.Marshal(&resp)
-						writeResp(out)
+						send(n.rpcGet(g))
 					}
 				case MTGetBulk:
 					var g MsgGetBulk
 					if cborDec.Unmarshal(buf, &g) == nil {
-						resp := n.rpcGetBulk(g)
-						out, _ := cborEnc.Marshal(&resp)
-						writeResp(out)
+						send(n.rpcGetBulk(g))
 					}
 				case MTSet:
 					var s MsgSet
 					if cborDec.Unmarshal(buf, &s) == nil {
-						resp := n.rpcSet(s)
-						out, _ := cborEnc.Marshal(&resp)
-						writeResp(out)
+						send(n.rpcSet(s))
 					}
 				case MTSetBulk:
 					var sb MsgSetBulk
 					if cborDec.Unmarshal(buf, &sb) == nil {
-						resp := n.rpcSetBulk(sb)
-						out, _ := cborEnc.Marshal(&resp)
-						writeResp(out)
+						send(n.rpcSetBulk(sb))
 					}
 				case MTDelete:
 					var d MsgDel
 					if cborDec.Unmarshal(buf, &d) == nil {
-						resp := n.rpcDel(d)
-						out, _ := cborEnc.Marshal(&resp)
-						writeResp(out)
+						send(n.rpcDel(d))
 					}
 				case MTLeaseLoad:
 					var ll MsgLeaseLoad
 					if cborDec.Unmarshal(buf, &ll) == nil {
-						resp := n.rpcLeaseLoad(ll)
-						out, _ := cborEnc.Marshal(&resp)
-						writeResp(out)
+						send(n.rpcLeaseLoad(ll))
 					}
 				case MTGossip:
 					var g MsgGossip
 					if cborDec.Unmarshal(buf, &g) == nil {
 						n.ingestGossip(&g)
 						ack := MsgGossip{Base: Base{T: MTGossip, ID: g.ID}}
-						out, _ := cborEnc.Marshal(&ack)
-						writeResp(out)
+						send(&ack)
 					}
 				case MTBackfillDigestReq:
 					var q MsgBackfillDigestReq
 					if cborDec.Unmarshal(buf, &q) == nil {
-						resp := n.rpcBackfillDigest(q)
-						out, _ := cborEnc.Marshal(&resp)
-						writeResp(out)
+						send(n.rpcBackfillDigest(q))
 					}
 				case MTBackfillKeysReq:
 					var q MsgBackfillKeysReq
 					if cborDec.Unmarshal(buf, &q) == nil {
-						resp := n.rpcBackfillKeys(q)
-						out, _ := cborEnc.Marshal(&resp)
-						writeResp(out)
+						send(n.rpcBackfillKeys(q))
 					}
 				}
 				readBufPool.put(buf)
@@ -518,9 +500,9 @@ func (bb *bytesBuffer) Bytes() []byte               { return bb.b }
 func (bb *bytesBuffer) Len() int                    { return len(bb.b) }
 func (bb *bytesBuffer) ReadFrom(r io.Reader) (int64, error) {
 	var total int64
-	tmp := make([]byte, 32<<10)
+	var tmp [32 << 10]byte
 	for {
-		n, err := r.Read(tmp)
+		n, err := r.Read(tmp[:])
 		if n > 0 {
 			bb.b = append(bb.b, tmp[:n]...)
 			total += int64(n)
@@ -951,16 +933,16 @@ func (n *Node[K, V]) ensurePeer(addr string) *peerConn {
 	if p = n.peers[addr]; p != nil {
 		return p
 	}
+
+	var tlsConf *tls.Config
+	if n.cfg.Sec.TLS.Enable {
+		tlsConf = n.tlsClientConf
+	}
 	// establish transport with auth/TLS and configure inflight limits.
 	pc, err := dialPeer(
 		n.cfg.PublicURL,
 		addr,
-		func() *tls.Config {
-			if n.cfg.Sec.TLS.Enable {
-				return n.tlsClientConf
-			}
-			return nil
-		}(),
+		tlsConf,
 		n.cfg.Sec.MaxFrameSize,
 		n.cfg.Sec.ReadTimeout,
 		n.cfg.Sec.WriteTimeout,

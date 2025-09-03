@@ -8,6 +8,23 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
+// hasTargetOwner reports whether target appears among owners (by Addr).
+func hasTargetOwner(owners []*nodeMeta, target string) bool {
+	for _, o := range owners {
+		if o.Addr == target {
+			return true
+		}
+	}
+	return false
+}
+
+func absExpiryAt(base time.Time, ttl time.Duration) int64 {
+	if ttl <= 0 {
+		return 0
+	}
+	return base.Add(ttl).UnixNano()
+}
+
 func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDigestResp {
 	depth := int(req.Depth)
 	if depth <= 0 || depth > 8 {
@@ -28,14 +45,7 @@ func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDige
 	for _, k := range keys {
 		// donate only keys the target should own (from donor’s view)
 		owners := n.ownersFor(k)
-		hasTarget := false
-		for _, o := range owners {
-			if o.Addr == target {
-				hasTarget = true
-				break
-			}
-		}
-		if !hasTarget {
+		if !hasTargetOwner(owners, target) {
 			continue
 		}
 
@@ -105,14 +115,7 @@ func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp
 		}
 
 		owners := n.ownersFor(k)
-		hasTarget := false
-		for _, o := range owners {
-			if o.Addr == target {
-				hasTarget = true
-				break
-			}
-		}
-		if !hasTarget || h64 <= after {
+		if !hasTargetOwner(owners, target) || h64 <= after {
 			continue
 		}
 		rows = append(rows, row{h: h64, k: k, kb: kb})
@@ -143,11 +146,7 @@ func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp
 		}
 
 		// convert remaining TTL to absolute expiry; 0 means no expiration.
-		abs := int64(0)
-		if ttl > 0 {
-			abs = now.Add(ttl).UnixNano()
-		}
-
+		abs := absExpiryAt(now, ttl)
 		items = append(items, KV{
 			K:   append([]byte(nil), r.kb...),
 			V:   append([]byte(nil), b2...),
