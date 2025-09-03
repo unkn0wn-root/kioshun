@@ -8,6 +8,7 @@ require (
 	github.com/dgraph-io/ristretto v0.1.1
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/unkn0wn-root/kioshun v0.0.3
+	github.com/redis/go-redis/v9 v9.5.2
 )
 
 require (

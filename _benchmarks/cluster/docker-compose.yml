@@ -1,0 +1,158 @@
+version: "3.9"
+
+networks:
+  mesh:
+    driver: bridge
+
+services:
+  node1:
+    build:
+      context: ../..
+      dockerfile: _benchmarks/cluster/node/Dockerfile
+    container_name: kioshun-mesh-node1
+    environment:
+      - PORT=8081
+      - CACHE_BIND=:5011
+      - CACHE_PUBLIC=node1:5011
+      - CACHE_SEEDS=node1:5011,node2:5012,node3:5013
+      - CACHE_AUTH=supersecret
+      - ALLOW_KILL=true
+      - KILL_TOKEN=letmein
+      # Optional tuning (uncomment/tune as needed)
+      # - REPLICATION_FACTOR=3
+      # - WRITE_CONCERN=2
+      - READ_MAX_FANOUT=1
+      # - READ_PER_TRY_MS=100
+      - READ_HEDGE_DELAY_MS=2
+      - READ_HEDGE_INTERVAL_MS=2
+      - WRITE_TIMEOUT_MS=2000
+      # - READ_TIMEOUT_MS=3000
+      # - SUSPICION_AFTER_MS=1500
+      - WEIGHT_UPDATE_MS=500
+      - GOSSIP_INTERVAL_MS=300
+    networks: [mesh]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/ready >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+    restart: unless-stopped
+
+  node2:
+    build:
+      context: ../..
+      dockerfile: _benchmarks/cluster/node/Dockerfile
+    container_name: kioshun-mesh-node2
+    environment:
+      - PORT=8082
+      - CACHE_BIND=:5012
+      - CACHE_PUBLIC=node2:5012
+      - CACHE_SEEDS=node1:5011,node2:5012,node3:5013
+      - CACHE_AUTH=supersecret
+      - ALLOW_KILL=true
+      - KILL_TOKEN=letmein
+      # Optional tuning (uncomment/tune as needed)
+      # - REPLICATION_FACTOR=3
+      # - WRITE_CONCERN=2
+      - READ_MAX_FANOUT=1
+      # - READ_PER_TRY_MS=100
+      - READ_HEDGE_DELAY_MS=2
+      - READ_HEDGE_INTERVAL_MS=2
+      - WRITE_TIMEOUT_MS=2000
+      # - READ_TIMEOUT_MS=3000
+      # - SUSPICION_AFTER_MS=1500
+      - WEIGHT_UPDATE_MS=500
+      - GOSSIP_INTERVAL_MS=300
+    networks: [mesh]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/ready >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+    restart: unless-stopped
+
+  node3:
+    build:
+      context: ../..
+      dockerfile: _benchmarks/cluster/node/Dockerfile
+    container_name: kioshun-mesh-node3
+    environment:
+      - PORT=8083
+      - CACHE_BIND=:5013
+      - CACHE_PUBLIC=node3:5013
+      - CACHE_SEEDS=node1:5011,node2:5012,node3:5013
+      - CACHE_AUTH=supersecret
+      - ALLOW_KILL=true
+      - KILL_TOKEN=letmein
+      # Optional tuning (uncomment/tune as needed)
+      # - REPLICATION_FACTOR=3
+      # - WRITE_CONCERN=2
+      - READ_MAX_FANOUT=1
+      # - READ_PER_TRY_MS=100
+      - READ_HEDGE_DELAY_MS=2
+      - READ_HEDGE_INTERVAL_MS=2
+      - WRITE_TIMEOUT_MS=2000
+      # - READ_TIMEOUT_MS=3000
+      # - SUSPICION_AFTER_MS=1500
+      - WEIGHT_UPDATE_MS=500
+      - GOSSIP_INTERVAL_MS=300
+    networks: [mesh]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/ready >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+    restart: unless-stopped
+
+  runner:
+    build:
+      context: ../..
+      dockerfile: _benchmarks/cluster/runner/Dockerfile
+    container_name: kioshun-mesh-runner
+    environment:
+      - TARGETS=http://node1:8081,http://node2:8082,http://node3:8083
+      - DURATION=120s
+      - CONCURRENCY=256
+      - KEYS=50000
+      - SET_RATIO=30
+      - LOG_EVERY=0
+      - STATS_EVERY=10s
+      - SET_TTL_MS=-1
+      - KILL_MODE=random # "none", "random", or "target"
+      - KILL_AFTER=45s
+      - KILL_TARGET=http://node2:8082
+      - KILL_TOKEN=letmein
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+    networks: [mesh]
+    restart: "no"
+
+  direct:
+    build:
+      context: ../..
+      dockerfile: _benchmarks/cluster/direct/Dockerfile
+    container_name: kioshun-direct-runner
+    environment:
+      - DURATION=120s
+      - CONCURRENCY=256
+      - KEYS=50000
+      - SET_RATIO=30
+      - SET_TTL_MS=-1
+      # Optional: node tuning
+      # - READ_MAX_FANOUT=1
+      # - READ_PER_TRY_MS=100
+      # - READ_HEDGE_DELAY_MS=2
+      # - READ_HEDGE_INTERVAL_MS=2
+      # - WRITE_TIMEOUT_MS=2000
+      # - SUSPICION_AFTER_MS=1500
+      # - WEIGHT_UPDATE_MS=500
+      # - GOSSIP_INTERVAL_MS=300
+      # Failure injection
+      # - KILL_AFTER=45s
+    networks: [mesh]
+    restart: "no"
