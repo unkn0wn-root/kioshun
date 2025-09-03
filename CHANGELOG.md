@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.2](https://github.com/unkn0wn-root/kioshun/compare/v0.3.1...v0.3.2) (2025-09-03)
+
+
+### Features
+
+* add cluster tests ([dd1ab76](https://github.com/unkn0wn-root/kioshun/commit/dd1ab764ef6e8d4f535e325358a2a96ce0ce8775))
+
+
+### Bug Fixes
+
+* reset peer only on fatal err; fix example api paths ([409fd08](https://github.com/unkn0wn-root/kioshun/commit/409fd08e3c46da6e526572d70963abc09e86f65f))
+
 ### [0.3.1](https://github.com/unkn0wn-root/kioshun/compare/v0.3.0...v0.3.1) (2025-09-03)
 
 
