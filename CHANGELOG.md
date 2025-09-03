@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.3](https://github.com/unkn0wn-root/kioshun/compare/v0.3.2...v0.3.3) (2025-09-03)
+
+
+### Features
+
+* added new cluster benchmarks - http via wrapper and direct - via inter claster RPC ([287cedd](https://github.com/unkn0wn-root/kioshun/commit/287cedde636154d340a05bfcc6c8c5cec304f854))
+
+
+### Bug Fixes
+
+* make eviction test more robust after admission change ([8d4a759](https://github.com/unkn0wn-root/kioshun/commit/8d4a75903ebe059b1c78a73f87563bf941362c82))
+
 ### [0.3.2](https://github.com/unkn0wn-root/kioshun/compare/v0.3.1...v0.3.2) (2025-09-03)
 
 
