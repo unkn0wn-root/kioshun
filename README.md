@@ -17,9 +17,8 @@
 
 - [Cluster (Overview)](#cluster-overview)
 - [Architecture](#architecture)
-  - [Sharded Design](#sharded-design)
-  - [Evictions Implementation](#eviction-policy-implementation)
-  - [Eviction Policy Implementation](#eviction-policy-implementation)
+  - [Design](#design)
+  - [Eviction](#eviction-policy)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -76,7 +75,7 @@ dc := cluster.NewDistributedCache[string, []byte](node)
 
 ## Architecture
 
-### Sharded Design
+### Design
 
 
 ```
@@ -117,7 +116,7 @@ dc := cluster.NewDistributedCache[string, []byte](node)
 - Shard count auto-detected based on CPU cores (default: 4× CPU cores, max 256)
 - Object pooling reduces GC pressure
 
-### Eviction Policy Implementation
+### Eviction Policy
 
 #### LRU (Least Recently Used)
 **Implementation**: Circular doubly-linked list with sentinel nodes
