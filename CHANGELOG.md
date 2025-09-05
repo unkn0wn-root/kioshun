@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.8](https://github.com/unkn0wn-root/kioshun/compare/v0.3.7...v0.3.8) (2025-09-05)
+
+
+### Features
+
+* add NotInRing to indicate that donor is not ready yet ([0fd11f5](https://github.com/unkn0wn-root/kioshun/commit/0fd11f5fd7db04edb9d15782f8063771dd25f0c3))
+
 ### [0.3.7](https://github.com/unkn0wn-root/kioshun/compare/v0.3.6...v0.3.7) (2025-09-05)
 
 
