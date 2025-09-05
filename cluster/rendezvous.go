@@ -140,7 +140,7 @@ func (r *ring) ownsHash(selfID NodeID, keyHash uint64) bool {
 	best := make([]slot, 0, top)
 	worst := 0
 
-	worse := func(a slot, b slot) bool { // a worse than b?
+	worse := func(a slot, b slot) bool {
 		if a.hi != b.hi {
 			return a.hi < b.hi
 		}
