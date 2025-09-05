@@ -5,19 +5,7 @@ import (
 	"encoding/binary"
 	"sort"
 	"time"
-
-	"github.com/cespare/xxhash/v2"
 )
-
-// hasTargetOwner reports whether target appears among owners (by Addr).
-func hasTargetOwner(owners []*nodeMeta, target string) bool {
-	for _, o := range owners {
-		if o.Addr == target {
-			return true
-		}
-	}
-	return false
-}
 
 func absExpiryAt(base time.Time, ttl time.Duration) int64 {
 	if ttl <= 0 {
@@ -35,8 +23,11 @@ func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDige
 	if depth <= 0 || depth > 8 {
 		depth = 2
 	}
-	target := req.Target
 	r := n.ring.Load().(*ring)
+	targetID, ok := r.idByAddr(req.Target)
+	if !ok {
+		return MsgBackfillDigestResp{Base: Base{T: MTBackfillDigestResp, ID: req.ID}, Depth: uint8(depth)}
+	}
 
 	type agg struct {
 		c uint32
@@ -49,22 +40,14 @@ func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDige
 
 	keys := n.local.Keys()
 	for _, k := range keys {
-		kb := n.kc.EncodeKey(k)
-
-		var h64 uint64
-		if kh, ok := any(n.kc).(KeyHasher[K]); ok {
-			h64 = kh.Hash64(k)
-		} else {
-			h64 = xxhash.Sum64(kb)
-		}
-
-		owners := r.ownersFromKeyHash(h64)
-		if !hasTargetOwner(owners, target) {
+		h64 := n.hash64Of(k)
+		if !r.ownsHash(targetID, h64) {
 			continue
 		}
 
 		var ver uint64
 		if n.cfg.LWWEnabled {
+			kb := n.kc.EncodeKey(k)
 			n.verMu.RLock()
 			ver = n.version[string(kb)]
 			n.verMu.RUnlock()
@@ -103,7 +86,12 @@ func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp
 		return MsgBackfillKeysResp{Base: Base{T: MTBackfillKeysResp, ID: req.ID}, Done: true}
 	}
 
-	target := req.Target
+	r := n.ring.Load().(*ring)
+	targetID, ok := r.idByAddr(req.Target)
+	if !ok {
+		return MsgBackfillKeysResp{Base: Base{T: MTBackfillKeysResp, ID: req.ID}, Done: true}
+	}
+
 	limit := req.Limit
 	if limit <= 0 || limit > 4096 {
 		limit = 1024
@@ -123,29 +111,20 @@ func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp
 	}
 	rows := make([]row, 0, limit*2)
 
-	r := n.ring.Load().(*ring)
 	keys := n.local.Keys()
 	for _, k := range keys {
-		kb := n.kc.EncodeKey(k)
-
-		var h64 uint64
-		if kh, ok := any(n.kc).(KeyHasher[K]); ok {
-			h64 = kh.Hash64(k)
-		} else {
-			h64 = xxhash.Sum64(kb)
-		}
+		h64 := n.hash64Of(k)
 
 		var hb [8]byte
 		binary.BigEndian.PutUint64(hb[:], h64)
-		if string(hb[:depth]) != string(prefix) {
+		if !bytes.Equal(hb[:depth], prefix) {
 			continue
 		}
 
-		owners := r.ownersFromKeyHash(h64)
-		if !hasTargetOwner(owners, target) || h64 <= after {
+		if !r.ownsHash(targetID, h64) || h64 <= after {
 			continue
 		}
-		rows = append(rows, row{h: h64, k: k, kb: kb})
+		rows = append(rows, row{h: h64, k: k, kb: n.kc.EncodeKey(k)})
 	}
 
 	// sort by key-hash to respect the cursor pagination.
@@ -191,7 +170,7 @@ func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp
 	if len(rows) > 0 {
 		var next [8]byte
 		binary.BigEndian.PutUint64(next[:], rows[len(rows)-1].h)
-		resp.NextCursor = next[:]
+		resp.NextCursor = append([]byte(nil), next[:]...)
 	}
 	return resp
 }
