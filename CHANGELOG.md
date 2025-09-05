@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.6](https://github.com/unkn0wn-root/kioshun/compare/v0.3.5...v0.3.6) (2025-09-05)
+
+
+### Features
+
+* micro opt. and fixes ([d0322de](https://github.com/unkn0wn-root/kioshun/commit/d0322de4fa3dc35f3844afa16c6474b7afc65f9f))
+
 ### [0.3.5](https://github.com/unkn0wn-root/kioshun/compare/v0.3.4...v0.3.5) (2025-09-03)
 
 ### [0.3.4](https://github.com/unkn0wn-root/kioshun/compare/v0.3.3...v0.3.4) (2025-09-03)
