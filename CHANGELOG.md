@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.10](https://github.com/unkn0wn-root/kioshun/compare/v0.3.9...v0.3.10) (2025-09-05)
+
+
+### Bug Fixes
+
+* **node:** make close idempotent ([4c183b5](https://github.com/unkn0wn-root/kioshun/commit/4c183b54db016e836074017f9f8b476594e171d3))
+
 ### [0.3.9](https://github.com/unkn0wn-root/kioshun/compare/v0.3.8...v0.3.9) (2025-09-05)
 
 
