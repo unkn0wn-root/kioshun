@@ -16,8 +16,9 @@ type MsgBackfillDigestReq struct {
 
 type MsgBackfillDigestResp struct {
 	Base
-	Depth   uint8          `cbor:"d"`
-	Buckets []BucketDigest `cbor:"b"`
+	Depth     uint8          `cbor:"d"`
+	Buckets   []BucketDigest `cbor:"b"`
+	NotInRing bool           `cbor:"nr,omitempty"`
 }
 
 type MsgBackfillKeysReq struct {
@@ -33,4 +34,5 @@ type MsgBackfillKeysResp struct {
 	Items      []KV   `cbor:"i"`
 	NextCursor []byte `cbor:"u"` // nil when done
 	Done       bool   `cbor:"o"`
+	NotInRing  bool   `cbor:"nr,omitempty"`
 }
