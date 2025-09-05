@@ -407,7 +407,9 @@ func main() {
 	if getReqs > 0 {
 		ratio = float64(aggHits) / float64(getReqs) * 100
 	}
-	fmt.Printf("Node aggregate: hits=%d miss=%d hit_ratio=%.2f%% evictions=%d expirations=%d size=%d capacity=%d\n", aggHits, aggMiss, ratio, aggEv, aggExp, aggSize, aggCap)
+	// Note: these are local cache counters summed across nodes.
+	// Remote hits show up as (miss on requester + hit on owner), so this is not a request-level hit ratio.
+	fmt.Printf("Local cache counters (sum across nodes): hits=%d miss=%d local_hit_ratio=%.2f%% evictions=%d expirations=%d size=%d capacity=%d\n", aggHits, aggMiss, ratio, aggEv, aggExp, aggSize, aggCap)
 }
 
 func fetchStats(ctx context.Context, client *http.Client, base string) (CacheStats, error) {

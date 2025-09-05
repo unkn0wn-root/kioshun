@@ -151,16 +151,6 @@ func main() {
 			return
 		}
 
-		// local fast path (for visibility of local hits)
-		if v, ok := local.Get(k); ok {
-			w.Header().Set("X-Cache", "HIT_LOCAL")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(v)
-			log.Printf("[HIT_LOCAL] k=%s sz=%d", k, len(v))
-			return
-		}
-
-		// owner-routed read via cluster
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 		v, found, err := node.Get(ctx, k)
@@ -175,10 +165,15 @@ func main() {
 			log.Printf("[MISS] k=%s", k)
 			return
 		}
-		w.Header().Set("X-Cache", "HIT_REMOTE")
+
+		src := "HIT_REMOTE"
+		if local.Exists(k) {
+			src = "HIT_LOCAL"
+		}
+		w.Header().Set("X-Cache", src)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(v)
-		log.Printf("[HIT_REMOTE] k=%s sz=%d", k, len(v))
+		log.Printf("[%s] k=%s sz=%d", src, k, len(v))
 	})
 
 	// POST /set  {k,v,ttl_ms}

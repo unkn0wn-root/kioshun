@@ -115,8 +115,8 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	resCh := make(chan ans, len(cands))
 
 	// track whether at least one leg completed cleanly (hit or miss)
-	clean := false
 	var lastErr error
+	clean := false
 	hadErr := false
 
 	startLeg := func(i int) {

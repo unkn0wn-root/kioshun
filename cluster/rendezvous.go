@@ -82,27 +82,35 @@ func (r *ring) ownersFromKeyHash(keyHash uint64) []*nodeMeta {
 // score. Used for hot-key shadowing beyond rf.
 func (r *ring) ownersTopNFromKeyHash(keyHash uint64, n int) []*nodeMeta {
 	// variant that returns the top-N candidates for hot-key shadowing.
+	// Use the same integer 128-bit ranking as ownersFromKeyHash for
+	// consistent ordering and tie-breaking.
 	type pair struct {
-		s uint64
+		s uint64 // rendezvous score
+		w uint64 // scaled weight (0..1_000_000)
 		n *nodeMeta
 	}
 
 	arr := make([]pair, 0, len(r.nodes))
 	for _, nm := range r.nodes {
-		score := mix64(keyHash ^ nm.salt)
-		arr = append(arr, pair{s: score, n: nm})
+		arr = append(arr, pair{
+			s: mix64(keyHash ^ nm.salt),
+			w: atomic.LoadUint64(&nm.weight),
+			n: nm,
+		})
 	}
 
-	sort.Slice(arr, func(i, j int) bool {
-		wi := arr[i].n.Weight()
-		wj := arr[j].n.Weight()
-		si := float64(arr[i].s) * wi
-		sj := float64(arr[j].s) * wj
-		if si == sj {
-			return arr[i].n.ID < arr[j].n.ID
+	less := func(i, j int) bool {
+		hi1, lo1 := bits.Mul64(arr[i].s, arr[i].w)
+		hi2, lo2 := bits.Mul64(arr[j].s, arr[j].w)
+		if hi1 != hi2 {
+			return hi1 > hi2
 		}
-		return si > sj
-	})
+		if lo1 != lo2 {
+			return lo1 > lo2
+		}
+		return arr[i].n.ID < arr[j].n.ID
+	}
+	sort.Slice(arr, less)
 
 	if n > len(arr) {
 		n = len(arr)

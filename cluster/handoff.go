@@ -91,9 +91,9 @@ func newHintQueue(cfg HandoffConfig) *hintQueue {
 	}
 }
 
-// removeItemLocked removes the item from whichever container it resides in and
+// removeItem removes the item from whichever container it resides in and
 // updates counters and index.
-func (q *hintQueue) removeItemLocked(hi *hintItem) {
+func (q *hintQueue) removeItem(hi *hintItem) {
 	delete(q.index, string(hi.key))
 	if hi.elem != nil {
 		q.ready.Remove(hi.elem)
@@ -140,7 +140,7 @@ func (q *hintQueue) dropOldest(avoid *hintItem) (int, int64) {
 			// do not drop the just-inserted/replaced item if it's at head
 			return false
 		}
-		q.removeItemLocked(h)
+		q.removeItem(h)
 		droppedCount++
 		droppedBytes += h.size
 		return true
@@ -150,17 +150,15 @@ func (q *hintQueue) dropOldest(avoid *hintItem) (int, int64) {
 		if q.delayed.Len() == 0 {
 			return false
 		}
-		h := q.delayed[0]
-		if h == avoid {
+		if q.delayed[0] == avoid {
 			return false
 		}
-
-		heap.Pop(&q.delayed) // remove root
-		delete(q.index, string(h.key))
+		hi := heap.Pop(&q.delayed).(*hintItem) // Pop sets hi.heapIndex = -1
+		delete(q.index, string(hi.key))
 		q.items--
-		q.bytes -= h.size
+		q.bytes -= hi.size
 		droppedCount++
-		droppedBytes += h.size
+		droppedBytes += hi.size
 		return true
 	}
 
@@ -278,7 +276,7 @@ func (q *hintQueue) enqueue(it *hintItem) (bool, int64, int) {
 				dc, db := q.dropOldest(it)
 				if dc == 0 {
 					// can't drop others; drop the just added item itself.
-					q.removeItemLocked(it)
+					q.removeItem(it)
 					delete(q.index, keyStr)
 					return false, -totalDroppedB, -totalDroppedI
 				}
@@ -287,7 +285,7 @@ func (q *hintQueue) enqueue(it *hintItem) (bool, int64, int) {
 			}
 			return true, it.size - totalDroppedB, 1 - totalDroppedI
 		default: // DropNewest/DropNone -> reject new item
-			q.removeItemLocked(it)
+			q.removeItem(it)
 			delete(q.index, keyStr)
 			return false, 0, 0
 		}
@@ -304,20 +302,20 @@ func (q *hintQueue) popReady(now int64) *hintItem {
 	// oromote due delayed items.
 	q.moveDueLocked(now)
 
-	fe := q.ready.Front()
-	if fe == nil {
-		return nil
+	// Skip expired heads and return the first valid item, if any.
+	for {
+		fe := q.ready.Front()
+		if fe == nil {
+			return nil
+		}
+		it := fe.Value.(*hintItem)
+		if it.expired(q.ttl, now) {
+			q.removeItem(it)
+			continue
+		}
+		q.removeItem(it)
+		return it
 	}
-
-	it := fe.Value.(*hintItem)
-	// skip expired items.
-	if it.expired(q.ttl, now) {
-		q.removeItemLocked(it)
-		return nil
-	}
-
-	q.removeItemLocked(it)
-	return it
 }
 
 // requeue puts a failed item back respecting backoff.
@@ -392,12 +390,15 @@ func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver 
 	}
 	q := h.queue(addr)
 	ok, byDelta, itDelta := q.enqueue(it)
+	if byDelta != 0 || itDelta != 0 {
+		h.totalItems.Add(int64(itDelta))
+		h.totalBytes.Add(byDelta)
+	}
 	if !ok {
 		return
 	}
-
-	newItems := h.totalItems.Add(int64(itDelta))
-	newBytes := h.totalBytes.Add(byDelta)
+	newItems := h.totalItems.Load()
+	newBytes := h.totalBytes.Load()
 	if (h.cfg.AutopauseItems > 0 && int(newItems) >= h.cfg.AutopauseItems) ||
 		(h.cfg.AutopauseBytes > 0 && newBytes >= h.cfg.AutopauseBytes) {
 		h.paused.Store(true)
@@ -428,11 +429,15 @@ func (h *handoff[K, V]) enqueueDel(addr string, key []byte, ver uint64) {
 	}
 	q := h.queue(addr)
 	ok, byDelta, itDelta := q.enqueue(it)
+	if byDelta != 0 || itDelta != 0 {
+		h.totalItems.Add(int64(itDelta))
+		h.totalBytes.Add(byDelta)
+	}
 	if !ok {
 		return
 	}
-	newItems := h.totalItems.Add(int64(itDelta))
-	newBytes := h.totalBytes.Add(byDelta)
+	newItems := h.totalItems.Load()
+	newBytes := h.totalBytes.Load()
 	if (h.cfg.AutopauseItems > 0 && int(newItems) >= h.cfg.AutopauseItems) ||
 		(h.cfg.AutopauseBytes > 0 && newBytes >= h.cfg.AutopauseBytes) {
 		h.paused.Store(true)
