@@ -55,6 +55,7 @@ type Node[K comparable, V any] struct {
 	kc            KeyCodec[K]
 	codec         Codec[V]
 	local         *cache.InMemoryCache[K, V]
+	ln            net.Listener
 	Loader        func(context.Context, K) (V, time.Duration, error)
 	leaseLimiter  *rateLimiter
 	leases        *leaseTable
@@ -129,6 +130,7 @@ func (n *Node[K, V]) Start() error {
 	if err != nil {
 		return err
 	}
+	n.ln = ln
 	go n.acceptLoop(ln)
 
 	// Ensure self is present in membership so the ring includes this node
@@ -155,6 +157,9 @@ func (n *Node[K, V]) Start() error {
 // and closes all peer connections. It is idempotent.
 func (n *Node[K, V]) Stop() {
 	close(n.stop)
+	if n.ln != nil {
+		_ = n.ln.Close()
+	}
 	if n.leaseLimiter != nil {
 		n.leaseLimiter.Stop()
 	}

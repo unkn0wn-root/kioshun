@@ -67,12 +67,8 @@ func absExpiry(ttl time.Duration) int64 {
 func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	var zero V
 
-	// local
 	bk := n.kc.EncodeKey(key)
 	defer n.heat.sample(bk)
-	if v, ok := n.local.Get(key); ok {
-		return v, true, nil
-	}
 
 	// route by exact RF owners from the ring
 	h64 := n.hash64Of(key)
@@ -80,6 +76,11 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	owners := r.ownersFromKeyHash(h64)
 	if len(owners) == 0 {
 		return zero, false, ErrNoOwner
+	}
+	if owners[0].Addr == n.cfg.PublicURL {
+		if v, ok := n.local.Get(key); ok {
+			return v, true, nil
+		}
 	}
 
 	fast, slow := make([]*nodeMeta, 0, len(owners)), make([]*nodeMeta, 0, len(owners))
