@@ -298,7 +298,8 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 		ttl = c.config.DefaultTTL
 	}
 
-	shard := c.getShard(key)
+	kh := c.hasher.hash(key)
+	shard := c.shardByHash(kh)
 	now := time.Now().UnixNano()
 
 	var expireTime int64
@@ -335,7 +336,7 @@ func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
 			// Sample → admission → eviction; admission may reject without evicting.
 			if !admissionEvictor.evictWithAdmission(
 				shard, &c.itemPool, c.config.StatsEnabled,
-				shard.admission, c.hasher.hash(key),
+				shard.admission, kh,
 			) {
 				return nil
 			}
@@ -594,4 +595,9 @@ func (c *InMemoryCache[K, V]) cleanup() {
 	for _, shard := range c.shards {
 		shard.cleanup(now, c.config.EvictionPolicy, &c.itemPool, c.config.StatsEnabled)
 	}
+}
+
+// shardByHash maps a precomputed hash → shard (saves rehash in hot paths).
+func (c *InMemoryCache[K, V]) shardByHash(hash uint64) *shard[K, V] {
+	return c.shards[hash&c.shardMask]
 }

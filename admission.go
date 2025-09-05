@@ -2,7 +2,6 @@ package cache
 
 import (
 	"math/bits"
-	"sync/atomic"
 	"time"
 
 	"github.com/unkn0wn-root/kioshun/internal/mathutil"
@@ -175,7 +174,8 @@ func (fbf *frequencyBloomFilter) increment(keyHash uint64) uint64 {
 		f++
 	}
 
-	if atomic.AddUint64(&fbf.totalIncrements, 1) >= fbf.agingThreshold {
+	fbf.totalIncrements++
+	if fbf.totalIncrements >= fbf.agingThreshold {
 		fbf.age()
 	}
 	return f
@@ -216,17 +216,12 @@ func (fbf *frequencyBloomFilter) incrementCounter(index uint64) {
 	ci := index % 16
 	sh := ci * 4
 
-	for {
-		cur := atomic.LoadUint64(&fbf.counters[ai])
-		v := (cur >> sh) & frequencyMask
-		if v >= maxFrequency {
-			return
-		}
-		nv := cur + (1 << sh)
-		if atomic.CompareAndSwapUint64(&fbf.counters[ai], cur, nv) {
-			return
-		}
+	cur := fbf.counters[ai]
+	v := (cur >> sh) & frequencyMask
+	if v < maxFrequency {
+		fbf.counters[ai] = cur + (1 << sh)
 	}
+
 }
 
 // age halves every 4-bit counter in-place:
@@ -234,15 +229,10 @@ func (fbf *frequencyBloomFilter) incrementCounter(index uint64) {
 func (fbf *frequencyBloomFilter) age() {
 	const halfMask uint64 = 0x7777777777777777
 	for i := range fbf.counters {
-		for {
-			cur := atomic.LoadUint64(&fbf.counters[i])
-			aged := (cur >> 1) & halfMask
-			if atomic.CompareAndSwapUint64(&fbf.counters[i], cur, aged) {
-				break
-			}
-		}
+		cur := fbf.counters[i]
+		fbf.counters[i] = (cur >> 1) & halfMask
 	}
-	atomic.StoreUint64(&fbf.totalIncrements, 0)
+	fbf.totalIncrements = 0
 }
 
 // workloadDetector tracks admissions/sec (windowed) and consecutive misses
@@ -265,29 +255,26 @@ func newWorkloadDetector() *workloadDetector {
 // and returns true if rate or miss streak is high.
 func (wd *workloadDetector) detectScan(keyHash uint64) bool {
 	now := time.Now().UnixNano()
-	dt := now - atomic.LoadInt64(&wd.recentAdmissionTime)
+	dt := now - wd.recentAdmissionTime
 	if dt > 1e9 {
-		adm := atomic.LoadUint64(&wd.recentAdmissions)
-		if dt > 0 {
-			r := adm * 1e9 / uint64(dt)
-			atomic.StoreUint64(&wd.admissionRate, r)
-		}
-		atomic.StoreUint64(&wd.recentAdmissions, 0)
-		atomic.StoreInt64(&wd.recentAdmissionTime, now)
+		adm := wd.recentAdmissions
+		r := adm * 1e9 / uint64(dt)
+		wd.admissionRate = r
+		wd.recentAdmissions = 0
+		wd.recentAdmissionTime = now
 	}
-	return atomic.LoadUint64(&wd.admissionRate) > scanAdmissionThreshold ||
-		atomic.LoadUint64(&wd.consecutiveMisses) > scanMissThreshold
+	return wd.admissionRate > scanAdmissionThreshold || wd.consecutiveMisses > scanMissThreshold
 }
 
 // recordAdmission bumps the windowed admissions count and resets the miss streak.
 func (wd *workloadDetector) recordAdmission() {
-	atomic.AddUint64(&wd.recentAdmissions, 1)
-	atomic.StoreUint64(&wd.consecutiveMisses, 0)
+	wd.recentAdmissions++
+	wd.consecutiveMisses = 0
 }
 
 // recordRejection increases the consecutive miss streak (used by detectScan()).
 func (wd *workloadDetector) recordRejection() {
-	atomic.AddUint64(&wd.consecutiveMisses, 1)
+	wd.consecutiveMisses++
 }
 
 // adaptiveAdmissionFilter coordinates doorkeeper, CMS, scan mode, and eviction-pressure feedback.
@@ -324,25 +311,25 @@ func newAdaptiveAdmissionFilter(n uint64, ri time.Duration) *adaptiveAdmissionFi
 
 // shouldAdmit decides whether to admit a candidate at capacity using doorkeeper, scan mode, freq/recency, and probability.
 func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, vFreq uint64, vAge int64) bool {
-	atomic.AddUint64(&aaf.admissionRequests, 1)
+	aaf.admissionRequests++
 
 	// Fast path: seen recently → refresh doorkeeper, sync sketch, admit.
 	if aaf.doorkeeper.contains(keyHash) {
 		aaf.doorkeeper.add(keyHash)
 		_ = aaf.frequencyFilter.increment(keyHash)
 		aaf.detector.recordAdmission()
-		atomic.AddUint64(&aaf.admissionGrants, 1)
+		aaf.admissionGrants++
 		return true
 	}
 
 	// Scan mode prefers recency.
 	scan := aaf.detector.detectScan(keyHash)
 	if scan {
-		atomic.AddUint64(&aaf.scanRejections, 1)
+		aaf.scanRejections++
 		admit := aaf.admitDuringScan(keyHash, vAge)
 		if admit {
 			aaf.detector.recordAdmission()
-			atomic.AddUint64(&aaf.admissionGrants, 1)
+			aaf.admissionGrants++
 		} else {
 			aaf.detector.recordRejection()
 		}
@@ -358,7 +345,7 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, vFreq uint64, vA
 
 	if admit {
 		aaf.detector.recordAdmission()
-		atomic.AddUint64(&aaf.admissionGrants, 1)
+		aaf.admissionGrants++
 	} else {
 		aaf.detector.recordRejection()
 	}
@@ -393,7 +380,7 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, nf, vFreq uin
 		return acceptWithProb(keyHash, 50)
 	}
 
-	prob := atomic.LoadUint32(&aaf.admissionProbability)
+	prob := aaf.admissionProbability
 
 	vf := vFreq
 	if vf > 5 {
@@ -410,12 +397,11 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, nf, vFreq uin
 // adjustAdmissionProbability nudges the global probability once per interval based on recent evictions.
 func (aaf *adaptiveAdmissionFilter) adjustAdmissionProbability() {
 	now := time.Now().UnixNano()
-	win := atomic.LoadInt64(&aaf.evictionWindow)
+	win := aaf.evictionWindow
 
 	if now-win > evictionPressureInterval {
-		ev := atomic.LoadUint64(&aaf.recentEvictions)
-		p := atomic.LoadUint32(&aaf.admissionProbability)
-
+		ev := aaf.recentEvictions
+		p := aaf.admissionProbability
 		if ev > highEvictionRateThreshold {
 			np := p
 			if np > admissionProbabilityStep {
@@ -424,17 +410,17 @@ func (aaf *adaptiveAdmissionFilter) adjustAdmissionProbability() {
 			if np < aaf.minProbability {
 				np = aaf.minProbability
 			}
-			atomic.StoreUint32(&aaf.admissionProbability, np)
+			aaf.admissionProbability = np
 		} else if ev < lowEvictionRateThreshold {
 			np := p + admissionProbabilityStep
 			if np > aaf.maxProbability {
 				np = aaf.maxProbability
 			}
-			atomic.StoreUint32(&aaf.admissionProbability, np)
+			aaf.admissionProbability = np
 		}
 
-		atomic.StoreUint64(&aaf.recentEvictions, 0)
-		atomic.StoreInt64(&aaf.evictionWindow, now)
+		aaf.recentEvictions = 0
+		aaf.evictionWindow = now
 	}
 }
 
@@ -449,7 +435,7 @@ func (aaf *adaptiveAdmissionFilter) checkPeriodicReset() {
 
 // RecordEviction feeds back pressure after an eviction.
 func (aaf *adaptiveAdmissionFilter) RecordEviction() {
-	atomic.AddUint64(&aaf.recentEvictions, 1)
+	aaf.recentEvictions++
 }
 
 // GetFrequencyEstimate exposes the current CMS estimate for a key hash (telemetry/debug).
@@ -459,10 +445,10 @@ func (aaf *adaptiveAdmissionFilter) GetFrequencyEstimate(keyHash uint64) uint64 
 
 // GetStats returns approximate counters and current probability (atomics; may be slightly stale).
 func (aaf *adaptiveAdmissionFilter) GetStats() (reqs, grants, scanRej uint64, rate float64, prob uint32) {
-	reqs = atomic.LoadUint64(&aaf.admissionRequests)
-	grants = atomic.LoadUint64(&aaf.admissionGrants)
-	scanRej = atomic.LoadUint64(&aaf.scanRejections)
-	prob = atomic.LoadUint32(&aaf.admissionProbability)
+	reqs = aaf.admissionRequests
+	grants = aaf.admissionGrants
+	scanRej = aaf.scanRejections
+	prob = aaf.admissionProbability
 
 	if reqs > 0 {
 		rate = float64(grants) / float64(reqs)
