@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.7](https://github.com/unkn0wn-root/kioshun/compare/v0.3.6...v0.3.7) (2025-09-05)
+
+
+### Bug Fixes
+
+* **node:** add itself to ring ([cc96554](https://github.com/unkn0wn-root/kioshun/commit/cc965545264e6be40e99720a037fd283710344f3))
+
 ### [0.3.6](https://github.com/unkn0wn-root/kioshun/compare/v0.3.5...v0.3.6) (2025-09-05)
 
 
