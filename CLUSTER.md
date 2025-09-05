@@ -166,4 +166,5 @@ Donor  → Joiner: Items [{K, V, E, Ver, Cp}] + next cursor
 - RF ≥ 3, WC ≥ 2 for balanced durability and freshness.
 - Handoff: set per‑peer caps and RPS to sustainable values. TTL high enough to cover expected downtimes.
 - Backfill: adjust depth for dataset size. Rune page size to donor capacity.
+ - Backfill: adjust depth for dataset size. Tune page size to donor capacity.
 - Timeouts: read/write/idle tuned to network characteristics; inflight caps per peer.

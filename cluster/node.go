@@ -131,6 +131,10 @@ func (n *Node[K, V]) Start() error {
 	}
 	go n.acceptLoop(ln)
 
+	// Ensure self is present in membership so the ring includes this node
+	// for owner selection and local primaries.
+	n.mem.ensure(NodeID(n.cfg.PublicURL), n.cfg.PublicURL)
+
 	// proactively connect to seeds to accelerate gossip and ring formation.
 	for _, s := range n.cfg.Seeds {
 		if s != n.cfg.PublicURL {
