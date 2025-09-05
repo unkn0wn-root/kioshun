@@ -76,6 +76,7 @@ type Node[K comparable, V any] struct {
 	handshakeGate chan struct{}
 	clock         *hlc
 	stop          chan struct{}
+	stopOnce      sync.Once
 }
 
 // NewNode constructs an unstarted cluster Node with the provided configuration,
@@ -156,20 +157,22 @@ func (n *Node[K, V]) Start() error {
 // Stop shuts down background loops, rate limiters, leases, hinted handoff,
 // and closes all peer connections. It is idempotent.
 func (n *Node[K, V]) Stop() {
-	close(n.stop)
-	if n.ln != nil {
-		_ = n.ln.Close()
-	}
-	if n.leaseLimiter != nil {
-		n.leaseLimiter.Stop()
-	}
-	if n.leases != nil {
-		n.leases.Stop()
-	}
-	if n.hh != nil {
-		n.hh.Stop()
-	}
-	n.closePeers()
+	n.stopOnce.Do(func() {
+		close(n.stop)
+		if n.ln != nil {
+			_ = n.ln.Close()
+		}
+		if n.leaseLimiter != nil {
+			n.leaseLimiter.Stop()
+		}
+		if n.leases != nil {
+			n.leases.Stop()
+		}
+		if n.hh != nil {
+			n.hh.Stop()
+		}
+		n.closePeers()
+	})
 }
 
 // initTLS configures server and client TLS based on security settings,
