@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.9](https://github.com/unkn0wn-root/kioshun/compare/v0.3.8...v0.3.9) (2025-09-05)
+
+
+### Features
+
+* **admission:** drop atomics since we hold lock in cache ([1667b84](https://github.com/unkn0wn-root/kioshun/commit/1667b8492a7102ff7d434e2032e9963a3b51dc9e))
+* **client:** if local is primary and key exists, serve locally ([6adb9e2](https://github.com/unkn0wn-root/kioshun/commit/6adb9e2f74ddc5de4b2f08056fb2eef8ab2a20ca))
+
 ### [0.3.8](https://github.com/unkn0wn-root/kioshun/compare/v0.3.7...v0.3.8) (2025-09-05)
 
 
