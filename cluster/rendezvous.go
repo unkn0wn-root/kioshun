@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"math/bits"
 	"sort"
 	"sync/atomic"
 
@@ -39,30 +40,37 @@ func newRing(rf int) *ring { return &ring{rf: rf} }
 // ownersFromKeyHash returns the top rf owners for a 64-bit key hash using
 // weighted rendezvous hashing. Node salt keeps per-node independence.
 func (r *ring) ownersFromKeyHash(keyHash uint64) []*nodeMeta {
-	// compute rendezvous scores per node using a per-node salt and mix64.
-	// weighted ordering is achieved by scaling scores by node weight.
 	type pair struct {
-		s uint64
+		s uint64 // rendezvous score
+		w uint64 // scaled weight (0..1_000_000)
 		n *nodeMeta
 	}
-
 	arr := make([]pair, 0, len(r.nodes))
 	for _, nm := range r.nodes {
-		score := mix64(keyHash ^ nm.salt)
-		arr = append(arr, pair{s: score, n: nm})
+		arr = append(arr, pair{
+			s: mix64(keyHash ^ nm.salt),
+			w: atomic.LoadUint64(&nm.weight), // snapshot once
+			n: nm,
+		})
 	}
 
-	sort.Slice(arr, func(i, j int) bool {
-		wi := arr[i].n.Weight()
-		wj := arr[j].n.Weight()
-		return float64(arr[i].s)*wi > float64(arr[j].s)*wj
-	})
+	less := func(i, j int) bool {
+		hi1, lo1 := bits.Mul64(arr[i].s, arr[i].w)
+		hi2, lo2 := bits.Mul64(arr[j].s, arr[j].w)
+		if hi1 != hi2 {
+			return hi1 > hi2 // higher product first
+		}
+		if lo1 != lo2 {
+			return lo1 > lo2
+		}
+		return arr[i].n.ID < arr[j].n.ID // tie-break
+	}
+	sort.Slice(arr, less)
 
 	n := r.rf
 	if n > len(arr) {
 		n = len(arr)
 	}
-
 	out := make([]*nodeMeta, n)
 	for i := 0; i < n; i++ {
 		out[i] = arr[i].n
@@ -74,22 +82,35 @@ func (r *ring) ownersFromKeyHash(keyHash uint64) []*nodeMeta {
 // score. Used for hot-key shadowing beyond rf.
 func (r *ring) ownersTopNFromKeyHash(keyHash uint64, n int) []*nodeMeta {
 	// variant that returns the top-N candidates for hot-key shadowing.
+	// Use the same integer 128-bit ranking as ownersFromKeyHash for
+	// consistent ordering and tie-breaking.
 	type pair struct {
-		s uint64
+		s uint64 // rendezvous score
+		w uint64 // scaled weight (0..1_000_000)
 		n *nodeMeta
 	}
 
 	arr := make([]pair, 0, len(r.nodes))
 	for _, nm := range r.nodes {
-		score := mix64(keyHash ^ nm.salt)
-		arr = append(arr, pair{s: score, n: nm})
+		arr = append(arr, pair{
+			s: mix64(keyHash ^ nm.salt),
+			w: atomic.LoadUint64(&nm.weight),
+			n: nm,
+		})
 	}
 
-	sort.Slice(arr, func(i, j int) bool {
-		wi := arr[i].n.Weight()
-		wj := arr[j].n.Weight()
-		return float64(arr[i].s)*wi > float64(arr[j].s)*wj
-	})
+	less := func(i, j int) bool {
+		hi1, lo1 := bits.Mul64(arr[i].s, arr[i].w)
+		hi2, lo2 := bits.Mul64(arr[j].s, arr[j].w)
+		if hi1 != hi2 {
+			return hi1 > hi2
+		}
+		if lo1 != lo2 {
+			return lo1 > lo2
+		}
+		return arr[i].n.ID < arr[j].n.ID
+	}
+	sort.Slice(arr, less)
 
 	if n > len(arr) {
 		n = len(arr)
@@ -100,6 +121,66 @@ func (r *ring) ownersTopNFromKeyHash(keyHash uint64, n int) []*nodeMeta {
 		out[i] = arr[i].n
 	}
 	return out
+}
+
+// ownsHash reports whether selfID is among the top-rf owners for keyHash.
+func (r *ring) ownsHash(selfID NodeID, keyHash uint64) bool {
+	if len(r.nodes) == 0 || r.rf <= 0 {
+		return false
+	}
+	top := r.rf
+	if top > len(r.nodes) {
+		top = len(r.nodes)
+	}
+
+	type slot struct {
+		hi, lo uint64 // 128-bit product of (score * weight)
+		n      *nodeMeta
+	}
+	best := make([]slot, 0, top)
+	worst := 0
+
+	worse := func(a slot, b slot) bool {
+		if a.hi != b.hi {
+			return a.hi < b.hi
+		}
+		if a.lo != b.lo {
+			return a.lo < b.lo
+		}
+		return a.n.ID > b.n.ID
+	}
+
+	for _, nm := range r.nodes {
+		s := mix64(keyHash ^ nm.salt)
+		w := atomic.LoadUint64(&nm.weight)
+		hi, lo := bits.Mul64(s, w)
+
+		if len(best) < top {
+			best = append(best, slot{hi: hi, lo: lo, n: nm})
+			if len(best) == 1 || worse(best[len(best)-1], best[worst]) {
+				worst = len(best) - 1
+			}
+			continue
+		}
+
+		if !worse(slot{hi, lo, nm}, best[worst]) {
+			best[worst] = slot{hi: hi, lo: lo, n: nm}
+			// recompute worst
+			worst = 0
+			for i := 1; i < len(best); i++ {
+				if worse(best[i], best[worst]) {
+					worst = i
+				}
+			}
+		}
+	}
+
+	for _, sl := range best {
+		if sl.n.ID == selfID {
+			return true
+		}
+	}
+	return false
 }
 
 // mix64: fast 64-bit mixer (SplitMix64 finalizer).

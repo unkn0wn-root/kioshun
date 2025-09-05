@@ -57,15 +57,18 @@ func (n *Node[K, V]) rebalanceOnce() {
 			continue
 		}
 
-		bv, err := n.codec.Encode(v)
+		// Encode + (maybe) compress once.
+		vb, err := n.codec.Encode(v)
 		if err != nil {
 			continue
 		}
+		vb, cp := n.maybeCompress(vb)
 
 		bk := n.kc.EncodeKey(k)
 		exp := absExpiry(ttl)
-		p := n.getPeer(primary.Addr)
-		if p == nil {
+		pc := n.getPeer(primary.Addr)
+		if pc == nil || pc.penalized() {
+			// Let next pass try again; we keep local until success.
 			continue
 		}
 
@@ -77,18 +80,26 @@ func (n *Node[K, V]) rebalanceOnce() {
 				ID: id,
 			},
 			Key: bk,
-			Val: bv,
+			Val: vb,
 			Exp: exp,
 			Ver: ver,
+			Cp:  cp,
 		}
 
-		raw, err := p.request(msg, id, 2*time.Second)
+		raw, err := pc.request(msg, id, n.cfg.Sec.WriteTimeout)
 		if err != nil {
+			if isFatalTransport(err) {
+				n.resetPeer(primary.Addr)
+			}
 			continue
 		}
 
 		var resp MsgSetResp
-		if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
+		if e := cbor.Unmarshal(raw, &resp); e != nil {
+			n.resetPeer(primary.Addr)
+			continue
+		}
+		if !resp.OK {
 			continue
 		}
 		n.local.Delete(k)

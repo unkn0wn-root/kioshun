@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"encoding/binary"
 	"sort"
 	"time"
@@ -35,26 +36,32 @@ func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDige
 		depth = 2
 	}
 	target := req.Target
+	r := n.ring.Load().(*ring)
 
 	type agg struct {
 		c uint32
 		h uint64
 	}
 
-	// Aggregate per-bucket count and XOR(hash^version) to cheaply detect
+	// Aggregate per-bucket count and XOR(hash^version) to detect
 	// differences between donor and joiner without shipping all keys.
 	buckets := make(map[string]agg, 1<<12)
 
 	keys := n.local.Keys()
 	for _, k := range keys {
-		// donate only keys the target should own (from donor’s view)
-		owners := n.ownersFor(k)
+		kb := n.kc.EncodeKey(k)
+
+		var h64 uint64
+		if kh, ok := any(n.kc).(KeyHasher[K]); ok {
+			h64 = kh.Hash64(k)
+		} else {
+			h64 = xxhash.Sum64(kb)
+		}
+
+		owners := r.ownersFromKeyHash(h64)
 		if !hasTargetOwner(owners, target) {
 			continue
 		}
-
-		kb := n.kc.EncodeKey(k)
-		h64 := xxhash.Sum64(kb)
 
 		var ver uint64
 		if n.cfg.LWWEnabled {
@@ -77,8 +84,12 @@ func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDige
 	for p, a := range buckets {
 		out = append(out, BucketDigest{Prefix: []byte(p), Count: a.c, Hash64: a.h})
 	}
-	sort.Slice(out, func(i, j int) bool { return string(out[i].Prefix) < string(out[j].Prefix) })
-	return MsgBackfillDigestResp{Base: Base{T: MTBackfillDigestResp, ID: req.ID}, Depth: uint8(depth), Buckets: out}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Prefix, out[j].Prefix) < 0 })
+	return MsgBackfillDigestResp{
+		Base:    Base{T: MTBackfillDigestResp, ID: req.ID},
+		Depth:   uint8(depth),
+		Buckets: out,
+	}
 }
 
 // rpcBackfillKeys returns the next page of keys within a given hash-prefix
@@ -112,17 +123,25 @@ func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp
 	}
 	rows := make([]row, 0, limit*2)
 
+	r := n.ring.Load().(*ring)
 	keys := n.local.Keys()
 	for _, k := range keys {
 		kb := n.kc.EncodeKey(k)
-		h64 := xxhash.Sum64(kb)
+
+		var h64 uint64
+		if kh, ok := any(n.kc).(KeyHasher[K]); ok {
+			h64 = kh.Hash64(k)
+		} else {
+			h64 = xxhash.Sum64(kb)
+		}
+
 		var hb [8]byte
 		binary.BigEndian.PutUint64(hb[:], h64)
 		if string(hb[:depth]) != string(prefix) {
 			continue
 		}
 
-		owners := n.ownersFor(k)
+		owners := r.ownersFromKeyHash(h64)
 		if !hasTargetOwner(owners, target) || h64 <= after {
 			continue
 		}
@@ -153,7 +172,7 @@ func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp
 			n.verMu.RUnlock()
 		}
 
-		// convert remaining TTL to absolute expiry; 0 means no expiration.
+		// 0 means no expiration.
 		abs := absExpiryAt(now, ttl)
 		items = append(items, KV{
 			K:   append([]byte(nil), r.kb...),

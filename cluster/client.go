@@ -63,21 +63,21 @@ func absExpiry(ttl time.Duration) int64 {
 	return time.Now().Add(ttl).UnixNano()
 }
 
-// Get: read-only, owner-routed read.
-// - If present locally, returns immediately.
-// - On miss: routes to the primary owner (with optional hedging) and decodes the response.
-// - No side effects: does NOT write, replicate, or repair on a miss.
-// - Use when you do not want population on miss (you have separate writers or are fine returning not-found).
+// Get is an owner-routed read with optional hedging.
 func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	var zero V
-	owners := n.ownersFor(key)
-	bk := n.kc.EncodeKey(key)
 
+	// local
+	bk := n.kc.EncodeKey(key)
 	defer n.heat.sample(bk)
 	if v, ok := n.local.Get(key); ok {
 		return v, true, nil
 	}
 
+	// route by exact RF owners from the ring
+	h64 := n.hash64Of(key)
+	r := n.ring.Load().(*ring)
+	owners := r.ownersFromKeyHash(h64)
 	if len(owners) == 0 {
 		return zero, false, ErrNoOwner
 	}
@@ -95,6 +95,7 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	}
 	cands := append(fast, slow...)
 	if len(cands) == 0 {
+		// No remote legs to try (we're the only owner and local miss) -> miss.
 		return zero, false, nil
 	}
 
@@ -113,8 +114,14 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	}
 	resCh := make(chan ans, len(cands))
 
+	// track whether at least one leg completed cleanly (hit or miss)
+	var lastErr error
+	clean := false
+	hadErr := false
+
 	startLeg := func(i int) {
-		pc := n.getPeer(cands[i].Addr)
+		addr := cands[i].Addr
+		pc := n.getPeer(addr)
 		if pc == nil {
 			resCh <- ans{err: ErrBadPeer}
 			return
@@ -125,31 +132,37 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		raw, err := pc.request(msg, id, ptr)
 		if err != nil {
 			if isFatalTransport(err) {
-				n.resetPeer(cands[i].Addr) // next getPeer() will redial
+				n.resetPeer(addr) // next getPeer() will redial
 			}
 			resCh <- ans{err: err}
 			return
 		}
 
-		var r MsgGetResp
-		if e := cbor.Unmarshal(raw, &r); e != nil {
+		var rmsg MsgGetResp
+		if e := cbor.Unmarshal(raw, &rmsg); e != nil {
+			// Broken stream -> reset peer
+			n.resetPeer(addr)
 			resCh <- ans{err: e}
 			return
 		}
 
-		if r.Err != "" && r.Err != ErrNotFound {
-			resCh <- ans{err: errors.New(r.Err)}
+		// Be tolerant and treat "ErrNotFound" as a clean miss.
+		if rmsg.Err != "" {
+			if rmsg.Err == ErrNotFound {
+				resCh <- ans{}
+				return
+			}
+			resCh <- ans{err: errors.New(rmsg.Err)}
 			return
 		}
-		if r.Err == ErrNotFound || !r.Found {
-			resCh <- ans{} // miss: no hit, no error
+		if !rmsg.Found {
+			resCh <- ans{}
 			return
 		}
-
-		resCh <- ans{hit: true, val: r.Val, cp: r.Cp}
+		resCh <- ans{hit: true, val: rmsg.Val, cp: rmsg.Cp}
 	}
 
-	// start first leg immediately, then stagger more
+	// Start first leg, then hedge
 	nextIdx := 0
 	inflight := 0
 	startLeg(nextIdx)
@@ -165,10 +178,17 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		case <-ctx.Done():
 			return zero, false, ctx.Err()
 
-		case r := <-resCh:
+		case rans := <-resCh:
 			inflight--
-			if r.hit {
-				vb, err := n.maybeDecompress(r.val, r.cp)
+			if rans.err != nil {
+				lastErr = rans.err
+				hadErr = true
+			} else {
+				clean = true // either a hit or a clean miss
+			}
+
+			if rans.hit {
+				vb, err := n.maybeDecompress(rans.val, rans.cp)
 				if err != nil {
 					return zero, false, err
 				}
@@ -179,17 +199,21 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 				return v, true, nil
 			}
 
-			// keep pipeline filled up to maxFanout
+			// Keep pipeline filled up to maxFanout
 			if nextIdx < len(cands) && inflight < maxFanout {
 				startLeg(nextIdx)
 				nextIdx++
 				inflight++
 			} else if inflight == 0 && nextIdx >= len(cands) {
-				return zero, false, nil
+				// All legs finished
+				if !clean && hadErr {
+					return zero, false, lastErr // every leg errored
+				}
+				return zero, false, nil // miss
 			}
 
 		case <-initial.C:
-			// after first delay, start more up to maxFanout, spaced by hedge interval
+			// After first delay, start more up to maxFanout, spaced by hedge interval
 			for inflight < maxFanout && nextIdx < len(cands) {
 				startLeg(nextIdx)
 				nextIdx++
@@ -210,17 +234,17 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	}
 }
 
-// Set encodes and writes the value for key with TTL, assigning a new HLC
-// version and replicating to the owner set. If the local node is primary,
-// it commits locally first for a fast-path and then replicates. Write concern
-// is enforced by the replicator; on peer failures hinted handoff is enqueued.
+// Set writes the value with TTL, assigning a new HLC version and replicating.
 func (n *Node[K, V]) Set(ctx context.Context, key K, val V, ttl time.Duration) error {
 	bk := n.kc.EncodeKey(key)
 	if n.cfg.Sec.MaxKeySize > 0 && len(bk) > n.cfg.Sec.MaxKeySize {
 		return errors.New("key too large")
 	}
 
-	owners := n.ownersFor(key)
+	// Route by exact RF owners
+	h64 := n.hash64Of(key)
+	r := n.ring.Load().(*ring)
+	owners := r.ownersFromKeyHash(h64)
 	if len(owners) == 0 {
 		return ErrNoOwner
 	}
@@ -229,17 +253,13 @@ func (n *Node[K, V]) Set(ctx context.Context, key K, val V, ttl time.Duration) e
 	if err != nil {
 		return err
 	}
-
 	if n.cfg.Sec.MaxValueSize > 0 && len(bv) > n.cfg.Sec.MaxValueSize {
 		return errors.New("value too large")
 	}
 
-	exp := int64(0)
-	if ttl > 0 {
-		exp = time.Now().Add(ttl).UnixNano()
-	}
-
+	exp := absExpiry(ttl)
 	ver := n.clock.Next()
+
 	if owners[0].Addr == n.cfg.PublicURL {
 		_ = n.local.Set(key, val, ttl)
 		if n.cfg.LWWEnabled {
@@ -249,15 +269,17 @@ func (n *Node[K, V]) Set(ctx context.Context, key K, val V, ttl time.Duration) e
 	return n.repl.replicateSet(ctx, bk, bv, exp, ver, owners)
 }
 
-// Delete removes key cluster-wide by assigning a tombstone version and
-// replicating the delete to owners. Locally deletes immediately when primary.
+// Delete removes key cluster-wide by assigning a tombstone version.
 func (n *Node[K, V]) Delete(ctx context.Context, key K) error {
 	bk := n.kc.EncodeKey(key)
 	if n.cfg.Sec.MaxKeySize > 0 && len(bk) > n.cfg.Sec.MaxKeySize {
 		return errors.New("key too large")
 	}
 
-	owners := n.ownersFor(key)
+	// Route by exact RF owners
+	h64 := n.hash64Of(key)
+	r := n.ring.Load().(*ring)
+	owners := r.ownersFromKeyHash(h64)
 	if len(owners) == 0 {
 		return ErrNoOwner
 	}
@@ -272,22 +294,17 @@ func (n *Node[K, V]) Delete(ctx context.Context, key K) error {
 	return n.repl.replicateDelete(ctx, bk, owners, ver)
 }
 
-// GetOrLoad: read-through with stampede protection and replication.
-// - If present locally, returns immediately.
-// - Otherwise, coordinates a single load on the primary owner via a lease:
-//   - If THIS node is primary, runs the provided loader, Set locally, and replicates to RF owners.
-//   - If a REMOTE node is primary, sends LeaseLoad. The remote primary runs its node.Loader
-//     (not the loader passed here), Set locally there, and replicates.
-//
-// - Prevents thundering herd: concurrent callers wait on the lease, so only one load+replicate happens.
-// - Use when you want population on miss and cluster-wide propagation with TTL.
+// GetOrLoad is read-through with stampede protection and replication.
 func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.Context) (V, time.Duration, error)) (V, error) {
 	var zero V
 	if v, ok := n.local.Get(key); ok {
 		return v, nil
 	}
 
-	owners := n.ownersFor(key)
+	// Route by exact RF owners
+	h64 := n.hash64Of(key)
+	r := n.ring.Load().(*ring)
+	owners := r.ownersFromKeyHash(h64)
 	if len(owners) == 0 {
 		return zero, ErrNoOwner
 	}
@@ -295,8 +312,9 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 	bk := n.kc.EncodeKey(key)
 	keyStr := string(bk)
 	primary := owners[0]
-	if primary.Addr == n.cfg.PublicURL {
 
+	if primary.Addr == n.cfg.PublicURL {
+		// We are primary: single-flight locally.
 		if _, acquired := n.leases.acquire(keyStr); acquired {
 			var v V
 			var ttl time.Duration
@@ -306,7 +324,17 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 			v, ttl, err = loader(ctx)
 			if err == nil {
 				_ = n.local.Set(key, v, ttl)
-				bv, _ := n.codec.Encode(v)
+
+				bv, encErr := n.codec.Encode(v)
+				if encErr != nil {
+					err = encErr
+					return zero, err
+				}
+				if n.cfg.Sec.MaxValueSize > 0 && len(bv) > n.cfg.Sec.MaxValueSize {
+					err = errors.New("value too large")
+					return zero, err
+				}
+
 				ver := n.clock.Next()
 				_ = n.repl.replicateSet(ctx, bk, bv, absExpiry(ttl), ver, owners)
 				if n.cfg.LWWEnabled {
@@ -319,14 +347,13 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 		if err := n.leases.wait(ctx, keyStr); err != nil {
 			return zero, err
 		}
-
 		if v, ok := n.local.Get(key); ok {
 			return v, nil
 		}
 		return zero, errors.New("lease resolved but key absent")
 	}
 
-	// delegate to primary to enforce single-flight via lease table there.
+	// Delegate to primary (its lease table coordinates the load).
 	p := n.getPeer(primary.Addr)
 	if p == nil {
 		return zero, ErrBadPeer
@@ -349,6 +376,7 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 
 	var resp MsgLeaseLoadResp
 	if err := cbor.Unmarshal(raw, &resp); err != nil {
+		n.resetPeer(primary.Addr)
 		return zero, err
 	}
 	if resp.Err != "" {
@@ -362,7 +390,6 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 	if err != nil {
 		return zero, err
 	}
-
 	v, err := n.codec.Decode(valBytes)
 	if err != nil {
 		return zero, err

@@ -7,9 +7,10 @@ import (
 )
 
 type inflight struct {
-	ch  chan struct{}
-	err error
-	exp int64
+	ch   chan struct{}
+	err  error
+	exp  int64
+	done bool
 }
 
 // leaseTable provides per-key single-flight semantics with a TTL. The first
@@ -44,8 +45,10 @@ func (t *leaseTable) acquire(key string) (*inflight, bool) {
 		t.mu.Unlock()
 		return f, false
 	}
-
-	f := &inflight{ch: make(chan struct{}), exp: time.Now().Add(t.ttl).UnixNano()}
+	f := &inflight{ch: make(chan struct{})}
+	if t.ttl > 0 {
+		f.exp = time.Now().Add(t.ttl).UnixNano()
+	}
 	t.m[key] = f
 	t.mu.Unlock()
 	return f, true
@@ -58,12 +61,13 @@ func (t *leaseTable) release(key string, err error) {
 	if ok {
 		delete(t.m, key)
 	}
-	t.mu.Unlock()
-
-	if ok {
+	// close channel under the lock to avoid double-close with sweeper
+	if ok && !f.done {
 		f.err = err
+		f.done = true
 		close(f.ch)
 	}
+	t.mu.Unlock()
 }
 
 // wait blocks until the lease for key completes or ctx is done, returning
@@ -86,7 +90,11 @@ func (t *leaseTable) wait(ctx context.Context, key string) error {
 // sweeper periodically scans for and force-closes expired leases to prevent
 // indefinite blocking when holders crash or hang.
 func (t *leaseTable) sweeper() {
-	tick := time.NewTicker(t.ttl / 2)
+	period := t.ttl / 2
+	if period <= 0 {
+		period = 10 * time.Millisecond
+	}
+	tick := time.NewTicker(period)
 	defer tick.Stop()
 	for {
 		select {
@@ -96,8 +104,11 @@ func (t *leaseTable) sweeper() {
 			for k, f := range t.m {
 				if f.exp > 0 && now >= f.exp {
 					delete(t.m, k)
-					f.err = ErrLeaseTimeout
-					close(f.ch)
+					if !f.done {
+						f.err = ErrLeaseTimeout
+						f.done = true
+						close(f.ch)
+					}
 				}
 			}
 			t.mu.Unlock()

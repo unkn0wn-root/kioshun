@@ -118,10 +118,10 @@ services:
       - LOG_EVERY=0
       - STATS_EVERY=10s
       - SET_TTL_MS=-1
-      - KILL_MODE=random # "none", "random", or "target"
-      - KILL_AFTER=45s
-      - KILL_TARGET=http://node2:8082
-      - KILL_TOKEN=letmein
+      - KILL_MODE=none # default: clean run; set to "random" or "target" to enable failures
+      # - KILL_AFTER=45s
+      # - KILL_TARGET=http://node2:8082
+      # - KILL_TOKEN=letmein
     depends_on:
       node1:
         condition: service_healthy
