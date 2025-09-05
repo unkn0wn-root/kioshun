@@ -130,7 +130,14 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 		}
 
 		var dr MsgBackfillDigestResp
-		if e := cbor.Unmarshal(raw, &dr); e != nil || len(dr.Buckets) == 0 {
+		if e := cbor.Unmarshal(raw, &dr); e != nil {
+			continue
+		}
+		if dr.NotInRing {
+			// Donor hasn't integrated us into its ring yet; skip this donor for now
+			continue
+		}
+		if len(dr.Buckets) == 0 {
 			continue
 		}
 
@@ -158,7 +165,14 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 				}
 
 				var kr MsgBackfillKeysResp
-				if e := cbor.Unmarshal(raw2, &kr); e != nil || len(kr.Items) == 0 {
+				if e := cbor.Unmarshal(raw2, &kr); e != nil {
+					break
+				}
+				if kr.NotInRing {
+					// Donor not ready; stop paging this bucket from this donor for now
+					break
+				}
+				if len(kr.Items) == 0 {
 					break
 				}
 

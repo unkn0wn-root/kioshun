@@ -192,3 +192,12 @@ func mix64(x uint64) uint64 {
 	x ^= x >> 31
 	return x
 }
+
+func (r *ring) idByAddr(addr string) (NodeID, bool) {
+	for _, nm := range r.nodes {
+		if nm.Addr == addr {
+			return nm.ID, true
+		}
+	}
+	return "", false
+}
