@@ -505,17 +505,19 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 
 // ownersFor returns the rendezvous owners for key
 func (n *Node[K, V]) ownersFor(key K) []*nodeMeta {
-	var keyHash uint64
+	var (
+		keyHash uint64
+		bk      = n.kc.EncodeKey(key)
+	)
 	if kh, ok := any(n.kc).(KeyHasher[K]); ok {
 		keyHash = kh.Hash64(key)
 	} else {
-		keyHash = xxhash.Sum64(n.kc.EncodeKey(key))
+		keyHash = xxhash.Sum64(bk)
 	}
 
 	r := n.ring.Load().(*ring)
 	owners := r.ownersFromKeyHash(keyHash)
 
-	bk := n.kc.EncodeKey(key)
 	n.hotMu.RLock()
 	expAt, hot := n.hotSet[string(bk)]
 	n.hotMu.RUnlock()

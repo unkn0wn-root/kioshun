@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"container/heap"
 	"container/list"
 	"sync"
 	"sync/atomic"
@@ -10,16 +11,18 @@ import (
 )
 
 type hintItem struct {
-	key     []byte
-	val     []byte // nil for delete
-	exp     int64
-	ver     uint64
-	cp      bool
-	isDel   bool
-	addedAt int64
-	nextAt  int64 // next eligible send time (for backoff)
-	tries   int
-	size    int64 // cached (key+val overhead)
+	key       []byte
+	val       []byte
+	exp       int64
+	ver       uint64
+	cp        bool
+	isDel     bool
+	addedAt   int64         // UnixNano when enqueued
+	nextAt    int64         // next eligible send time (backoff), UnixNano
+	tries     int           // number of attempts so far
+	size      int64         // cached (key+val+overhead) bytes
+	elem      *list.Element // if in ready FIFO
+	heapIndex int           // index in delayed heap, or -1 if not in heap
 }
 
 // expired returns true when the hint itself should not be replayed anymore.
@@ -36,10 +39,38 @@ func (h *hintItem) expired(ttl time.Duration, now int64) bool {
 	return false
 }
 
+type delayHeap []*hintItem
+
+func (h delayHeap) Len() int { return len(h) }
+func (h delayHeap) Less(i, j int) bool {
+	// earlier nextAt has higher priority
+	return h[i].nextAt < h[j].nextAt
+}
+func (h delayHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIndex = i
+	h[j].heapIndex = j
+}
+func (h *delayHeap) Push(x any) {
+	hi := x.(*hintItem)
+	hi.heapIndex = len(*h)
+	*h = append(*h, hi)
+}
+func (h *delayHeap) Pop() any {
+	old := *h
+	n := len(old)
+	hi := old[n-1]
+	old[n-1] = nil
+	*h = old[:n-1]
+	hi.heapIndex = -1
+	return hi
+}
+
 type hintQueue struct {
 	mu       sync.Mutex
-	index    map[string]*list.Element // keyString -> *Element(hintItem)
-	ll       *list.List               // FIFO for fairness / DropOldest
+	index    map[string]*hintItem // keyString -> hintItem in either ready or delayed
+	ready    *list.List           // FIFO of *hintItem
+	delayed  delayHeap            // min-heap by nextAt
 	bytes    int64
 	items    int
 	maxItems int
@@ -48,14 +79,11 @@ type hintQueue struct {
 	drop     DropPolicy
 }
 
-// newHintQueue builds a per-peer queue with caps and TTL used by the manager.
-// newHintQueue initializes a queue for one peer with capacity/bytes limits and
-// a TTL for dropping stale hints. It tracks elements both by FIFO list and an
-// index to coalesce updates per key.
 func newHintQueue(cfg HandoffConfig) *hintQueue {
 	return &hintQueue{
-		index:    make(map[string]*list.Element),
-		ll:       list.New(),
+		index:    make(map[string]*hintItem),
+		ready:    list.New(),
+		delayed:  delayHeap{},
 		maxItems: cfg.PerPeerCap,
 		maxBytes: cfg.PerPeerBytes,
 		ttl:      cfg.TTL,
@@ -63,16 +91,88 @@ func newHintQueue(cfg HandoffConfig) *hintQueue {
 	}
 }
 
-// removeElementLocked removes an element and updates all counters.
-func (q *hintQueue) removeElementLocked(e *list.Element) {
-	hi := e.Value.(*hintItem)
+// removeItemLocked removes the item from whichever container it resides in and
+// updates counters and index.
+func (q *hintQueue) removeItemLocked(hi *hintItem) {
 	delete(q.index, string(hi.key))
-	q.ll.Remove(e)
+	if hi.elem != nil {
+		q.ready.Remove(hi.elem)
+		hi.elem = nil
+	} else if hi.heapIndex >= 0 {
+		heap.Remove(&q.delayed, hi.heapIndex) // heap callbacks clear heapIndex
+	}
 	q.items--
 	q.bytes -= hi.size
 }
 
+// moveDueLocked shifts any delayed items whose nextAt <= now into ready FIFO.
+func (q *hintQueue) moveDueLocked(now int64) {
+	for q.delayed.Len() > 0 {
+		front := q.delayed[0]
+		if front.nextAt > now {
+			break
+		}
+		hi := heap.Pop(&q.delayed).(*hintItem)
+		hi.elem = q.ready.PushBack(hi)
+	}
+}
+
+// overCap evaluates capacity against hypothetical items/bytes.
+func (q *hintQueue) overCap(items int, bytes int64) bool {
+	return (q.maxItems > 0 && items > q.maxItems) ||
+		(q.maxBytes > 0 && bytes > q.maxBytes)
+}
+
+// dropOldest drops from the oldest end
+// ready front if available, otherwise earliest nextAt from delayed.
+func (q *hintQueue) dropOldest(avoid *hintItem) (int, int64) {
+	droppedCount := 0
+	droppedBytes := int64(0)
+
+	tryDropReady := func() bool {
+		fe := q.ready.Front()
+		if fe == nil {
+			return false
+		}
+
+		h := fe.Value.(*hintItem)
+		if h == avoid {
+			// do not drop the just-inserted/replaced item if it's at head
+			return false
+		}
+		q.removeItemLocked(h)
+		droppedCount++
+		droppedBytes += h.size
+		return true
+	}
+
+	tryDropDelayed := func() bool {
+		if q.delayed.Len() == 0 {
+			return false
+		}
+		h := q.delayed[0]
+		if h == avoid {
+			return false
+		}
+
+		heap.Pop(&q.delayed) // remove root
+		delete(q.index, string(h.key))
+		q.items--
+		q.bytes -= h.size
+		droppedCount++
+		droppedBytes += h.size
+		return true
+	}
+
+	if tryDropReady() || tryDropDelayed() {
+		return droppedCount, droppedBytes
+	}
+	return 0, 0
+}
+
 // enqueue adds or coalesces a hint. It keeps only the newest version per key.
+// Returns (accepted, bytesDelta, itemsDelta). The deltas reflect NET change,
+// including any drops performed to enforce caps.
 func (q *hintQueue) enqueue(it *hintItem) (bool, int64, int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -83,90 +183,146 @@ func (q *hintQueue) enqueue(it *hintItem) (bool, int64, int) {
 	}
 
 	keyStr := string(it.key)
-	if e, ok := q.index[keyStr]; ok {
-		old := e.Value.(*hintItem)
-		// keep newer version; drop the older one.
+	// coalesce with existing key if present.
+	if old, ok := q.index[keyStr]; ok {
 		if it.ver <= old.ver {
 			return false, 0, 0
 		}
-		// replace in place
+
+		// preserve scheduling/backoff state if old was delayed.
+		if old.heapIndex >= 0 {
+			it.nextAt = old.nextAt
+			it.tries = old.tries
+		}
+		// replace in same container.
+		var placement string
+		if old.elem != nil {
+			placement = "ready"
+			old.elem.Value = it
+			it.elem = old.elem
+			it.heapIndex = -1
+		} else {
+			placement = "delayed"
+			idx := old.heapIndex
+			it.heapIndex = idx
+			it.elem = nil
+			q.delayed[idx] = it
+		}
+
+		// bytes accounting + cap enforcement.
 		delta := it.size - old.size
-		e.Value = it
 		q.bytes += delta
+		q.index[keyStr] = it
+
+		if q.overCap(q.items, q.bytes) {
+			switch q.drop {
+			case DropOldest:
+				totalDroppedB := int64(0)
+				totalDroppedI := 0
+				for q.overCap(q.items, q.bytes) {
+					dc, db := q.dropOldest(it)
+					if dc == 0 {
+						// Can't drop anything else without dropping 'it' -> revert replacement.
+						// Restore old placement/value.
+						if placement == "ready" {
+							it.elem.Value = old
+							old.elem = it.elem
+							it.elem = nil
+						} else {
+							q.delayed[it.heapIndex] = old
+							old.heapIndex = it.heapIndex
+							it.heapIndex = -1
+						}
+						q.index[keyStr] = old
+						q.bytes -= delta
+
+						return false, totalDroppedB, -totalDroppedI
+					}
+					totalDroppedB += db
+					totalDroppedI += dc
+				}
+				return true, delta - totalDroppedB, -totalDroppedI
+			default:
+				if old.elem != nil {
+					old.elem.Value = old
+				} else if old.heapIndex >= 0 {
+					q.delayed[old.heapIndex] = old
+				}
+				q.index[keyStr] = old
+				q.bytes -= delta
+				return false, 0, 0
+			}
+		}
 		return true, delta, 0
 	}
 
-	// new entry: honor caps by policy (DropOldest/DropNewest/DropNone).
-	wouldItems := q.items + 1
-	wouldBytes := q.bytes + it.size
-
-	overCap := func(items int, bytes int64) bool {
-		return (q.maxItems > 0 && items > q.maxItems) ||
-			(q.maxBytes > 0 && bytes > q.maxBytes)
+	// choose container based on nextAt.
+	if it.nextAt > now {
+		heap.Push(&q.delayed, it)
+		it.elem = nil
+	} else {
+		it.elem = q.ready.PushBack(it)
+		it.heapIndex = -1
 	}
+	q.index[keyStr] = it
+	q.items++
+	q.bytes += it.size
 
-	switch q.drop {
-	case DropOldest:
-		for overCap(wouldItems, wouldBytes) {
-			fe := q.ll.Front()
-			if fe == nil {
-				break
+	// enforce caps for new items.
+	if q.overCap(q.items, q.bytes) {
+		switch q.drop {
+		case DropOldest:
+			totalDroppedB := int64(0)
+			totalDroppedI := 0
+			for q.overCap(q.items, q.bytes) {
+				dc, db := q.dropOldest(it)
+				if dc == 0 {
+					// can't drop others; drop the just added item itself.
+					q.removeItemLocked(it)
+					delete(q.index, keyStr)
+					return false, -totalDroppedB, -totalDroppedI
+				}
+				totalDroppedB += db
+				totalDroppedI += dc
 			}
-			q.removeElementLocked(fe)
-			wouldItems = q.items + 1
-			wouldBytes = q.bytes + it.size
-		}
-	default: // DropNone and DropNewest: reject when over cap
-		if overCap(wouldItems, wouldBytes) {
+			return true, it.size - totalDroppedB, 1 - totalDroppedI
+		default: // DropNewest/DropNone -> reject new item
+			q.removeItemLocked(it)
+			delete(q.index, keyStr)
 			return false, 0, 0
 		}
 	}
 
-	e := q.ll.PushBack(it)
-	q.index[keyStr] = e
-	q.items++
-	q.bytes += it.size
 	return true, it.size, 1
 }
 
-// popReady pops the oldest item if it's ready (nextAt<=now) and not expired.
+// popReady pops the head of the ready (after moving due delayed items).
 func (q *hintQueue) popReady(now int64) *hintItem {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for {
-		fe := q.ll.Front()
-		if fe == nil {
-			return nil
-		}
 
-		it := fe.Value.(*hintItem)
-		if it.expired(q.ttl, now) {
-			q.removeElementLocked(fe)
-			continue
-		}
+	// oromote due delayed items.
+	q.moveDueLocked(now)
 
-		if it.nextAt > 0 && now < it.nextAt {
-			return nil // head-of-line backoff. Keep simple to avoid scans
-		}
-
-		q.removeElementLocked(fe)
-		return it
+	fe := q.ready.Front()
+	if fe == nil {
+		return nil
 	}
+
+	it := fe.Value.(*hintItem)
+	// skip expired items.
+	if it.expired(q.ttl, now) {
+		q.removeItemLocked(it)
+		return nil
+	}
+
+	q.removeItemLocked(it)
+	return it
 }
 
-// requeue puts a failed item back at the tail with updated backoff state.
+// requeue puts a failed item back respecting backoff.
 func (q *hintQueue) requeue(it *hintItem) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	keyStr := string(it.key)
-	if _, ok := q.index[keyStr]; ok {
-		// already there (shouldn't happen), prefer keeping the newer slot.
-		return
-	}
-	e := q.ll.PushBack(it)
-	q.index[keyStr] = e
-	q.items++
-	q.bytes += it.size
+	_, _, _ = q.enqueue(it)
 }
 
 // snapshot stats (for breaker/metrics)
@@ -188,9 +344,6 @@ type handoff[K comparable, V any] struct {
 	rr         uint32 // round-robin cursor over peers
 }
 
-// newHandoff creates a hinted-handoff manager for a node and starts the
-// background replay loop if enabled. Replay drains per-peer queues with
-// token-bucket rate limiting and exponential backoff on failures.
 func newHandoff[K comparable, V any](n *Node[K, V]) *handoff[K, V] {
 	h := &handoff[K, V]{
 		node:  n,
@@ -214,26 +367,41 @@ func (h *handoff[K, V]) queue(addr string) *hintQueue {
 	return q
 }
 
-// enqueueSet enqueues a SET hint for addr with value bytes (optionally
-// compressed), absolute expiry, and version. Dropped when handoff disabled or
-// auto-paused due to backlog.
+// enqueueSet enqueues a SET hint for addr with value bytes
+// (optionally compressed), absolute expiry, and version.
+// Dropped when handoff disabled or auto-paused due to backlog.
 func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver uint64, cp bool) {
 	if !h.cfg.IsEnabled() {
+		return
+	}
+	if h.paused.Load() {
 		return
 	}
 
 	const hintOverheadSet = int64(24) // bookkeeping bytes per SET
 	it := &hintItem{
-		key:     append([]byte(nil), key...),
-		val:     append([]byte(nil), val...),
-		exp:     exp,
-		ver:     ver,
-		cp:      cp,
-		isDel:   false,
-		addedAt: time.Now().UnixNano(),
-		size:    int64(len(key)+len(val)) + hintOverheadSet,
+		key:       append([]byte(nil), key...),
+		val:       append([]byte(nil), val...),
+		exp:       exp,
+		ver:       ver,
+		cp:        cp,
+		isDel:     false,
+		addedAt:   time.Now().UnixNano(),
+		size:      int64(len(key)+len(val)) + hintOverheadSet,
+		heapIndex: -1, // nextAt==0 -> ready FIFO
 	}
-	h.enqueue(addr, it)
+	q := h.queue(addr)
+	ok, byDelta, itDelta := q.enqueue(it)
+	if !ok {
+		return
+	}
+
+	newItems := h.totalItems.Add(int64(itDelta))
+	newBytes := h.totalBytes.Add(byDelta)
+	if (h.cfg.AutopauseItems > 0 && int(newItems) >= h.cfg.AutopauseItems) ||
+		(h.cfg.AutopauseBytes > 0 && newBytes >= h.cfg.AutopauseBytes) {
+		h.paused.Store(true)
+	}
 }
 
 // enqueueDel enqueues a DELETE hint for addr with a version. The value field
@@ -242,45 +410,40 @@ func (h *handoff[K, V]) enqueueDel(addr string, key []byte, ver uint64) {
 	if !h.cfg.IsEnabled() {
 		return
 	}
-
-	const hintOverheadDel = int64(16) // bookkeeping bytes per DEL
-	it := &hintItem{
-		key:     append([]byte(nil), key...),
-		val:     nil,
-		exp:     0,
-		ver:     ver,
-		cp:      false,
-		isDel:   true,
-		addedAt: time.Now().UnixNano(),
-		size:    int64(len(key)) + hintOverheadDel,
-	}
-	h.enqueue(addr, it)
-}
-
-// enqueue inserts or coalesces a hint in the per-peer queue and updates
-// manager-wide counters, auto-pausing new enqueues when thresholds are
-// exceeded to allow draining.
-func (h *handoff[K, V]) enqueue(addr string, it *hintItem) {
-	// when auto-paused due to backlog, drop newest enqueues to allow draining.
 	if h.paused.Load() {
 		return
 	}
 
+	const hintOverheadDel = int64(16) // bookkeeping bytes per DEL
+	it := &hintItem{
+		key:       append([]byte(nil), key...),
+		val:       nil,
+		exp:       0,
+		ver:       ver,
+		cp:        false,
+		isDel:     true,
+		addedAt:   time.Now().UnixNano(),
+		size:      int64(len(key)) + hintOverheadDel,
+		heapIndex: -1,
+	}
 	q := h.queue(addr)
-
 	ok, byDelta, itDelta := q.enqueue(it)
 	if !ok {
 		return
 	}
 	newItems := h.totalItems.Add(int64(itDelta))
 	newBytes := h.totalBytes.Add(byDelta)
-
-	// circuit breaker based on backlog (operator Pause is honored in loop)
-	// auto-pauses new enqueues while allowing replay to drain.
 	if (h.cfg.AutopauseItems > 0 && int(newItems) >= h.cfg.AutopauseItems) ||
 		(h.cfg.AutopauseBytes > 0 && newBytes >= h.cfg.AutopauseBytes) {
 		h.paused.Store(true)
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // loop drives replay at a configured RPS using per-tick slices. It supports
@@ -292,7 +455,7 @@ func (h *handoff[K, V]) loop() {
 		return
 	}
 
-	const slotsPerSec = 100
+	const slotsPerSec = 20
 	tick := time.NewTicker(time.Second / slotsPerSec)
 	defer tick.Stop()
 
@@ -304,9 +467,13 @@ func (h *handoff[K, V]) loop() {
 	defer house.Stop()
 
 	// exponential backoff for retries; capped to keep queues moving.
-	backoff := func(tries int) time.Duration {
-		// 100ms, 200ms, 400ms ... cap at 5s
-		d := 100 * time.Millisecond << uint(min(6, tries)) // up to ~6.4s
+	// attemptIndex: 0 -> 200ms, 1 -> 400ms, ... cap ~5s.
+	backoff := func(attemptIndex int) time.Duration {
+		if attemptIndex < 0 {
+			attemptIndex = 0
+		}
+		shift := min(6, attemptIndex) // 0..6
+		d := 200 * time.Millisecond << uint(shift)
 		if d > 5*time.Second {
 			d = 5 * time.Second
 		}
@@ -327,7 +494,7 @@ func (h *handoff[K, V]) loop() {
 			if n == 0 {
 				continue
 			}
-			// Operator pause fully stops replay; auto-pause only stops enqueues,
+			// operator pause fully stops replay; auto-pause only stops enqueues,
 			// allowing replay to continue draining backlog.
 			if h.cfg.Pause {
 				continue
@@ -343,7 +510,6 @@ func (h *handoff[K, V]) loop() {
 			totalI, totalB := int64(0), int64(0)
 			h.mu.Lock()
 			for _, q := range h.peers {
-				// touch stats (and drop via popReady in steady state)
 				i, b := q.stats()
 				totalI += int64(i)
 				totalB += b
@@ -352,7 +518,7 @@ func (h *handoff[K, V]) loop() {
 			h.totalItems.Store(totalI)
 			h.totalBytes.Store(totalB)
 
-			// auto-resume when sufficiently drained (hysteresis at ~60% of autopause threshold).
+			// auto-resume when sufficiently drained (hysteresis ~60%).
 			if h.paused.Load() {
 				if (h.cfg.AutopauseItems == 0 || totalI < int64(float64(h.cfg.AutopauseItems)*0.6)) &&
 					(h.cfg.AutopauseBytes == 0 || totalB < int64(float64(h.cfg.AutopauseBytes)*0.6)) {
@@ -367,12 +533,11 @@ func (h *handoff[K, V]) loop() {
 }
 
 // scheduleRetry updates backoff state and requeues the item.
-// scheduleRetry sets the next eligible time and requeues an item after a
-// failure using the provided backoff function.
 func (h *handoff[K, V]) scheduleRetry(q *hintQueue, hi *hintItem, backoff func(int) time.Duration) {
 	hi.tries++
-	hi.nextAt = time.Now().Add(backoff(hi.tries)).UnixNano()
-	q.requeue(hi)
+	// First retry (tries==1) -> attemptIndex 0 -> 200ms.
+	hi.nextAt = time.Now().Add(backoff(hi.tries - 1)).UnixNano()
+	q.requeue(hi) // re-enqueue respects TTL/caps/coalescing
 }
 
 // replayOne attempts to send a single hint across peers using round-robin
@@ -380,18 +545,16 @@ func (h *handoff[K, V]) scheduleRetry(q *hintQueue, hi *hintItem, backoff func(i
 // Returns true when an item was processed (success or scheduled), false when
 // no ready items were found.
 func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
-	// fairshare round-robin over peers to avoid starving any one queue.
+	// fair-share round-robin over peers to avoid starving any one queue.
 	h.mu.Lock()
 	if len(h.peers) == 0 {
 		h.mu.Unlock()
 		return false
 	}
-	// collect keys to iterate deterministically: don't need order here,
-	// just pick an index and iterate at most N peers.
 	idx := int(h.rr)
 	h.rr++
 
-	// snapshot addresses
+	// snapshot addresses .
 	addrs := make([]string, 0, len(h.peers))
 	for a := range h.peers {
 		addrs = append(addrs, a)
@@ -418,6 +581,7 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 
 		id := h.node.nextReqID()
 		if !hi.isDel {
+			// SET hint
 			msg := &MsgSet{
 				Base: Base{
 					T:  MTSet,
@@ -441,33 +605,42 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 
 			var resp MsgSetResp
 			if e := cbor.Unmarshal(raw, &resp); e != nil {
-				// framing/decoding error: likely broken stream → reset
+				// likely broken stream → reset.
 				h.node.resetPeer(addr)
 				h.scheduleRetry(q, hi, backoff)
 				continue
 			}
 			if !resp.OK {
-				// application-level negative ack: don't reset, just retry
+				// don't reset, just retry.
 				h.scheduleRetry(q, hi, backoff)
 				continue
 			}
-			// success: drop
+
+			// success - drop (counters recomputed by housekeeping)
 			return true
 		}
 
-		// delete hint
 		msg := &MsgDel{Base: Base{T: MTDelete, ID: id}, Key: hi.key, Ver: hi.ver}
 		raw, err := pc.request(msg, id, h.node.cfg.Sec.WriteTimeout)
 		if err != nil {
+			if isFatalTransport(err) {
+				h.node.resetPeer(addr)
+			}
 			h.scheduleRetry(q, hi, backoff)
 			continue
 		}
 
 		var resp MsgDelResp
-		if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
+		if e := cbor.Unmarshal(raw, &resp); e != nil {
+			h.node.resetPeer(addr)
 			h.scheduleRetry(q, hi, backoff)
 			continue
 		}
+		if !resp.OK {
+			h.scheduleRetry(q, hi, backoff)
+			continue
+		}
+
 		return true
 	}
 	return false

@@ -223,41 +223,35 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 // XOR(hash^version) so that donors and joiners can cheaply detect drift
 // without moving all keys. Depth is clamped to [1,8] bytes of the 64-bit
 // key hash in big-endian order.
+// helper (optional)
 func (n *Node[K, V]) computeLocalDigests(depth int) map[string]bucketSig {
 	if depth <= 0 || depth > 8 {
 		depth = 2
 	}
+
 	m := make(map[string]bucketSig, 1<<12)
 	keys := n.local.Keys()
-	self := n.cfg.PublicURL
+	r := n.ring.Load().(*ring)
+	selfID := NodeID(n.cfg.PublicURL)
 
 	for _, k := range keys {
-		owners := n.ownersFor(k)
-		owned := false
-		for _, o := range owners {
-			if o.Addr == self {
-				owned = true
-				break
-			}
-		}
-		if !owned {
+		h64 := n.hash64Of(k)
+		if !r.ownsHash(selfID, h64) {
 			continue
 		}
 
-		kb := n.kc.EncodeKey(k)
-		h64 := xxhash.Sum64(kb)
 		var hb [8]byte
 		binary.BigEndian.PutUint64(hb[:], h64)
 		prefix := string(hb[:depth])
 
-		// Include version in the digest to detect divergence even when counts
-		// match (XORing hash with version is inexpensive and orderless).
-		var ver uint64
+		ver := uint64(0)
 		if n.cfg.LWWEnabled {
+			kb := n.kc.EncodeKey(k)
 			n.verMu.RLock()
 			ver = n.version[string(kb)]
 			n.verMu.RUnlock()
 		}
+
 		s := m[prefix]
 		s.count++
 		s.hash ^= (h64 ^ ver)
@@ -271,15 +265,27 @@ func (n *Node[K, V]) computeLocalDigests(depth int) map[string]bucketSig {
 // keys and avoid re-requesting them in the same backfill run.
 func (n *Node[K, V]) updateLocalDigestWithBatch(m map[string]bucketSig, depth int, batch []cache.Item[K, V]) map[string]bucketSig {
 	for _, it := range batch {
-		kb := n.kc.EncodeKey(it.Key)
-		h64 := xxhash.Sum64(kb)
+		h64 := n.hash64Of(it.Key)
 		var hb [8]byte
 		binary.BigEndian.PutUint64(hb[:], h64)
 		prefix := string(hb[:depth])
+
+		ver := uint64(0)
+		if n.cfg.LWWEnabled {
+			ver = it.Version
+		}
+
 		s := m[prefix]
 		s.count++
-		s.hash ^= (h64 ^ it.Version)
+		s.hash ^= (h64 ^ ver)
 		m[prefix] = s
 	}
 	return m
+}
+
+func (n *Node[K, V]) hash64Of(k K) uint64 {
+	if kh, ok := any(n.kc).(KeyHasher[K]); ok {
+		return kh.Hash64(k)
+	}
+	return xxhash.Sum64(n.kc.EncodeKey(k))
 }
