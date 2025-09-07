@@ -6,7 +6,7 @@ import (
 )
 
 func TestHLCNextMonotonic(t *testing.T) {
-	h := newHLC()
+	h := newHLC(1)
 	a := h.Next()
 	b := h.Next()
 	if b <= a {
@@ -15,10 +15,10 @@ func TestHLCNextMonotonic(t *testing.T) {
 }
 
 func TestHLCObserveRemoteAhead(t *testing.T) {
-	h := newHLC()
+	h := newHLC(1)
 	_ = h.Next() // initialize
 	rp := time.Now().UnixMilli() + 5
-	remote := packHLC(rp, 3)
+	remote := packHLC(rp, 3, 0)
 	h.Observe(remote)
 	after := h.Next()
 	ap, _ := unpackHLC(after)
@@ -28,11 +28,11 @@ func TestHLCObserveRemoteAhead(t *testing.T) {
 }
 
 func TestHLCObserveRemoteBehindNoRegression(t *testing.T) {
-	h := newHLC()
+	h := newHLC(1)
 	a := h.Next()
 	ap, _ := unpackHLC(a)
 	// remote behind current physical time
-	remote := packHLC(ap-10, 0)
+	remote := packHLC(ap-10, 0, 0)
 	h.Observe(remote)
 	b := h.Next()
 	if b <= a {
