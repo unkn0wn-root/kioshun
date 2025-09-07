@@ -113,11 +113,21 @@ func NewNode[K comparable, V any](cfg Config, keyc KeyCodec[K], c *cache.InMemor
 	}
 	if cfg.Sec.TLS.Enable {
 		n.initTLS()
-		lim := runtime.NumCPU() * 32
-		if lim < 64 {
-			lim = 64
+
+		lim := cfg.Sec.MaxConcurrentHandshakes
+		switch {
+		case lim < 0:
+			lim = 0 // disabled
+		case lim == 0:
+			lim = runtime.GOMAXPROCS(0) * 32
+			if lim < 64 {
+				lim = 64
+			}
 		}
-		n.handshakeGate = make(chan struct{}, lim)
+
+		if lim > 0 {
+			n.handshakeGate = make(chan struct{}, lim)
+		}
 	}
 
 	if cfg.Handoff.IsEnabled() {

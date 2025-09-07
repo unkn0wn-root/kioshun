@@ -37,6 +37,11 @@ type Security struct {
 	ReadBufSize                 int
 	WriteBufSize                int
 	AllowUnauthenticatedClients bool
+	// MaxConcurrentHandshakes caps simultaneous TLS handshakes.
+	//  > 0 : fixed cap
+	//  = 0 : auto => max(64, 32*GOMAXPROCS)
+	//  < 0 : disabled (no gating)
+	MaxConcurrentHandshakes int
 }
 
 type DropPolicy uint8
@@ -170,6 +175,7 @@ func Default() Config {
 				PreferServerCipherSuites: true,
 			},
 			AllowUnauthenticatedClients: true,
+			MaxConcurrentHandshakes:     0,
 		},
 		PerConnWorkers: 64,
 		PerConnQueue:   128,
