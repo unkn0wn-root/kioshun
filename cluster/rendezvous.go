@@ -193,11 +193,12 @@ func mix64(x uint64) uint64 {
 	return x
 }
 
-func (r *ring) idByAddr(addr string) (NodeID, bool) {
+// hasID returns true when the ID participates in this ring view.
+func (r *ring) hasID(id NodeID) bool {
 	for _, nm := range r.nodes {
-		if nm.Addr == addr {
-			return nm.ID, true
+		if nm.ID == id {
+			return true
 		}
 	}
-	return "", false
+	return false
 }

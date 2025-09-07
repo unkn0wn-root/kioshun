@@ -10,7 +10,7 @@ func TestMembershipIntegrateAlivePrune(t *testing.T) {
 	now := time.Now().UnixNano()
 
 	// integrate gossip from A, referencing B as known peer.
-	m.integrate(NodeID("A"), "A", []string{"B"}, map[string]int64{"B": now}, 10, now)
+	m.integrate(NodeID("A"), "A", []PeerInfo{{ID: "B", Addr: "B"}}, map[string]int64{"B": now}, 10, now)
 
 	if m.epoch != 10 {
 		t.Fatalf("epoch not updated: %d", m.epoch)

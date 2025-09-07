@@ -2,7 +2,10 @@ package cluster
 
 import (
 	"crypto/tls"
+	"fmt"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 type NodeID string
@@ -20,19 +23,20 @@ type TLSMode struct {
 }
 
 type Security struct {
-	AuthToken            string
-	TLS                  TLSMode
-	MaxFrameSize         int
-	MaxKeySize           int
-	MaxValueSize         int
-	ReadTimeout          time.Duration
-	WriteTimeout         time.Duration
-	IdleTimeout          time.Duration
-	MaxInflightPerPeer   int
-	CompressionThreshold int
-	LeaseLoadQPS         int
-	ReadBufSize          int
-	WriteBufSize         int
+	AuthToken                   string
+	TLS                         TLSMode
+	MaxFrameSize                int
+	MaxKeySize                  int
+	MaxValueSize                int
+	ReadTimeout                 time.Duration
+	WriteTimeout                time.Duration
+	IdleTimeout                 time.Duration
+	MaxInflightPerPeer          int
+	CompressionThreshold        int
+	LeaseLoadQPS                int
+	ReadBufSize                 int
+	WriteBufSize                int
+	AllowUnauthenticatedClients bool
 }
 
 type DropPolicy uint8
@@ -121,6 +125,7 @@ type Config struct {
 	MirrorTTL         time.Duration
 	LeaseTTL          time.Duration
 	RebalanceInterval time.Duration
+	BackfillInterval  time.Duration
 	RebalanceLimit    int
 	Sec               Security
 	LWWEnabled        bool
@@ -147,6 +152,7 @@ func Default() Config {
 		MirrorTTL:         30 * time.Second,
 		LeaseTTL:          300 * time.Millisecond,
 		RebalanceInterval: 2 * time.Second,
+		BackfillInterval:  30 * time.Second,
 		RebalanceLimit:    500,
 		Sec: Security{
 			MaxFrameSize:         4 << 20,
@@ -163,6 +169,7 @@ func Default() Config {
 			TLS: TLSMode{
 				PreferServerCipherSuites: true,
 			},
+			AllowUnauthenticatedClients: true,
 		},
 		PerConnWorkers: 64,
 		PerConnQueue:   128,
@@ -182,4 +189,14 @@ func Default() Config {
 			AutopauseBytes: int64((2 << 30) * 9 / 10),
 		},
 	}
+}
+
+// EnsureID assigns a stable ID when not provided.
+// Default: 16-hex digest of PublicURL.
+func (c *Config) EnsureID() {
+	if c.ID != "" {
+		return
+	}
+	sum := xxhash.Sum64String(c.PublicURL)
+	c.ID = NodeID(fmt.Sprintf("%016x", sum))
 }

@@ -10,8 +10,8 @@ type BucketDigest struct {
 
 type MsgBackfillDigestReq struct {
 	Base
-	Target string `cbor:"t"` // joiner PublicURL
-	Depth  uint8  `cbor:"d"` // bytes of prefix (1..8)
+	TargetID string `cbor:"tid"` // joiner ID
+	Depth    uint8  `cbor:"d"`   // bytes of prefix (1..8)
 }
 
 type MsgBackfillDigestResp struct {
@@ -23,10 +23,10 @@ type MsgBackfillDigestResp struct {
 
 type MsgBackfillKeysReq struct {
 	Base
-	Target string `cbor:"t"` // joiner PublicURL
-	Prefix []byte `cbor:"p"` // len == Depth
-	Limit  int    `cbor:"l"` // page size
-	Cursor []byte `cbor:"u"` // last 8B key-hash (big-endian) for pagination
+	TargetID string `cbor:"tid"` // joiner ID
+	Prefix   []byte `cbor:"p"`   // len == Depth
+	Limit    int    `cbor:"l"`   // page size
+	Cursor   []byte `cbor:"u"`   // last 8B key-hash (big-endian) for pagination
 }
 
 type MsgBackfillKeysResp struct {

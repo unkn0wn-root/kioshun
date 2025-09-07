@@ -29,6 +29,12 @@ const (
 	MTBackfillKeysResp   MsgType = 203
 )
 
+// PeerInfo advertises identity + current dialable address
+type PeerInfo struct {
+	ID   string `cbor:"i"`
+	Addr string `cbor:"a"`
+}
+
 type Base struct {
 	T  MsgType `cbor:"t"`
 	ID uint64  `cbor:"id"`
@@ -36,13 +42,16 @@ type Base struct {
 
 type MsgHello struct {
 	Base
-	From  string `cbor:"f"`
-	Token string `cbor:"tok"`
+	FromID   string `cbor:"fi"`
+	FromAddr string `cbor:"fa"`
+	Token    string `cbor:"tok"`
 }
+
 type MsgHelloResp struct {
 	Base
-	OK  bool   `cbor:"ok"`
-	Err string `cbor:"err,omitempty"`
+	OK     bool   `cbor:"ok"`
+	PeerID string `cbor:"pi"`
+	Err    string `cbor:"err,omitempty"`
 }
 
 type MsgGet struct {
@@ -62,6 +71,7 @@ type MsgGetBulk struct {
 	Base
 	Keys [][]byte `cbor:"ks"`
 }
+
 type MsgGetBulkResp struct {
 	Base
 	Hits []bool   `cbor:"h"`
@@ -79,6 +89,7 @@ type MsgSet struct {
 	Ver uint64 `cbor:"ver"`
 	Cp  bool   `cbor:"cp"`
 }
+
 type MsgSetResp struct {
 	Base
 	OK  bool   `cbor:"ok"`
@@ -92,10 +103,12 @@ type KV struct {
 	Ver uint64 `cbor:"ver"`
 	Cp  bool   `cbor:"cp"`
 }
+
 type MsgSetBulk struct {
 	Base
 	Items []KV `cbor:"items"`
 }
+
 type MsgSetBulkResp struct {
 	Base
 	OK  bool   `cbor:"ok"`
@@ -107,6 +120,7 @@ type MsgDel struct {
 	Key []byte `cbor:"k"`
 	Ver uint64 `cbor:"ver"`
 }
+
 type MsgDelResp struct {
 	Base
 	OK  bool   `cbor:"ok"`
@@ -117,6 +131,7 @@ type MsgLeaseLoad struct {
 	Base
 	Key []byte `cbor:"k"`
 }
+
 type MsgLeaseLoadResp struct {
 	Base
 	Found bool   `cbor:"f"`
@@ -128,12 +143,13 @@ type MsgLeaseLoadResp struct {
 
 type MsgGossip struct {
 	Base
-	From  string           `cbor:"f"`
-	Seen  map[string]int64 `cbor:"sn"`
-	Peers []string         `cbor:"pe"`
-	Load  NodeLoad         `cbor:"ld"`
-	TopK  []HotKey         `cbor:"hh"`
-	Epoch uint64           `cbor:"ep"`
+	FromID   string           `cbor:"fi"`
+	FromAddr string           `cbor:"fa"`
+	Seen     map[string]int64 `cbor:"sn"` // keys are peer IDs
+	Peers    []PeerInfo       `cbor:"pe"` // ID + current address
+	Load     NodeLoad         `cbor:"ld"`
+	TopK     []HotKey         `cbor:"hh"`
+	Epoch    uint64           `cbor:"ep"`
 }
 
 type NodeLoad struct {

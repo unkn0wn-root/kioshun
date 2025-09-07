@@ -63,7 +63,7 @@ func (n *Node[K, V]) backfillLoop() {
 	defer tk.Stop()
 	for {
 		r := n.ring.Load().(*ring)
-		if len(n.peerAddrs()) > 0 || len(r.nodes) > 1 {
+		if len(n.peerIDs()) > 0 || len(r.nodes) > 1 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -78,12 +78,22 @@ func (n *Node[K, V]) backfillLoop() {
 
 	n.backfillOnce(defaultBackfillDepth, 1024)
 
-	t := time.NewTicker(n.cfg.RebalanceInterval)
+	iv := n.cfg.BackfillInterval
+	if iv <= 0 {
+		iv = n.cfg.RebalanceInterval
+		if iv <= 0 {
+			iv = 30 * time.Second
+		}
+	}
+	t := time.NewTicker(iv)
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
 			n.backfillOnce(defaultBackfillDepth, 512) // light repair
+		case <-n.backfillKick:
+			// triggered by membership epoch increase -> run a light repair promptly.
+			n.backfillOnce(defaultBackfillDepth, 512)
 		case <-n.stop:
 			return
 		}
@@ -99,11 +109,11 @@ func (n *Node[K, V]) backfillLoop() {
 //
 // The donor list excludes self and peers we are not connected to.
 func (n *Node[K, V]) backfillOnce(depth int, page int) {
-	donors := n.peerAddrs()
-	self := n.cfg.PublicURL
+	donors := n.peerIDs()
+	selfID := n.cfg.ID
 	tmp := donors[:0]
 	for _, d := range donors {
-		if d != self && n.getPeer(d) != nil {
+		if d != selfID && n.getPeer(d) != nil {
 			tmp = append(tmp, d)
 		}
 	}
@@ -115,7 +125,7 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 
 	// Compute a local view of bucket digests we own to detect divergence.
 	local := n.computeLocalDigests(depth)
-	sort.Strings(donors)
+	sort.Slice(donors, func(i, j int) bool { return donors[i] < donors[j] })
 
 	for _, d := range donors {
 		pc := n.getPeer(d)
@@ -123,7 +133,12 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 			continue
 		}
 
-		req := &MsgBackfillDigestReq{Base: Base{T: MTBackfillDigestReq, ID: n.nextReqID()}, Target: self, Depth: uint8(depth)}
+		req := &MsgBackfillDigestReq{
+			Base:     Base{T: MTBackfillDigestReq, ID: n.nextReqID()},
+			TargetID: string(selfID),
+			Depth:    uint8(depth),
+		}
+
 		raw, err := pc.request(req, req.ID, n.cfg.Sec.ReadTimeout)
 		if err != nil {
 			continue
@@ -152,11 +167,11 @@ func (n *Node[K, V]) backfillOnce(depth int, page int) {
 			var cursor []byte
 			for {
 				kReq := &MsgBackfillKeysReq{
-					Base:   Base{T: MTBackfillKeysReq, ID: n.nextReqID()},
-					Target: self,
-					Prefix: append([]byte(nil), b.Prefix...),
-					Limit:  page,
-					Cursor: cursor,
+					Base:     Base{T: MTBackfillKeysReq, ID: n.nextReqID()},
+					TargetID: string(selfID),
+					Prefix:   append([]byte(nil), b.Prefix...),
+					Limit:    page,
+					Cursor:   cursor,
 				}
 
 				raw2, err := pc.request(kReq, kReq.ID, n.cfg.Sec.ReadTimeout)
@@ -246,7 +261,7 @@ func (n *Node[K, V]) computeLocalDigests(depth int) map[string]bucketSig {
 	m := make(map[string]bucketSig, 1<<12)
 	keys := n.local.Keys()
 	r := n.ring.Load().(*ring)
-	selfID := NodeID(n.cfg.PublicURL)
+	selfID := n.cfg.ID
 
 	for _, k := range keys {
 		h64 := n.hash64Of(k)

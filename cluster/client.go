@@ -73,11 +73,12 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	// route by exact RF owners from the ring
 	h64 := n.hash64Of(key)
 	r := n.ring.Load().(*ring)
+
 	owners := r.ownersFromKeyHash(h64)
 	if len(owners) == 0 {
 		return zero, false, ErrNoOwner
 	}
-	if owners[0].Addr == n.cfg.PublicURL {
+	if owners[0].ID == n.cfg.ID {
 		if v, ok := n.local.Get(key); ok {
 			return v, true, nil
 		}
@@ -85,10 +86,10 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 
 	fast, slow := make([]*nodeMeta, 0, len(owners)), make([]*nodeMeta, 0, len(owners))
 	for _, o := range owners {
-		if o.Addr == n.cfg.PublicURL {
+		if o.ID == n.cfg.ID {
 			continue
 		}
-		if pc := n.getPeer(o.Addr); pc != nil && !pc.penalized() {
+		if pc := n.getPeer(o.ID); pc != nil && !pc.penalized() {
 			fast = append(fast, o)
 		} else {
 			slow = append(slow, o)
@@ -121,19 +122,19 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	hadErr := false
 
 	startLeg := func(i int) {
-		addr := cands[i].Addr
-		pc := n.getPeer(addr)
+		peerID := cands[i].ID
+		pc := n.getPeer(peerID)
 		if pc == nil {
 			resCh <- ans{err: ErrBadPeer}
 			return
 		}
 
-		id := n.nextReqID()
-		msg := &MsgGet{Base: Base{T: MTGet, ID: id}, Key: bk}
-		raw, err := pc.request(msg, id, ptr)
+		reqID := n.nextReqID()
+		msg := &MsgGet{Base: Base{T: MTGet, ID: reqID}, Key: bk}
+		raw, err := pc.request(msg, reqID, ptr)
 		if err != nil {
 			if isFatalTransport(err) {
-				n.resetPeer(addr) // next getPeer() will redial
+				n.resetPeer(peerID) // next getPeer() will redial
 			}
 			resCh <- ans{err: err}
 			return
@@ -142,7 +143,7 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		var rmsg MsgGetResp
 		if e := cbor.Unmarshal(raw, &rmsg); e != nil {
 			// Broken stream -> reset peer
-			n.resetPeer(addr)
+			n.resetPeer(peerID)
 			resCh <- ans{err: e}
 			return
 		}
@@ -261,7 +262,7 @@ func (n *Node[K, V]) Set(ctx context.Context, key K, val V, ttl time.Duration) e
 	exp := absExpiry(ttl)
 	ver := n.clock.Next()
 
-	if owners[0].Addr == n.cfg.PublicURL {
+	if owners[0].ID == n.cfg.ID {
 		_ = n.local.Set(key, val, ttl)
 		if n.cfg.LWWEnabled {
 			n.lwwSetVersion(bk, ver)
@@ -286,7 +287,7 @@ func (n *Node[K, V]) Delete(ctx context.Context, key K) error {
 	}
 
 	ver := n.clock.Next()
-	if owners[0].Addr == n.cfg.PublicURL {
+	if owners[0].ID == n.cfg.ID {
 		n.local.Delete(key)
 		if n.cfg.LWWEnabled {
 			n.lwwSetVersion(bk, ver)
@@ -309,12 +310,11 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 	if len(owners) == 0 {
 		return zero, ErrNoOwner
 	}
-
 	bk := n.kc.EncodeKey(key)
 	keyStr := string(bk)
-	primary := owners[0]
 
-	if primary.Addr == n.cfg.PublicURL {
+	primary := owners[0]
+	if primary.ID == n.cfg.ID {
 		// We are primary: single-flight locally.
 		if _, acquired := n.leases.acquire(keyStr); acquired {
 			var v V
@@ -355,7 +355,7 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 	}
 
 	// Delegate to primary (its lease table coordinates the load).
-	p := n.getPeer(primary.Addr)
+	p := n.getPeer(primary.ID)
 	if p == nil {
 		return zero, ErrBadPeer
 	}
@@ -370,14 +370,14 @@ func (n *Node[K, V]) GetOrLoad(ctx context.Context, key K, loader func(context.C
 	raw, err := p.request(msg, id, ttm)
 	if err != nil {
 		if isFatalTransport(err) {
-			n.resetPeer(primary.Addr)
+			n.resetPeer(primary.ID)
 		}
 		return zero, err
 	}
 
 	var resp MsgLeaseLoadResp
 	if err := cbor.Unmarshal(raw, &resp); err != nil {
-		n.resetPeer(primary.Addr)
+		n.resetPeer(primary.ID)
 		return zero, err
 	}
 	if resp.Err != "" {

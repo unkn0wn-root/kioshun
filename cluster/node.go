@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,8 +49,6 @@ func init() {
 	cborEnc, cborDec = em, dm
 }
 
-type tcpKeepAliveListener struct{ *net.TCPListener }
-
 type Node[K comparable, V any] struct {
 	cfg           Config
 	kc            KeyCodec[K]
@@ -69,12 +68,15 @@ type Node[K comparable, V any] struct {
 	verMu         sync.RWMutex
 	version       map[string]uint64
 	peersMu       sync.RWMutex
-	peers         map[string]*peerConn
+	peers         map[NodeID]*peerConn
 	tlsServerConf *tls.Config
 	tlsClientConf *tls.Config
 	reqID         uint64
 	handshakeGate chan struct{}
 	clock         *hlc
+	backfillKick  chan struct{}
+	lastRingSig   uint64
+	lastEpoch     uint64
 	stop          chan struct{}
 	stopOnce      sync.Once
 }
@@ -84,20 +86,22 @@ type Node[K comparable, V any] struct {
 // listening and background loops.
 func NewNode[K comparable, V any](cfg Config, keyc KeyCodec[K], c *cache.InMemoryCache[K, V], codec Codec[V]) *Node[K, V] {
 	cfg.Handoff.FillDefaults()
+	cfg.EnsureID()
 
 	n := &Node[K, V]{
-		cfg:     cfg,
-		kc:      keyc,
-		codec:   codec,
-		local:   c,
-		leases:  newLeaseTable(cfg.LeaseTTL),
-		heat:    newHeat(4, 4096, cfg.HotsetSize, 16),
-		mem:     newMembership(),
-		peers:   make(map[string]*peerConn),
-		stop:    make(chan struct{}),
-		hotSet:  make(map[string]int64),
-		version: make(map[string]uint64),
-		clock:   newHLC(),
+		cfg:          cfg,
+		kc:           keyc,
+		codec:        codec,
+		local:        c,
+		leases:       newLeaseTable(cfg.LeaseTTL),
+		heat:         newHeat(4, 4096, cfg.HotsetSize, 16),
+		mem:          newMembership(),
+		peers:        make(map[NodeID]*peerConn),
+		stop:         make(chan struct{}),
+		hotSet:       make(map[string]int64),
+		version:      make(map[string]uint64),
+		clock:        newHLC(uint16(xxhash.Sum64String(string(cfg.ID)))),
+		backfillKick: make(chan struct{}, 1),
 	}
 
 	r := newRing(cfg.ReplicationFactor)
@@ -134,15 +138,22 @@ func (n *Node[K, V]) Start() error {
 	n.ln = ln
 	go n.acceptLoop(ln)
 
-	// Ensure self is present in membership so the ring includes this node
-	// for owner selection and local primaries.
-	n.mem.ensure(NodeID(n.cfg.PublicURL), n.cfg.PublicURL)
+	// Ensure self in membership (identity + address).
+	n.mem.ensure(n.cfg.ID, n.cfg.PublicURL)
 
-	// proactively connect to seeds to accelerate gossip and ring formation.
+	// Prime the ring with self immediately to avoid early "no owner" windows.
+	{
+		r := newRing(n.cfg.ReplicationFactor)
+		r.nodes = []*nodeMeta{newMeta(n.cfg.ID, n.cfg.PublicURL)}
+		n.ring.Store(r)
+	}
+
+	// Bootstrap to seeds (addresses) to learn their IDs.
 	for _, s := range n.cfg.Seeds {
-		if s != n.cfg.PublicURL {
-			_ = n.ensurePeer(s)
+		if s == "" {
+			continue
 		}
+		_ = n.ensureSeed(s)
 	}
 
 	// fire!
@@ -251,13 +262,13 @@ func (n *Node[K, V]) closePeers() {
 	for _, p := range n.peers {
 		p.close()
 	}
-	n.peers = make(map[string]*peerConn)
+	n.peers = make(map[NodeID]*peerConn)
 }
 
-// getPeer returns a cached peer connection for addr, or nil if absent.
-func (n *Node[K, V]) getPeer(addr string) *peerConn {
+// getPeer returns a cached peer connection for peer ID, or nil if absent.
+func (n *Node[K, V]) getPeer(id NodeID) *peerConn {
 	n.peersMu.RLock()
-	p := n.peers[addr]
+	p := n.peers[id]
 	n.peersMu.RUnlock()
 	return p
 }
@@ -303,7 +314,6 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 		if rt := n.cfg.Sec.ReadTimeout; rt > 0 {
 			_ = t.SetDeadline(time.Now().Add(rt))
 		}
-
 		if err := t.Handshake(); err != nil {
 			_ = t.Close()
 			return
@@ -321,48 +331,73 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 	if wb <= 0 {
 		wb = 32 << 10
 	}
-
 	r := bufio.NewReaderSize(c, rb)
 	w := bufio.NewWriterSize(c, wb)
 
-	if n.cfg.Sec.AuthToken != "" {
-		if rt := n.cfg.Sec.ReadTimeout; rt > 0 {
-			_ = c.SetReadDeadline(time.Now().Add(rt))
-		}
+	requireToken := n.cfg.Sec.AuthToken != ""
+	allowNoHello := !requireToken && n.cfg.Sec.AllowUnauthenticatedClients
 
-		var hdr [4]byte
-		if _, err := io.ReadFull(r, hdr[:]); err != nil {
-			return
-		}
+	// we’ll parse exactly one initial frame up-front. If it’s Hello, we auth+ack.
+	// If it’s not Hello and no-hello is allowed, we’ll enqueue it as the first job.
+	// Otherwise we bail.
+	if rt := n.cfg.Sec.ReadTimeout; rt > 0 {
+		_ = c.SetReadDeadline(time.Now().Add(rt))
+	}
 
-		nbytes := int(binary.BigEndian.Uint32(hdr[:]))
-		if n.cfg.Sec.MaxFrameSize > 0 && nbytes > n.cfg.Sec.MaxFrameSize {
-			return
-		}
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return
+	}
 
-		buf := readBufPool.get(nbytes)
-		if _, err := io.ReadFull(r, buf[:nbytes]); err != nil {
-			readBufPool.put(buf)
-			return
-		}
+	nbytes := int(binary.BigEndian.Uint32(hdr[:]))
+	if n.cfg.Sec.MaxFrameSize > 0 && nbytes > n.cfg.Sec.MaxFrameSize {
+		return
+	}
 
-		if idle := n.cfg.Sec.IdleTimeout; idle > 0 {
-			_ = c.SetReadDeadline(time.Now().Add(idle))
-		} else {
-			_ = c.SetReadDeadline(time.Time{})
-		}
+	firstBuf := readBufPool.get(nbytes)
+	if _, err := io.ReadFull(r, firstBuf[:nbytes]); err != nil {
+		readBufPool.put(firstBuf)
+		return
+	}
 
-		var base Base
-		if err := cborDec.Unmarshal(buf[:nbytes], &base); err != nil || base.T != MTHello {
-			readBufPool.put(buf)
-			return
-		}
+	// switch to idle deadline window now that the first frame is read.
+	if idle := n.cfg.Sec.IdleTimeout; idle > 0 {
+		_ = c.SetReadDeadline(time.Now().Add(idle))
+	} else {
+		_ = c.SetReadDeadline(time.Time{})
+	}
 
+	// determine first-frame type
+	var base Base
+	if err := cborDec.Unmarshal(firstBuf[:nbytes], &base); err != nil {
+		readBufPool.put(firstBuf)
+		return
+	}
+
+	// connection state: becomes true when a peer successfully Hello’s.
+	authedPeer := false
+	// whether we should enqueue the first (non-hello) request after spinning workers.
+	enqueueFirst := false
+
+	if base.T == MTHello {
 		var h MsgHello
-		authOK := cborDec.Unmarshal(buf[:nbytes], &h) == nil && h.Token == n.cfg.Sec.AuthToken
-		readBufPool.put(buf)
+		if err := cborDec.Unmarshal(firstBuf[:nbytes], &h); err != nil {
+			readBufPool.put(firstBuf)
+			return
+		}
+		readBufPool.put(firstBuf)
 
-		ack := MsgHelloResp{Base: Base{T: MTHelloResp, ID: base.ID}, OK: authOK}
+		authOK := true
+		if tok := n.cfg.Sec.AuthToken; tok != "" && h.Token != tok {
+			authOK = false
+		}
+		if authOK {
+			authedPeer = true
+			// learn/refresh membership for this peer
+			n.mem.ensure(NodeID(h.FromID), h.FromAddr)
+		}
+
+		ack := MsgHelloResp{Base: Base{T: MTHelloResp, ID: base.ID}, OK: authOK, PeerID: string(n.cfg.ID)}
 		if !authOK {
 			ack.Err = errUnauthorized
 		}
@@ -371,14 +406,25 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 		if wt := n.cfg.Sec.WriteTimeout; wt > 0 {
 			_ = c.SetWriteDeadline(time.Now().Add(wt))
 		}
-
 		if err := writeFrameBuf(w, raw); err != nil || !authOK {
+			return
+		}
+	} else {
+		if requireToken || !allowNoHello {
+			// Hello required but didn't get it.
+			readBufPool.put(firstBuf)
+			return
+		}
+		// only allow public client RPCs as the very first frame
+		switch base.T {
+		case MTGet, MTGetBulk, MTSet, MTSetBulk, MTDelete:
+			enqueueFirst = true // keep firstBuf; workers will recycle it
+		default:
+			readBufPool.put(firstBuf)
 			return
 		}
 	}
 
-	// Per-connection worker pool - incoming frames are queued and processed
-	// up to PerConnWorkers with backpressure on the channel.
 	workers := n.cfg.PerConnWorkers
 	if workers <= 0 {
 		workers = 64
@@ -409,7 +455,6 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 	for i := 0; i < workers; i++ {
 		go func() {
 			for buf := range jobQ {
-				// buf length is exactly the frame body
 				var base Base
 				if err := cborDec.Unmarshal(buf, &base); err != nil {
 					readBufPool.put(buf)
@@ -448,11 +493,21 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 						send(n.rpcDel(d))
 					}
 				case MTLeaseLoad:
+					// Peer-only
+					if !authedPeer {
+						readBufPool.put(buf)
+						continue
+					}
 					var ll MsgLeaseLoad
 					if cborDec.Unmarshal(buf, &ll) == nil {
 						send(n.rpcLeaseLoad(ll))
 					}
 				case MTGossip:
+					// Peer-only
+					if !authedPeer {
+						readBufPool.put(buf)
+						continue
+					}
 					var g MsgGossip
 					if cborDec.Unmarshal(buf, &g) == nil {
 						n.ingestGossip(&g)
@@ -460,11 +515,21 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 						send(&ack)
 					}
 				case MTBackfillDigestReq:
+					// Peer-only
+					if !authedPeer {
+						readBufPool.put(buf)
+						continue
+					}
 					var q MsgBackfillDigestReq
 					if cborDec.Unmarshal(buf, &q) == nil {
 						send(n.rpcBackfillDigest(q))
 					}
 				case MTBackfillKeysReq:
+					// Peer-only
+					if !authedPeer {
+						readBufPool.put(buf)
+						continue
+					}
 					var q MsgBackfillKeysReq
 					if cborDec.Unmarshal(buf, &q) == nil {
 						send(n.rpcBackfillKeys(q))
@@ -475,11 +540,18 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 		}()
 	}
 
+	// enqueue the first request if we took the no-hello path.
+	// workers will recycle the buffer
+	if enqueueFirst {
+		jobQ <- firstBuf[:nbytes]
+	} else {
+		// Hello path or rejected no-hello: buffer already returned.
+	}
+
 	idle := n.cfg.Sec.IdleTimeout
 	if idle <= 0 {
 		idle = n.cfg.Sec.ReadTimeout
 	}
-
 	for {
 		if idle > 0 {
 			_ = c.SetReadDeadline(time.Now().Add(idle)) // waiting for next frame
@@ -494,7 +566,6 @@ func (n *Node[K, V]) serveConn(c net.Conn) {
 		if n.cfg.Sec.MaxFrameSize > 0 && nbytes > n.cfg.Sec.MaxFrameSize {
 			return
 		}
-
 		if rt := n.cfg.Sec.ReadTimeout; rt > 0 {
 			_ = c.SetReadDeadline(time.Now().Add(rt)) // active body read
 		}
@@ -521,6 +592,7 @@ func (n *Node[K, V]) ownersFor(key K) []*nodeMeta {
 		keyHash uint64
 		bk      = n.kc.EncodeKey(key)
 	)
+
 	if kh, ok := any(n.kc).(KeyHasher[K]); ok {
 		keyHash = kh.Hash64(key)
 	} else {
@@ -538,7 +610,7 @@ func (n *Node[K, V]) ownersFor(key K) []*nodeMeta {
 	outer:
 		for _, cand := range cands {
 			for _, ex := range owners {
-				if ex.Addr == cand.Addr {
+				if ex.ID == cand.ID {
 					continue outer
 				}
 			}
@@ -1061,42 +1133,48 @@ func (n *Node[K, V]) gossipLoop() {
 // sendGossip snapshots membership/seen, current load and hot keys, and sends
 // a gossip message to connected peers.
 func (n *Node[K, V]) sendGossip() {
-	_, seen, epoch := n.mem.snapshot()
+	peers, seen, epoch := n.mem.snapshot()
 	seenStr := make(map[string]int64, len(seen))
 	for id, ts := range seen {
 		seenStr[string(id)] = ts
 	}
+
+	list := make([]PeerInfo, 0, len(peers))
+	for id, meta := range peers {
+		list = append(list, PeerInfo{ID: string(id), Addr: meta.Addr})
+	}
+
 	ld := n.sampleLoad()
 	top := n.heat.exportTopK()
-	msg := &MsgGossip{Base: Base{
-		T:  MTGossip,
-		ID: n.nextReqID()},
-		From:  n.cfg.PublicURL,
-		Seen:  seenStr,
-		Peers: n.peerAddrs(),
-		Load:  ld,
-		TopK:  top,
-		Epoch: epoch,
+	msg := &MsgGossip{
+		Base:     Base{T: MTGossip, ID: n.nextReqID()},
+		FromID:   string(n.cfg.ID),
+		FromAddr: n.cfg.PublicURL,
+		Seen:     seenStr,
+		Peers:    list,
+		Load:     ld,
+		TopK:     top,
+		Epoch:    epoch,
 	}
 
 	n.peersMu.RLock()
 	defer n.peersMu.RUnlock()
-	for addr, pc := range n.peers {
-		if pc == nil || addr == n.cfg.PublicURL {
+	for id, pc := range n.peers {
+		if pc == nil || id == n.cfg.ID {
 			continue
 		}
 		_, _ = pc.request(msg, msg.ID, 1500*time.Millisecond)
 	}
 }
 
-// peerAddrs returns the addresses of currently known peer connections.
-func (n *Node[K, V]) peerAddrs() []string {
+// peerIDs returns IDs of currently known peer connections.
+func (n *Node[K, V]) peerIDs() []NodeID {
 	n.peersMu.RLock()
 	defer n.peersMu.RUnlock()
 
-	out := make([]string, 0, len(n.peers))
-	for a := range n.peers {
-		out = append(out, a)
+	out := make([]NodeID, 0, len(n.peers))
+	for id := range n.peers {
+		out = append(out, id)
 	}
 	return out
 }
@@ -1106,10 +1184,13 @@ func (n *Node[K, V]) peerAddrs() []string {
 func (n *Node[K, V]) ingestGossip(g *MsgGossip) {
 	now := time.Now().UnixNano()
 
-	n.mem.ensure(NodeID(g.From), g.From)
-	n.mem.integrate(NodeID(g.From), g.From, g.Peers, g.Seen, g.Epoch, now)
+	// track epoch change across integrate
+	_, _, prevEpoch := n.mem.snapshot()
+	n.mem.ensure(NodeID(g.FromID), g.FromAddr)
+	n.mem.integrate(NodeID(g.FromID), g.FromAddr, g.Peers, g.Seen, g.Epoch, now)
+	_, _, curEpoch := n.mem.snapshot()
 
-	if meta, ok := n.mem.peers[NodeID(g.From)]; ok {
+	if meta, ok := n.mem.peers[NodeID(g.FromID)]; ok {
 		atomic.StoreUint64(&meta.weight, computeWeight(g.Load))
 	}
 
@@ -1120,6 +1201,14 @@ func (n *Node[K, V]) ingestGossip(g *MsgGossip) {
 			n.hotSet[string(hk.K)] = exp
 		}
 		n.hotMu.Unlock()
+	}
+
+	if curEpoch > prevEpoch && curEpoch > atomic.LoadUint64(&n.lastEpoch) {
+		atomic.StoreUint64(&n.lastEpoch, curEpoch)
+		select {
+		case n.backfillKick <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -1138,13 +1227,25 @@ func (n *Node[K, V]) weightLoop() {
 
 			n.ring.Store(r)
 			for _, m := range alive {
-				if m.Addr != "" && m.Addr != n.cfg.PublicURL {
-					_ = n.ensurePeer(m.Addr)
+				if m.ID != n.cfg.ID && m.Addr != "" {
+					_ = n.ensurePeer(m.ID)
 				}
 			}
 
 			n.cleanupHot(now.UnixNano())
 			n.mem.pruneTombstones(now.UnixNano(), n.cfg.TombstoneAfter)
+
+			// Detect membership changes and bump epoch + trigger backfill.
+			sig := n.aliveSig(alive)
+			if sig != atomic.LoadUint64(&n.lastRingSig) {
+				atomic.StoreUint64(&n.lastRingSig, sig)
+				n.mem.bumpEpoch()
+				// non-blocking backfill kick
+				select {
+				case n.backfillKick <- struct{}{}:
+				default:
+				}
+			}
 		case <-n.stop:
 			return
 		}
@@ -1162,20 +1263,38 @@ func (n *Node[K, V]) cleanupHot(now int64) {
 	n.hotMu.Unlock()
 }
 
-// ensurePeer returns an existing peer connection or dials a new one (with
-// TLS/auth if configured), records it in membership, and caches it.
-func (n *Node[K, V]) ensurePeer(addr string) *peerConn {
+// aliveSig computes a stable signature of the alive member IDs for epoch bumps.
+func (n *Node[K, V]) aliveSig(alive []*nodeMeta) uint64 {
+	if len(alive) == 0 {
+		return 0
+	}
+	ids := make([]string, 0, len(alive))
+	for _, m := range alive {
+		ids = append(ids, string(m.ID))
+	}
+	sort.Strings(ids)
+	var acc uint64
+	for _, s := range ids {
+		acc = xxhash.Sum64String(s+"|") ^ (acc<<1 | acc>>63)
+	}
+	return acc
+}
+
+// ensurePeer: connect to a peer by ID (look up its current address in membership).
+func (n *Node[K, V]) ensurePeer(id NodeID) *peerConn {
 	n.peersMu.RLock()
-	p := n.peers[addr]
-	n.peersMu.RUnlock()
-	if p != nil {
+	if p := n.peers[id]; p != nil {
+		n.peersMu.RUnlock()
 		return p
 	}
+	n.peersMu.RUnlock()
 
-	n.peersMu.Lock()
-	defer n.peersMu.Unlock()
-	if p = n.peers[addr]; p != nil {
-		return p
+	// look up address
+	n.mem.mu.RLock()
+	meta := n.mem.peers[id]
+	n.mem.mu.RUnlock()
+	if meta == nil || meta.Addr == "" {
+		return nil
 	}
 
 	var tlsConf *tls.Config
@@ -1183,33 +1302,50 @@ func (n *Node[K, V]) ensurePeer(addr string) *peerConn {
 		tlsConf = n.tlsClientConf
 	}
 
-	// establish transport with auth/TLS and configure inflight limits.
-	pc, err := dialPeer(
-		n.cfg.PublicURL,
-		addr,
-		tlsConf,
-		n.cfg.Sec.MaxFrameSize,
-		n.cfg.Sec.ReadTimeout,
-		n.cfg.Sec.WriteTimeout,
-		n.cfg.Sec.IdleTimeout,
-		n.cfg.Sec.MaxInflightPerPeer,
-		n.cfg.Sec.AuthToken,
-	)
+	pc, peerID, err := dialPeer(n.cfg.ID, n.cfg.PublicURL, meta.Addr, tlsConf,
+		n.cfg.Sec.MaxFrameSize, n.cfg.Sec.ReadTimeout, n.cfg.Sec.WriteTimeout,
+		n.cfg.Sec.IdleTimeout, n.cfg.Sec.MaxInflightPerPeer, n.cfg.Sec.AuthToken)
+	if err != nil {
+		return nil
+	}
+	if peerID != id {
+		pc.close()
+		return nil
+	}
+
+	n.peersMu.Lock()
+	n.peers[id] = pc
+	n.peersMu.Unlock()
+	return pc
+}
+
+// ensureSeed: bootstrap by address when we don't know the peer ID yet.
+func (n *Node[K, V]) ensureSeed(addr string) *peerConn {
+	var tlsConf *tls.Config
+	if n.cfg.Sec.TLS.Enable {
+		tlsConf = n.tlsClientConf
+	}
+
+	pc, peerID, err := dialPeer(n.cfg.ID, n.cfg.PublicURL, addr, tlsConf,
+		n.cfg.Sec.MaxFrameSize, n.cfg.Sec.ReadTimeout, n.cfg.Sec.WriteTimeout,
+		n.cfg.Sec.IdleTimeout, n.cfg.Sec.MaxInflightPerPeer, n.cfg.Sec.AuthToken)
 	if err != nil {
 		return nil
 	}
 
-	n.peers[addr] = pc
-	n.mem.ensure(NodeID(addr), addr)
+	n.mem.ensure(peerID, addr)
+	n.peersMu.Lock()
+	n.peers[peerID] = pc
+	n.peersMu.Unlock()
 	return pc
 }
 
-// resetPeer closes and removes a cached peer connection for addr.
-func (n *Node[K, V]) resetPeer(addr string) {
+// resetPeer closes and removes a cached peer connection for the given peer ID.
+func (n *Node[K, V]) resetPeer(id NodeID) {
 	n.peersMu.Lock()
-	if p, ok := n.peers[addr]; ok && p != nil {
+	if p, ok := n.peers[id]; ok && p != nil {
 		p.close()
-		delete(n.peers, addr)
+		delete(n.peers, id)
 	}
 	n.peersMu.Unlock()
 }

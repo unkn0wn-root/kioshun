@@ -25,7 +25,7 @@ func (r *replicator[K, V]) replicateSet(ctx context.Context, key []byte, val []b
 	}
 
 	acks := 0
-	if len(owners) > 0 && owners[0].Addr == r.node.cfg.PublicURL {
+	if len(owners) > 0 && owners[0].ID == r.node.cfg.ID {
 		acks++
 	}
 	want := required - acks
@@ -34,20 +34,20 @@ func (r *replicator[K, V]) replicateSet(ctx context.Context, key []byte, val []b
 	b2, cp := r.node.maybeCompress(val)
 
 	// helper to send and enqueue hint on failure
-	sendOne := func(addr string, pc *peerConn) {
+	sendOne := func(pid NodeID, pc *peerConn) {
 		if pc == nil {
 			if r.node.hh != nil {
-				r.node.hh.enqueueSet(addr, key, b2, exp, ver, cp)
+				r.node.hh.enqueueSet(pid, key, b2, exp, ver, cp)
 			}
 			return
 		}
 
-		id := r.node.nextReqID()
-		msg := &MsgSet{Base: Base{T: MTSet, ID: id}, Key: key, Val: b2, Exp: exp, Ver: ver, Cp: cp}
-		raw, err := pc.request(msg, id, r.node.cfg.Sec.WriteTimeout)
+		reqID := r.node.nextReqID()
+		msg := &MsgSet{Base: Base{T: MTSet, ID: reqID}, Key: key, Val: b2, Exp: exp, Ver: ver, Cp: cp}
+		raw, err := pc.request(msg, reqID, r.node.cfg.Sec.WriteTimeout)
 		if err != nil {
 			if r.node.hh != nil {
-				r.node.hh.enqueueSet(addr, key, b2, exp, ver, cp)
+				r.node.hh.enqueueSet(pid, key, b2, exp, ver, cp)
 			}
 			return
 		}
@@ -55,10 +55,7 @@ func (r *replicator[K, V]) replicateSet(ctx context.Context, key []byte, val []b
 		var resp MsgSetResp
 		if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
 			if r.node.hh != nil {
-				if e == nil && resp.Err != "" {
-					// still enqueue; resp.Err examined for logging if needed
-				}
-				r.node.hh.enqueueSet(addr, key, b2, exp, ver, cp)
+				r.node.hh.enqueueSet(pid, key, b2, exp, ver, cp)
 			}
 			return
 		}
@@ -68,11 +65,11 @@ func (r *replicator[K, V]) replicateSet(ctx context.Context, key []byte, val []b
 	// still capturing failures into hinted handoff without blocking the caller.
 	if want <= 0 {
 		for _, own := range owners {
-			if own.Addr == r.node.cfg.PublicURL {
+			if own.ID == r.node.cfg.ID {
 				continue
 			}
-			pc := r.node.getPeer(own.Addr)
-			go sendOne(own.Addr, pc)
+			pc := r.node.getPeer(own.ID)
+			go sendOne(own.ID, pc)
 		}
 		return nil
 	}
@@ -84,26 +81,26 @@ func (r *replicator[K, V]) replicateSet(ctx context.Context, key []byte, val []b
 
 	errCh := make(chan error, len(owners))
 	for _, own := range owners {
-		if own.Addr == r.node.cfg.PublicURL {
+		if own.ID == r.node.cfg.ID {
 			continue
 		}
-		pc := r.node.getPeer(own.Addr)
+		pc := r.node.getPeer(own.ID)
 		if pc == nil {
 			// we know this one will miss; enqueue and continue
 			if r.node.hh != nil {
-				r.node.hh.enqueueSet(own.Addr, key, b2, exp, ver, cp)
+				r.node.hh.enqueueSet(own.ID, key, b2, exp, ver, cp)
 			}
 			continue
 		}
 
-		go func(addr string, p *peerConn) {
-			id := r.node.nextReqID()
-			msg := &MsgSet{Base: Base{T: MTSet, ID: id}, Key: key, Val: b2, Exp: exp, Ver: ver, Cp: cp}
-			raw, err := p.request(msg, id, r.node.cfg.Sec.WriteTimeout)
+		go func(pid NodeID, p *peerConn) {
+			reqID := r.node.nextReqID()
+			msg := &MsgSet{Base: Base{T: MTSet, ID: reqID}, Key: key, Val: b2, Exp: exp, Ver: ver, Cp: cp}
+			raw, err := p.request(msg, reqID, r.node.cfg.Sec.WriteTimeout)
 			if err != nil {
 				// enqueue and return an error
 				if r.node.hh != nil {
-					r.node.hh.enqueueSet(addr, key, b2, exp, ver, cp)
+					r.node.hh.enqueueSet(pid, key, b2, exp, ver, cp)
 				}
 				errCh <- err
 				return
@@ -112,7 +109,7 @@ func (r *replicator[K, V]) replicateSet(ctx context.Context, key []byte, val []b
 			var resp MsgSetResp
 			if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
 				if r.node.hh != nil {
-					r.node.hh.enqueueSet(addr, key, b2, exp, ver, cp)
+					r.node.hh.enqueueSet(pid, key, b2, exp, ver, cp)
 				}
 				if e == nil && resp.Err != "" {
 					errCh <- errors.New(resp.Err)
@@ -125,7 +122,7 @@ func (r *replicator[K, V]) replicateSet(ctx context.Context, key []byte, val []b
 			if atomic.AddInt32(&remaining, -1) <= 0 {
 				errCh <- nil
 			}
-		}(own.Addr, pc)
+		}(own.ID, pc)
 	}
 
 	for {
@@ -149,25 +146,25 @@ func (r *replicator[K, V]) replicateDelete(ctx context.Context, key []byte, owne
 		required = 1
 	}
 	acks := 0
-	if len(owners) > 0 && owners[0].Addr == r.node.cfg.PublicURL {
+	if len(owners) > 0 && owners[0].ID == r.node.cfg.ID {
 		acks++
 	}
 	want := required - acks
 
-	sendOne := func(addr string, pc *peerConn) {
+	sendOne := func(pid NodeID, pc *peerConn) {
 		if pc == nil {
 			if r.node.hh != nil {
-				r.node.hh.enqueueDel(addr, key, ver)
+				r.node.hh.enqueueDel(pid, key, ver)
 			}
 			return
 		}
 
-		id := r.node.nextReqID()
-		msg := &MsgDel{Base: Base{T: MTDelete, ID: id}, Key: key, Ver: ver}
-		raw, err := pc.request(msg, id, r.node.cfg.Sec.WriteTimeout)
+		reqID := r.node.nextReqID()
+		msg := &MsgDel{Base: Base{T: MTDelete, ID: reqID}, Key: key, Ver: ver}
+		raw, err := pc.request(msg, reqID, r.node.cfg.Sec.WriteTimeout)
 		if err != nil {
 			if r.node.hh != nil {
-				r.node.hh.enqueueDel(addr, key, ver)
+				r.node.hh.enqueueDel(pid, key, ver)
 			}
 			return
 		}
@@ -175,7 +172,7 @@ func (r *replicator[K, V]) replicateDelete(ctx context.Context, key []byte, owne
 		var resp MsgDelResp
 		if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
 			if r.node.hh != nil {
-				r.node.hh.enqueueDel(addr, key, ver)
+				r.node.hh.enqueueDel(pid, key, ver)
 			}
 			return
 		}
@@ -183,11 +180,11 @@ func (r *replicator[K, V]) replicateDelete(ctx context.Context, key []byte, owne
 
 	if want <= 0 {
 		for _, own := range owners {
-			if own.Addr == r.node.cfg.PublicURL {
+			if own.ID == r.node.cfg.ID {
 				continue
 			}
-			pc := r.node.getPeer(own.Addr)
-			go sendOne(own.Addr, pc)
+			pc := r.node.getPeer(own.ID)
+			go sendOne(own.ID, pc)
 		}
 		return nil
 	}
@@ -198,24 +195,24 @@ func (r *replicator[K, V]) replicateDelete(ctx context.Context, key []byte, owne
 	errCh := make(chan error, len(owners))
 
 	for _, own := range owners {
-		if own.Addr == r.node.cfg.PublicURL {
+		if own.ID == r.node.cfg.ID {
 			continue
 		}
-		pc := r.node.getPeer(own.Addr)
+		pc := r.node.getPeer(own.ID)
 		if pc == nil {
 			if r.node.hh != nil {
-				r.node.hh.enqueueDel(own.Addr, key, ver)
+				r.node.hh.enqueueDel(own.ID, key, ver)
 			}
 			continue
 		}
 
-		go func(addr string, p *peerConn) {
-			id := r.node.nextReqID()
-			msg := &MsgDel{Base: Base{T: MTDelete, ID: id}, Key: key, Ver: ver}
-			raw, err := p.request(msg, id, r.node.cfg.Sec.WriteTimeout)
+		go func(pid NodeID, p *peerConn) {
+			reqID := r.node.nextReqID()
+			msg := &MsgDel{Base: Base{T: MTDelete, ID: reqID}, Key: key, Ver: ver}
+			raw, err := p.request(msg, reqID, r.node.cfg.Sec.WriteTimeout)
 			if err != nil {
 				if r.node.hh != nil {
-					r.node.hh.enqueueDel(addr, key, ver)
+					r.node.hh.enqueueDel(pid, key, ver)
 				}
 				errCh <- err
 				return
@@ -224,7 +221,7 @@ func (r *replicator[K, V]) replicateDelete(ctx context.Context, key []byte, owne
 			var resp MsgDelResp
 			if e := cbor.Unmarshal(raw, &resp); e != nil || !resp.OK {
 				if r.node.hh != nil {
-					r.node.hh.enqueueDel(addr, key, ver)
+					r.node.hh.enqueueDel(pid, key, ver)
 				}
 				if e == nil && resp.Err != "" {
 					errCh <- errors.New(resp.Err)
@@ -236,7 +233,7 @@ func (r *replicator[K, V]) replicateDelete(ctx context.Context, key []byte, owne
 			if atomic.AddInt32(&remaining, -1) <= 0 {
 				errCh <- nil
 			}
-		}(own.Addr, pc)
+		}(own.ID, pc)
 	}
 
 	for {

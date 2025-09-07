@@ -6,18 +6,119 @@ import (
 )
 
 const (
-	hlcLogicalBits = 16
-	hlcLogicalMask = (1 << hlcLogicalBits) - 1
+	hlcLogicalBits = 16     // total logical bits (low end of the 64-bit HLC)
+	hlcNodeBits    = 8      // low bits reserved for nodeID (0..255)
+	hlcSeqBits     = 16 - 8 // remaining logical bits for per-ms sequence
+	hlcNodeMask    = (1 << hlcNodeBits) - 1
+	hlcSeqMask     = (1 << hlcSeqBits) - 1
 )
 
-// packHLC encodes physical milliseconds and logical counter into a 64-bit HLC.
-func packHLC(physMS int64, logical uint16) uint64 {
+// hlc is a 64-bit Hybrid Logical Clock:
+// layout:
+// [48 bits physical millis][hlcSeqBits seq][hlcNodeBits nodeID].
+type hlc struct {
+	mu     sync.Mutex
+	physMS int64
+	seq    uint16
+	nodeID uint16
+}
+
+// newHLC constructs an HLC that embeds a per-node ID in the low logical bits.
+// nodeID is masked to hlcNodeBits (e.g., 8 bits -> 0..255).
+func newHLC(nodeID uint16) *hlc {
+	return &hlc{nodeID: nodeID & hlcNodeMask}
+}
+
+// Next returns a strictly monotonic timestamp for local events.
+// yields strictly monotonic timestamps for local events.
+func (h *hlc) Next() uint64 {
+	now := time.Now().UnixMilli()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if now > h.physMS {
+		h.physMS = now
+		h.seq = 0
+	} else {
+		if h.seq < hlcSeqMask {
+			h.seq++
+		} else {
+			h.physMS++
+			h.seq = 0
+		}
+	}
+	v := packHLC(h.physMS, h.seq, h.nodeID)
+	return v
+}
+
+// Observe incorporates a remote HLC into our state to avoid regressions.
+// After Observe(remote), a subsequent Next() will be strictly > remote (monotonic).
+func (h *hlc) Observe(remote uint64) {
+	rp, rlog := unpackHLC(remote)
+	rseq, _ := splitLogical(rlog)
+	now := time.Now().UnixMilli()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	phys := maxOf(h.physMS, now, rp)
+
+	switch {
+	case phys == rp && phys == h.physMS:
+		target := h.seq
+		if rseq > target {
+			target = rseq
+		}
+
+		newSeq := target + 1
+		if newSeq > hlcSeqMask {
+			h.physMS = phys + 1
+			h.seq = 0
+		} else {
+			h.physMS = phys
+			h.seq = newSeq
+		}
+	case phys == rp && phys > h.physMS:
+		newSeq := rseq + 1
+		if newSeq > hlcSeqMask {
+			h.physMS = phys + 1
+			h.seq = 0
+		} else {
+			h.physMS = phys
+			h.seq = newSeq
+		}
+	case phys == h.physMS && phys > rp:
+		if h.seq < hlcSeqMask {
+			h.seq++
+		} else {
+			h.physMS++
+			h.seq = 0
+		}
+
+	default:
+		h.physMS = phys
+		h.seq = 0
+	}
+
+}
+
+// packHLC encodes physical milliseconds and a combined (seq,nodeID) into a 64-bit HLC.
+func packHLC(physMS int64, seq uint16, nodeID uint16) uint64 {
+	logical := ((seq & hlcSeqMask) << hlcNodeBits) | (nodeID & hlcNodeMask)
 	return (uint64(physMS) << hlcLogicalBits) | uint64(logical)
 }
 
-// unpackHLC decodes a 64-bit HLC into physical milliseconds and logical.
+// unpackHLC decodes a 64-bit HLC into physical milliseconds and the 16-bit logical.
 func unpackHLC(ts uint64) (physMS int64, logical uint16) {
-	return int64(ts >> hlcLogicalBits), uint16(ts & hlcLogicalMask)
+	return int64(ts >> hlcLogicalBits), uint16(ts & ((1 << hlcLogicalBits) - 1))
+}
+
+// splitLogical splits the 16-bit logical field into (seq, nodeID).
+func splitLogical(logical uint16) (seq uint16, nodeID uint16) {
+	seq = (logical >> hlcNodeBits) & hlcSeqMask
+	nodeID = logical & hlcNodeMask
+	return
 }
 
 func maxOf(a, b, c int64) int64 {
@@ -28,62 +129,4 @@ func maxOf(a, b, c int64) int64 {
 		a = c
 	}
 	return a
-}
-
-// hlc is a 64-bit Hybrid Logical Clock:
-// layout: [48 bits physical millis][16 bits logical counter].
-// Next() yields strictly monotonic timestamps for local events.
-// Observe() integrates remote HLC values to avoid regressions during replication.
-type hlc struct {
-	mu      sync.Mutex
-	physMS  int64  // last physical ms
-	logical uint16 // last logical
-}
-
-// newHLC constructs an HLC initialized to zero state.
-func newHLC() *hlc {
-	return &hlc{}
-}
-
-// Next returns a strictly monotonic timestamp for local events.
-func (h *hlc) Next() uint64 {
-	now := time.Now().UnixMilli()
-	h.mu.Lock()
-	if now > h.physMS {
-		h.physMS = now
-		h.logical = 0
-	} else {
-		h.logical++
-	}
-	v := packHLC(h.physMS, h.logical)
-	h.mu.Unlock()
-	return v
-}
-
-// Observe incorporates a remote HLC into our state to avoid regressions.
-func (h *hlc) Observe(remote uint64) {
-	rp, rl := unpackHLC(remote)
-	now := time.Now().UnixMilli()
-
-	h.mu.Lock()
-	phys := maxOf(h.physMS, now, rp)
-	switch {
-	case phys == rp && phys == h.physMS:
-		if rl >= h.logical {
-			h.logical = rl + 1
-		} else {
-			h.logical++ // both equal phys; bump past local logical too
-		}
-		h.physMS = phys
-	case phys == rp && phys > h.physMS:
-		h.physMS = phys
-		h.logical = rl + 1
-	case phys == h.physMS && phys > rp:
-		h.logical++ // local phys dominates; ensure monotone logical
-	default:
-		// phys == now and > both; reset logical
-		h.physMS = phys
-		h.logical = 0
-	}
-	h.mu.Unlock()
 }
