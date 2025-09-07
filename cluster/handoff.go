@@ -334,7 +334,7 @@ type handoff[K comparable, V any] struct {
 	node       *Node[K, V]
 	cfg        HandoffConfig
 	mu         sync.Mutex
-	peers      map[string]*hintQueue
+	peers      map[NodeID]*hintQueue
 	totalItems atomic.Int64
 	totalBytes atomic.Int64
 	paused     atomic.Bool
@@ -346,7 +346,7 @@ func newHandoff[K comparable, V any](n *Node[K, V]) *handoff[K, V] {
 	h := &handoff[K, V]{
 		node:  n,
 		cfg:   n.cfg.Handoff,
-		peers: make(map[string]*hintQueue),
+		peers: make(map[NodeID]*hintQueue),
 		stop:  make(chan struct{}),
 	}
 	go h.loop()
@@ -354,13 +354,13 @@ func newHandoff[K comparable, V any](n *Node[K, V]) *handoff[K, V] {
 }
 
 // queue returns the per-peer queue, creating it on demand.
-func (h *handoff[K, V]) queue(addr string) *hintQueue {
+func (h *handoff[K, V]) queue(id NodeID) *hintQueue {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	q := h.peers[addr]
+	q := h.peers[id]
 	if q == nil {
 		q = newHintQueue(h.cfg)
-		h.peers[addr] = q
+		h.peers[id] = q
 	}
 	return q
 }
@@ -368,7 +368,7 @@ func (h *handoff[K, V]) queue(addr string) *hintQueue {
 // enqueueSet enqueues a SET hint for addr with value bytes
 // (optionally compressed), absolute expiry, and version.
 // Dropped when handoff disabled or auto-paused due to backlog.
-func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver uint64, cp bool) {
+func (h *handoff[K, V]) enqueueSet(id NodeID, key, val []byte, exp int64, ver uint64, cp bool) {
 	if !h.cfg.IsEnabled() {
 		return
 	}
@@ -388,7 +388,7 @@ func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver 
 		size:      int64(len(key)+len(val)) + hintOverheadSet,
 		heapIndex: -1, // nextAt==0 -> ready FIFO
 	}
-	q := h.queue(addr)
+	q := h.queue(id)
 	ok, byDelta, itDelta := q.enqueue(it)
 	if byDelta != 0 || itDelta != 0 {
 		h.totalItems.Add(int64(itDelta))
@@ -407,7 +407,7 @@ func (h *handoff[K, V]) enqueueSet(addr string, key, val []byte, exp int64, ver 
 
 // enqueueDel enqueues a DELETE hint for addr with a version. The value field
 // is empty for deletes. Dropped when handoff disabled or auto-paused.
-func (h *handoff[K, V]) enqueueDel(addr string, key []byte, ver uint64) {
+func (h *handoff[K, V]) enqueueDel(id NodeID, key []byte, ver uint64) {
 	if !h.cfg.IsEnabled() {
 		return
 	}
@@ -427,7 +427,7 @@ func (h *handoff[K, V]) enqueueDel(addr string, key []byte, ver uint64) {
 		size:      int64(len(key)) + hintOverheadDel,
 		heapIndex: -1,
 	}
-	q := h.queue(addr)
+	q := h.queue(id)
 	ok, byDelta, itDelta := q.enqueue(it)
 	if byDelta != 0 || itDelta != 0 {
 		h.totalItems.Add(int64(itDelta))
@@ -559,38 +559,38 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 	idx := int(h.rr)
 	h.rr++
 
-	// snapshot addresses .
-	addrs := make([]string, 0, len(h.peers))
-	for a := range h.peers {
-		addrs = append(addrs, a)
+	// snapshot peer IDs
+	ids := make([]NodeID, 0, len(h.peers))
+	for id := range h.peers {
+		ids = append(ids, id)
 	}
 	h.mu.Unlock()
 
 	now := time.Now().UnixNano()
-	for k := 0; k < len(addrs); k++ {
-		addr := addrs[(idx+k)%len(addrs)]
-		q := h.queue(addr)
+	for k := 0; k < len(ids); k++ {
+		id := ids[(idx+k)%len(ids)]
+		q := h.queue(id)
 		hi := q.popReady(now)
 		if hi == nil {
 			continue
 		}
 
-		pc := h.node.getPeer(addr)
+		pc := h.node.getPeer(id)
 		if pc == nil {
-			pc = h.node.ensurePeer(addr)
+			pc = h.node.ensurePeer(id)
 			if pc == nil {
 				h.scheduleRetry(q, hi, backoff)
 				continue
 			}
 		}
 
-		id := h.node.nextReqID()
+		rid := h.node.nextReqID()
 		if !hi.isDel {
 			// SET hint
 			msg := &MsgSet{
 				Base: Base{
 					T:  MTSet,
-					ID: id,
+					ID: rid,
 				},
 				Key: hi.key,
 				Val: hi.val,
@@ -599,10 +599,10 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 				Cp:  hi.cp,
 			}
 
-			raw, err := pc.request(msg, id, h.node.cfg.Sec.WriteTimeout)
+			raw, err := pc.request(msg, rid, h.node.cfg.Sec.WriteTimeout)
 			if err != nil {
 				if isFatalTransport(err) {
-					h.node.resetPeer(addr)
+					h.node.resetPeer(id)
 				}
 				h.scheduleRetry(q, hi, backoff)
 				continue
@@ -611,7 +611,7 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 			var resp MsgSetResp
 			if e := cbor.Unmarshal(raw, &resp); e != nil {
 				// likely broken stream → reset.
-				h.node.resetPeer(addr)
+				h.node.resetPeer(id)
 				h.scheduleRetry(q, hi, backoff)
 				continue
 			}
@@ -625,11 +625,11 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 			return true
 		}
 
-		msg := &MsgDel{Base: Base{T: MTDelete, ID: id}, Key: hi.key, Ver: hi.ver}
-		raw, err := pc.request(msg, id, h.node.cfg.Sec.WriteTimeout)
+		msg := &MsgDel{Base: Base{T: MTDelete, ID: rid}, Key: hi.key, Ver: hi.ver}
+		raw, err := pc.request(msg, rid, h.node.cfg.Sec.WriteTimeout)
 		if err != nil {
 			if isFatalTransport(err) {
-				h.node.resetPeer(addr)
+				h.node.resetPeer(id)
 			}
 			h.scheduleRetry(q, hi, backoff)
 			continue
@@ -637,7 +637,7 @@ func (h *handoff[K, V]) replayOne(backoff func(int) time.Duration) bool {
 
 		var resp MsgDelResp
 		if e := cbor.Unmarshal(raw, &resp); e != nil {
-			h.node.resetPeer(addr)
+			h.node.resetPeer(id)
 			h.scheduleRetry(q, hi, backoff)
 			continue
 		}

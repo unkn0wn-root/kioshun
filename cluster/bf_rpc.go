@@ -23,10 +23,16 @@ func (n *Node[K, V]) rpcBackfillDigest(req MsgBackfillDigestReq) MsgBackfillDige
 	if depth <= 0 || depth > 8 {
 		depth = 2
 	}
+
 	r := n.ring.Load().(*ring)
-	targetID, ok := r.idByAddr(req.Target)
-	if !ok {
-		return MsgBackfillDigestResp{Base: Base{T: MTBackfillDigestResp, ID: req.ID}, Depth: uint8(depth), NotInRing: true}
+
+	targetID := NodeID(req.TargetID)
+	if !r.hasID(targetID) {
+		return MsgBackfillDigestResp{
+			Base:      Base{T: MTBackfillDigestResp, ID: req.ID},
+			Depth:     uint8(depth),
+			NotInRing: true,
+		}
 	}
 
 	type agg struct {
@@ -87,9 +93,14 @@ func (n *Node[K, V]) rpcBackfillKeys(req MsgBackfillKeysReq) MsgBackfillKeysResp
 	}
 
 	r := n.ring.Load().(*ring)
-	targetID, ok := r.idByAddr(req.Target)
-	if !ok {
-		return MsgBackfillKeysResp{Base: Base{T: MTBackfillKeysResp, ID: req.ID}, Done: true, NotInRing: true}
+
+	targetID := NodeID(req.TargetID)
+	if !r.hasID(targetID) {
+		return MsgBackfillKeysResp{
+			Base:      Base{T: MTBackfillKeysResp, ID: req.ID},
+			Done:      true,
+			NotInRing: true,
+		}
 	}
 
 	limit := req.Limit

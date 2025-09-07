@@ -40,7 +40,7 @@ func (m *membership) snapshot() (map[NodeID]*nodeMeta, map[NodeID]int64, uint64)
 
 // integrate merges gossip from a peer: updates address, seen timestamps,
 // and tracks the highest epoch to detect cluster resyncs.
-func (m *membership) integrate(from NodeID, addr string, peersAddrs []string, seen map[string]int64, epoch uint64, now int64) {
+func (m *membership) integrate(from NodeID, addr string, peers []PeerInfo, seen map[string]int64, epoch uint64, now int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if epoch > m.epoch {
@@ -55,10 +55,12 @@ func (m *membership) integrate(from NodeID, addr string, peersAddrs []string, se
 
 	m.seen[from] = now
 
-	for _, a := range peersAddrs {
-		id := NodeID(a)
+	for _, p := range peers {
+		id := NodeID(p.ID)
 		if _, ok := m.peers[id]; !ok {
-			m.peers[id] = newMeta(id, a)
+			m.peers[id] = newMeta(id, p.Addr)
+		} else {
+			m.peers[id].Addr = p.Addr
 		}
 	}
 
@@ -75,6 +77,7 @@ func (m *membership) integrate(from NodeID, addr string, peersAddrs []string, se
 func (m *membership) alive(now int64, suspicionAfter time.Duration) []*nodeMeta {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
 	out := make([]*nodeMeta, 0, len(m.peers))
 	threshold := now - suspicionAfter.Nanoseconds()
 	for id, meta := range m.peers {
@@ -106,4 +109,13 @@ func (m *membership) ensure(id NodeID, addr string) {
 		m.peers[id] = newMeta(id, addr)
 	}
 	m.seen[id] = time.Now().UnixNano()
+}
+
+// bumpEpoch increments the membership epoch to signal a topology change.
+func (m *membership) bumpEpoch() uint64 {
+	m.mu.Lock()
+	m.epoch++
+	e := m.epoch
+	m.mu.Unlock()
+	return e
 }

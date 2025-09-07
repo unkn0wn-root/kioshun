@@ -48,7 +48,7 @@ func (n *Node[K, V]) rebalanceOnce() {
 		}
 
 		primary := owners[0]
-		if primary.Addr == n.cfg.PublicURL {
+		if primary.ID == n.cfg.ID {
 			continue
 		}
 
@@ -66,7 +66,7 @@ func (n *Node[K, V]) rebalanceOnce() {
 
 		bk := n.kc.EncodeKey(k)
 		exp := absExpiry(ttl)
-		pc := n.getPeer(primary.Addr)
+		pc := n.getPeer(primary.ID)
 		if pc == nil || pc.penalized() {
 			// Let next pass try again; we keep local until success.
 			continue
@@ -89,14 +89,14 @@ func (n *Node[K, V]) rebalanceOnce() {
 		raw, err := pc.request(msg, id, n.cfg.Sec.WriteTimeout)
 		if err != nil {
 			if isFatalTransport(err) {
-				n.resetPeer(primary.Addr)
+				n.resetPeer(primary.ID)
 			}
 			continue
 		}
 
 		var resp MsgSetResp
 		if e := cbor.Unmarshal(raw, &resp); e != nil {
-			n.resetPeer(primary.Addr)
+			n.resetPeer(primary.ID)
 			continue
 		}
 		if !resp.OK {

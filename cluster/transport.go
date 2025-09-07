@@ -22,8 +22,10 @@ const (
 )
 
 type peerConn struct {
-	addr         string
-	self         string
+	addr         string // current dial address for this peer
+	selfID       NodeID
+	selfAddr     string
+	peerID       NodeID
 	conn         net.Conn
 	r            *bufio.Reader
 	w            *bufio.Writer
@@ -41,9 +43,11 @@ type peerConn struct {
 	toStreak     uint32
 }
 
-// dialPeer establishes a TCP/TLS connection, performs an optional Hello auth,
-// and starts a read loop that dispatches responses by request ID via pend map.
-func dialPeer(self string, addr string, tlsConf *tls.Config, maxFrame int, readTO, writeTO, idleTO time.Duration, inflight int, token string) (*peerConn, error) {
+// dialPeer establishes a connection, performs Hello (auth+identity),
+// and starts the read loop. Returns the learned peerID.
+func dialPeer(selfID NodeID, selfAddr, addr string, tlsConf *tls.Config, maxFrame int,
+	readTO, writeTO, idleTO time.Duration, inflight int, token string,
+) (*peerConn, NodeID, error) {
 	d := &net.Dialer{
 		Timeout:   readTO,
 		KeepAlive: 45 * time.Second,
@@ -64,7 +68,7 @@ func dialPeer(self string, addr string, tlsConf *tls.Config, maxFrame int, readT
 		c, err = d.Dial("tcp", addr)
 	}
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if tlsConf == nil {
@@ -77,7 +81,8 @@ func dialPeer(self string, addr string, tlsConf *tls.Config, maxFrame int, readT
 
 	pc := &peerConn{
 		addr:       addr,
-		self:       self,
+		selfID:     selfID,
+		selfAddr:   selfAddr,
 		conn:       c,
 		r:          bufio.NewReaderSize(c, 64<<10),
 		w:          bufio.NewWriterSize(c, 64<<10),
@@ -89,23 +94,27 @@ func dialPeer(self string, addr string, tlsConf *tls.Config, maxFrame int, readT
 		inflightCh: make(chan struct{}, inflight),
 		token:      token,
 	}
-	if token != "" {
-		if err := pc.hello(); err != nil {
-			_ = c.Close()
-			return nil, err
-		}
+
+	if err := pc.hello(); err != nil {
+		_ = c.Close()
+		return nil, "", err
 	}
 	// start the demultiplexing reader: one goroutine reads frames and routes
 	// them to the waiting requester channel keyed by Base.ID.
 	go pc.readLoop()
-	return pc, nil
+	return pc, pc.peerID, nil
 }
 
 // hello performs an authentication handshake by sending MsgHello and expecting
 // a positive MsgHelloResp.
 func (p *peerConn) hello() error {
 	id := uint64(time.Now().UnixNano())
-	msg := &MsgHello{Base: Base{T: MTHello, ID: id}, From: p.self, Token: p.token}
+	msg := &MsgHello{
+		Base:     Base{T: MTHello, ID: id},
+		FromID:   string(p.selfID),
+		FromAddr: p.selfAddr,
+		Token:    p.token,
+	}
 	raw, err := cborEnc.Marshal(msg)
 	if err != nil {
 		return err
@@ -139,6 +148,8 @@ func (p *peerConn) hello() error {
 		}
 		return errors.New(hr.Err)
 	}
+
+	p.peerID = NodeID(hr.PeerID)
 	return nil
 }
 
