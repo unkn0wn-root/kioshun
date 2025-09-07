@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.11](https://github.com/unkn0wn-root/kioshun/compare/v0.3.10...v0.3.11) (2025-09-07)
+
+
+### Features
+
+* add MaxConcurrentHandshakes and resoect container limits with GOMAXPROCS ([bfbcc78](https://github.com/unkn0wn-root/kioshun/commit/bfbcc7842fc3fd0dcf3c4db654ee6fbadf406f96))
+* **cluster:** use ID instead of PublicURL ([e5e9bb3](https://github.com/unkn0wn-root/kioshun/commit/e5e9bb39b201fc434293800b385dc0a5f04bfc2c))
+
+
+### Bug Fixes
+
+* tests after publicurl to node id change ([d9e7f83](https://github.com/unkn0wn-root/kioshun/commit/d9e7f837ff264a4db6b32c4caed9bcb3e18e2667))
+
 ### [0.3.10](https://github.com/unkn0wn-root/kioshun/compare/v0.3.9...v0.3.10) (2025-09-05)
 
 
