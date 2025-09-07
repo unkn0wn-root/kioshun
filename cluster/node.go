@@ -49,8 +49,6 @@ func init() {
 	cborEnc, cborDec = em, dm
 }
 
-type tcpKeepAliveListener struct{ *net.TCPListener }
-
 type Node[K comparable, V any] struct {
 	cfg           Config
 	kc            KeyCodec[K]
