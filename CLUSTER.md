@@ -11,6 +11,7 @@ This document describes the distributed cache cluster components and protocols u
 ## Usage Model (peer-to-peer)
 
 - Peer-to-peer mesh: each service instance runs a full cluster peer. Nodes discover each other via `Seeds`, gossip membership/weights, form a weighted rendezvous ring, and replicate directly. There is no coordinator or proxy.
+- Identity: every node has a stable `ID` (type `NodeID`) used in membership and the ring. If not provided, `ID` defaults to a 16‑hex digest derived from `PublicURL` (`Config.EnsureID()`). `PublicURL` is the dialable address.
 - In-process node: embed a `cluster.Node` in your service. Start it with a unique `PublicURL` and `BindAddr`, configure `Seeds` with known peers, then wrap it with `NewDistributedCache` to call `Set/Get`.
 
 ### Kioshun Mesh-style vs. Redis-style
@@ -54,10 +55,10 @@ _ = v; _ = ok
 
 Key points:
 
-- Mesh like: every instance is a peer; it gossips, can be selected as an owner, and stores a shard locally.
-- Reachability: `CACHE_PUBLIC` must be routable between peers. Open the port in firewalls/security groups.
+- Mesh like: every instance is a peer - it gossips, can be selected as an owner, and stores a shard locally.
+- Reachability: `CACHE_PUBLIC` must be routable between peers.
 - Durability: tune `ReplicationFactor` and `WriteConcern` (e.g., RF=3, WC=2).
-- Security: set the same `CACHE_AUTH` on all peers. Enable TLS in config if required.
+- Security: set the same `CACHE_AUTH` on all peers. Enable TLS in config if required. When `AuthToken` is empty and `AllowUnauthenticatedClients` is true, public client RPCs are allowed without Hello; peer‑only RPCs still require Hello.
 - Adapter scope: `Clear/Size/Stats` act on the local shard only.
 
 ## Architecture
@@ -73,7 +74,7 @@ Core components:
 - Rendezvous ring with dynamic weights chooses RF owners per key.
 - LWW replication with HLC versions guarantees monotonic conflict resolution.
 - Hinted handoff replays missed writes to down/unreachable owners.
-- Digest‑based backfill periodically repairs divergence and on join.
+- Digest‑based backfill repairs divergence on join and periodically. It is also kicked shortly after membership epoch changes.
 
 ## Data Flow
 
@@ -85,8 +86,8 @@ Write path (Set/Delete):
 
 Read path (Get):
 1. If local is primary and key exists, serve locally.
-2. Otherwise route to primary owner; decompress/deserialize on success.
-3. Clients may hedge reads across owners to reduce tail latency.
+2. Otherwise route to ring owners. Healthy (non‑penalized) peers are tried first; additional legs are hedged after a small delay.
+3. Responses are decompressed/decoded; "notfound" from an owner is treated as a clean miss.
 
 ## Failure Handling
 
@@ -94,14 +95,15 @@ Hinted handoff:
 - Per‑peer queues store newest version per key with absolute expiry.
 - Replay loop drains queues with exponential backoff and global RPS limit.
 - Auto‑pause stops enqueues under high backlog; replay continues to drain.
+- Transport timeouts increment a short penalty window per peer. Penalized peers are temporarily deprioritized for reads.
 
 Backfill/repair:
 - Donor builds bucket digests (count, XOR(hash^version)) for a prefix depth.
 - Joiner compares to its local digests - on mismatch, pages keys by bucket.
-- Keys are imported with versions and absolute expiries; LWW prunes stale.
+- Keys are imported with versions and absolute expiries; LWW prunes stale. Backfill also runs shortly after membership epoch increases to start repair promptly.
 
 Ring membership:
-- Gossip exchanges peer addresses, seen timestamps, and load.
+- Gossip exchanges peer identity (`ID`), current address, seen timestamps, and load.
 - Weight updates rebuild a weighted rendezvous ring for owner selection.
 
 ## Consistency Model
@@ -114,12 +116,13 @@ Ring membership:
 
 Transport:
 - Length‑prefixed frames over TCP (optional TLS); each frame carries a CBOR message.
-- Initial Hello (with token) authenticates peers when auth is enabled.
+- Initial Hello authenticates/identifies peers when auth is enabled. `MsgHello{FromID, FromAddr, Token}` → `MsgHelloResp{OK, PeerID, Err}`. When `AllowUnauthenticatedClients` is true and no token is set, public client RPCs may be sent as the first frame without Hello. Peer‑only RPCs still require Hello.
 
 Messages:
-- Get/Set/Delete (+Bulk) carry keys, values, compression flag, expiry, and version.
+- Set/Delete (+Bulk) carry keys, values (for Set), compression flag, absolute expiry, and version (HLC).
+- Get/GetBulk return found flag(s), value bytes, compression flags, and optional expiry; they do not carry version.
 - LeaseLoad supports coordinated loader on primary with single‑flight leases.
-- Gossip exchanges peer list, load metrics, and hot key samples.
+- Gossip exchanges peer list (ID + Addr), load metrics, hot key samples, and epoch.
 - BackfillDigest/BackfillKeys implement incremental repair.
 
 ```
@@ -129,7 +132,7 @@ Messages:
 
 Message Base: { t: MsgType, id: uint64 }
 Key/Value: []byte (value may be gzip-compressed; Cp=true)
-Version: uint64 (HLC)
+Set/Delete versions: uint64 (HLC)
 ```
 
 ## Hinted Handoff
@@ -156,15 +159,15 @@ Donor  → Joiner: Items [{K, V, E, Ver, Cp}] + next cursor
 
 - Depth controls bucket granularity (default 2 bytes = 65,536 buckets).
 - Cursor is last key‑hash in bucket for stable pagination.
+- Typical page sizes: initial pass ~1024, periodic passes ~512.
 
 ## Rebalance
 
-- Periodically samples local keys- if primary changed, pushes key to new primary using current HLC and remaining TTL → absolute expiry; deletes local key on success.
+- Periodically samples local keys - if primary changed, pushes key to new primary using current HLC and remaining TTL → absolute expiry; deletes local key on success.
 
 ## Tuning
 
 - RF ≥ 3, WC ≥ 2 for balanced durability and freshness.
 - Handoff: set per‑peer caps and RPS to sustainable values. TTL high enough to cover expected downtimes.
-- Backfill: adjust depth for dataset size. Rune page size to donor capacity.
 - Backfill: adjust depth for dataset size. Tune page size to donor capacity.
 - Timeouts: read/write/idle tuned to network characteristics; inflight caps per peer.
