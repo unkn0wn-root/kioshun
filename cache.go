@@ -208,13 +208,20 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 	shard := c.getShard(key)
 
 	nw := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
+	shardLockedWrite := false
 	if nw {
 		shard.mu.Lock()
-		defer shard.mu.Unlock()
+		shardLockedWrite = true
 	} else {
 		shard.mu.RLock()
-		defer shard.mu.RUnlock()
 	}
+	defer func() {
+		if shardLockedWrite {
+			shard.mu.Unlock()
+		} else {
+			shard.mu.RUnlock()
+		}
+	}()
 
 	item, exists := shard.data[key]
 	if !exists {
@@ -224,24 +231,44 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 		return nil, 0, false
 	}
 
-	now := time.Now().UnixNano()
-	if item.expireTime > 0 && now > item.expireTime {
-		delete(shard.data, key)
-		shard.removeFromLRU(item)
+	var now int64
+	for {
+		now = time.Now().UnixNano()
+		if item.expireTime > 0 && now > item.expireTime {
+			if !shardLockedWrite {
+				shard.mu.RUnlock()
+				shard.mu.Lock()
+				shardLockedWrite = true
 
-		if c.config.EvictionPolicy == LFU {
-			shard.lfuList.remove(item)
+				item, exists = shard.data[key]
+				if !exists {
+					if c.config.StatsEnabled {
+						atomic.AddInt64(&shard.misses, 1)
+					}
+					return nil, now, false
+				}
+				// Item might have been refreshed while upgrading the lock; re-evaluate.
+				continue
+			}
+
+			delete(shard.data, key)
+			shard.removeFromLRU(item)
+
+			if c.config.EvictionPolicy == LFU {
+				shard.lfuList.remove(item)
+			}
+
+			c.itemPool.Put(item)
+			atomic.AddInt64(&shard.size, -1)
+
+			if c.config.StatsEnabled {
+				atomic.AddInt64(&shard.expirations, 1)
+				atomic.AddInt64(&shard.misses, 1)
+			}
+
+			return nil, now, false
 		}
-
-		c.itemPool.Put(item)
-		atomic.AddInt64(&shard.size, -1)
-
-		if c.config.StatsEnabled {
-			atomic.AddInt64(&shard.expirations, 1)
-			atomic.AddInt64(&shard.misses, 1)
-		}
-
-		return nil, now, false
+		break
 	}
 
 	switch c.config.EvictionPolicy {
