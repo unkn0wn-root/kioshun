@@ -33,7 +33,7 @@
 > [!NOTE]
 > Clustering is fully **optional**. If you don’t enable the cluster, Kioshun runs as a standalone, in‑process in‑memory cache.
 
-Kioshun’s cluster turns your service instances into a **small, self-managing, peer‑to‑peer distributed cache**. It shards keys via weighted rendezvous, replicates with configurable RF/WC, heals with hinted handoff and backfill, and serves hot data from local memory when your instance owns it. To put it into another perspective: Kioshun can run as a **peer-to-peer mesh**: each service instance embeds a cluster node that discovers peers (*Seeds*), forms a weighted rendezvous ring, and replicates writes with configurable RF/WC. Reads route to the primary owner, read‑through population uses single‑flight leases.
+Kioshun’s cluster turns your service instances into a **small, self-managing, peer‑to‑peer distributed cache**. It shards keys via weighted rendezvous, replicates with configurable RF/WC, heals with hinted handoff and backfill, and serves hot data from local memory when your instance owns it. To put it into another perspective: Kioshun can run as a **peer-to-peer mesh**: each service instance embeds a cluster node that discovers peers (*Seeds*), forms a weighted rendezvous ring, and replicates writes with configurable RF/WC. You only need to point each node at a handful of reachable seeds. After the first contact, gossip spreads the full peer list so the rest of the cluster discovers itself. Reads route to the primary owner, read‑through population uses single‑flight leases.
 
 ```
 ┌─────────────┐      Gossip + Weights      ┌─────────────┐
@@ -66,6 +66,8 @@ node := cluster.NewNode[string, []byte](cfg, cluster.StringKeyCodec[string]{}, l
 if err := node.Start(); err != nil { panic(err) }
 dc := cluster.NewDistributedCache[string, []byte](node)
 ```
+
+Only a subset of nodes need to appear in `CACHE_SEEDS`. The list is purely for bootstrap - include a few stable peers so new processes can reach at least one live seed, then gossip distributes the rest of the membership automatically, whether you run three caches or twenty.
 
 > See **CLUSTER.md** for more details.
 
