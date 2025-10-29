@@ -33,7 +33,7 @@
 > [!NOTE]
 > Clustering is fully **optional**. If you don’t enable the cluster, Kioshun runs as a standalone, in‑process in‑memory cache.
 
-Kioshun’s cluster turns your service instances into a **small, self-managing, peer‑to‑peer distributed cache**. It shards keys via weighted rendezvous, replicates with configurable RF/WC, heals with hinted handoff and backfill, and serves hot data from local memory when your instance owns it. To put it into another perspective: Kioshun can run as a **peer-to-peer mesh**: each service instance embeds a cluster node that discovers peers (*Seeds*), forms a weighted rendezvous ring, and replicates writes with configurable RF/WC. You only need to point each node at a handful of reachable seeds. After the first contact, gossip spreads the full peer list so the rest of the cluster discovers itself. Reads route to the primary owner, read‑through population uses single‑flight leases.
+Kioshun’s cluster turns each service instance (your application process) into a **small, self-managing, peer-to-peer cache node**. It shards keys via weighted rendezvous, replicates writes with configurable RF/WC, heals via hinted handoff and backfill, and serves hot data from local memory whenever your instance owns it. In practice the cache runs in-process, so every service node embeds a cluster member that discovers peers (*Seeds*), forms a weighted rendezvous ring, and keeps membership fresh through gossip. Point each node at a few reachable seeds; gossip distributes the full peer list from there. Reads route to the primary owner, and read-through population uses single-flight leases.
 
 ```
 ┌─────────────┐      Gossip + Weights      ┌─────────────┐
