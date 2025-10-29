@@ -93,20 +93,10 @@ func (b *BigCacheWrapper) Close() error {
 // Wrapper for FreeCache
 type FreeCacheWrapper struct {
 	cache *freecache.Cache
-	mu    sync.RWMutex
-	count int64
 }
 
 func (f *FreeCacheWrapper) Set(key string, value []byte) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	keyBytes := []byte(key)
-	_, err := f.cache.Get(keyBytes)
-	if err != nil {
-		f.count++
-	}
-	return f.cache.Set(keyBytes, value, 3600)
+	return f.cache.Set([]byte(key), value, 3600)
 }
 
 func (f *FreeCacheWrapper) Get(key string) ([]byte, bool) {
@@ -118,29 +108,15 @@ func (f *FreeCacheWrapper) Get(key string) ([]byte, bool) {
 }
 
 func (f *FreeCacheWrapper) Delete(key string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	keyBytes := []byte(key)
-	_, err := f.cache.Get(keyBytes)
-	if err == nil {
-		f.count--
-		return f.cache.Del(keyBytes)
-	}
-	return false
+	return f.cache.Del([]byte(key))
 }
 
 func (f *FreeCacheWrapper) Clear() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.cache.Clear()
-	f.count = 0
 }
 
 func (f *FreeCacheWrapper) Size() int64 {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.count
+	return f.cache.EntryCount()
 }
 
 func (f *FreeCacheWrapper) Close() error {
@@ -220,6 +196,12 @@ func (r *RistrettoWrapper) Close() error {
 	return nil
 }
 
+func waitForAsync(cache CacheInterface) {
+	if r, ok := cache.(*RistrettoWrapper); ok {
+		r.cache.Wait()
+	}
+}
+
 // Cache factory functions
 func createCaches() map[string]CacheInterface {
 	caches := make(map[string]CacheInterface)
@@ -237,7 +219,7 @@ func createCaches() map[string]CacheInterface {
 
 	// BigCache
 	bigCacheConfig := bigcache.DefaultConfig(1 * time.Hour)
-	// Find the next power of two that's >= runtime.NumCPU()
+	// Match BigCache shards to CPU count (power-of-two requirement).
 	shards := 1
 	for shards < runtime.NumCPU() {
 		shards *= 2
@@ -298,6 +280,7 @@ func BenchmarkCacheComparison_Set(b *testing.B) {
 					i++
 				}
 			})
+			waitForAsync(cache)
 		})
 	}
 }
@@ -320,6 +303,7 @@ func BenchmarkCacheComparison_Get(b *testing.B) {
 		for i := 0; i < 10000; i++ {
 			cache.Set(fmt.Sprintf("key_%d", i), value)
 		}
+		waitForAsync(cache)
 	}
 
 	for name, cache := range caches {
@@ -332,6 +316,7 @@ func BenchmarkCacheComparison_Get(b *testing.B) {
 					i++
 				}
 			})
+			waitForAsync(cache)
 		})
 	}
 }
@@ -366,6 +351,7 @@ func BenchmarkCacheComparison_Mixed(b *testing.B) {
 					i++
 				}
 			})
+			waitForAsync(cache)
 		})
 	}
 }
@@ -389,6 +375,7 @@ func BenchmarkCacheComparison_HighContention(b *testing.B) {
 		for i := 0; i < hotKeys; i++ {
 			cache.Set(fmt.Sprintf("hot_key_%d", i), value)
 		}
+		waitForAsync(cache)
 	}
 
 	for name, cache := range caches {
@@ -414,6 +401,7 @@ func BenchmarkCacheComparison_HighContention(b *testing.B) {
 					i++
 				}
 			})
+			waitForAsync(cache)
 		})
 	}
 }
@@ -553,6 +541,7 @@ func BenchmarkCacheComparison_ReadHeavy(b *testing.B) {
 		for i := 0; i < 10000; i++ {
 			cache.Set(fmt.Sprintf("key_%d", i), value)
 		}
+		waitForAsync(cache)
 	}
 
 	for name, cache := range caches {
@@ -573,6 +562,7 @@ func BenchmarkCacheComparison_ReadHeavy(b *testing.B) {
 					i++
 				}
 			})
+			waitForAsync(cache)
 		})
 	}
 }
@@ -608,6 +598,7 @@ func BenchmarkCacheComparison_WriteHeavy(b *testing.B) {
 					i++
 				}
 			})
+			waitForAsync(cache)
 		})
 	}
 }
@@ -653,6 +644,7 @@ func BenchmarkCacheComparison_RealWorldWorkload(b *testing.B) {
 					i++
 				}
 			})
+			waitForAsync(cache)
 		})
 	}
 }

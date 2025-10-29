@@ -5,7 +5,7 @@
 
   *"kee-oh-shoon" /kiːoʊʃuːn/*
 
-  [![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
+  [![Go Version](https://img.shields.io/badge/Go-1.24+-blue.svg)](https://golang.org)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
   [![CI](https://github.com/unkn0wn-root/kioshun/actions/workflows/test.yml/badge.svg)](https://github.com/unkn0wn-root/kioshun/actions)
 
@@ -25,7 +25,7 @@
 - [API Reference](#api-reference)
 - [HTTP Middleware](#http-middleware)
 - [Cache Invalidation Setup](#cache-invalidation-setup)
-- [Benchmark Results](_benchmarks/benchmarks.md)
+- [Benchmark Results](#benchmark-results)
 
 
 ## Cluster Overview
@@ -733,3 +733,12 @@ The middleware automatically handles:
 - **Vary** headers for content negotiation
 - **X-Cache** headers (HIT/MISS status)
 - **X-Cache-Date** and **X-Cache-Age** headers
+
+## Benchmark Results
+
+Latest benchmark run (Apple M4 Max, Go 1.24.7):
+- `SET`: 100,000,000 ops/sec · 75.55 ns/op · 41 B/op · 3 allocs/op
+- `GET`: 231,967,180 ops/sec · 25.87 ns/op · 31 B/op · 2 allocs/op
+- `Real-World`: 52,742,550 ops/sec · 65.25 ns/op · 48 B/op · 3 allocs/op
+
+Full suite and methodology: [_benchmarks/README.md](_benchmarks/README.md)

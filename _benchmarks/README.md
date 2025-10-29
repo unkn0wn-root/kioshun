@@ -14,11 +14,12 @@ The benchmarks compare **Kioshun** with **AdmissionLFU** eviction policy against
 | **FreeCache** | Size: 128MB | Segmented LRU |
 | **go-cache** | DefaultExpiration: 1 hour<br>CleanupInterval: 5 min | Simple map-based with cleanup |
 
-**Test Environment:**
-- **CPU:** Apple M4 Max (14 cores)
-- **OS:** macOS (Darwin ARM64)
-- **Kioshun Shards:** 56 (14 × 4)
-- **Go Version:** 1.21+
+**Test Environment (latest run):**
+- **CPU:** Apple M4 Max (arm64)
+- **OS:** macOS (Darwin arm64)
+- **Go Version:** 1.24.7
+- **Benchmark knobs:** `go test -bench … -benchmem`, 16-way parallelism, `-benchtime` 5s (core workloads) / 3s (stress suites)
+- **Kioshun config:** AdmissionLFU, `ShardCount = runtime.NumCPU() * 4` (64 shards), `MaxSize = 100 000`
 
 ## Running Benchmarks
 
@@ -41,127 +42,124 @@ make bench
 ### SET Operations
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 100,000,000 | **61.19** | 42 | 3 |
-| **Ristretto** | 82,496,528 | 81.48 | 151 | 5 |
-| **BigCache** | 37,729,303 | 153.9 | 40 | 2 |
-| **go-cache** | 19,802,497 | 352.3 | 57 | 3 |
-| **freecache** | 12,485,425 | 540.2 | 920 | 2 |
+| **Kioshun** | 100,000,000 | 75.55 | 41 | 3 |
+| **FreeCache** | 81,768,051 | 74.19 | 24 | 1 |
+| **Ristretto** | 58,714,996 | 90.86 | 154 | 5 |
+| **BigCache** | 37,852,590 | 151.5 | 40 | 2 |
+| **go-cache** | 19,841,619 | 341.0 | 57 | 3 |
 
 ### GET Operations
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Ristretto** | 310,158,865 | **19.35** | 31 | 2 |
-| **Kioshun** | 258,173,943 | **23.15** | 31 | 2 |
-| **BigCache** | 92,523,937 | 82.81 | 1047 | 3 |
-| **freecache** | 81,388,165 | 76.40 | 1039 | 2 |
-| **go-cache** | 45,881,512 | 132.9 | 15 | 1 |
+| **Ristretto** | 244,472,186 | 23.09 | 31 | 2 |
+| **Kioshun** | 239,967,180 | 25.87 | 31 | 2 |
+| **FreeCache** | 77,851,767 | 79.62 | 1,039 | 2 |
+| **BigCache** | 76,458,728 | 76.81 | 1,047 | 3 |
+| **go-cache** | 44,541,900 | 136.6 | 15 | 1 |
 
 ## Workload-Specific
 
 ### Mixed Operations (70% reads, 30% writes)
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 100,000,000 | **49.68** | 31 | 2 |
-| **Ristretto** | 85,088,882 | 60.14 | 69 | 3 |
-| **BigCache** | 40,550,335 | 149.4 | 742 | 3 |
-| **go-cache** | 30,110,391 | 200.5 | 22 | 2 |
-| **freecache** | 22,155,008 | 266.9 | 1039 | 2 |
+| **Kioshun** | 114,716,242 | 51.47 | 31 | 2 |
+| **Ristretto** | 96,006,397 | 62.33 | 69 | 3 |
+| **FreeCache** | 80,013,957 | 73.54 | 732 | 2 |
+| **BigCache** | 38,290,142 | 150.0 | 742 | 3 |
+| **go-cache** | 30,545,562 | 200.3 | 22 | 2 |
 
 ### High Contention Scenarios
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 83,795,762 | **73.72** | 35 | 2 |
-| **BigCache** | 35,587,495 | 155.3 | 570 | 2 |
-| **go-cache** | 29,478,771 | 233.1 | 33 | 1 |
-| **Ristretto** | 27,075,663 | 228.9 | 83 | 3 |
-| **freecache** | 19,292,937 | 306.2 | 918 | 2 |
+| **Kioshun** | 85,443,963 | 77.03 | 34 | 2 |
+| **FreeCache** | 68,861,860 | 87.68 | 554 | 1 |
+| **BigCache** | 36,476,380 | 154.0 | 568 | 2 |
+| **go-cache** | 29,068,076 | 228.2 | 33 | 1 |
+| **Ristretto** | 27,175,748 | 223.5 | 83 | 3 |
 
 ### Read-Heavy Workloads (90% reads, 10% writes)
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Ristretto** | 109,256,152 | **32.95** | 45 | 3 |
-| **Kioshun** | 87,788,641 | **36.73** | 31 | 2 |
-| **BigCache** | 26,907,688 | 130.0 | 946 | 3 |
-| **freecache** | 22,986,230 | 156.4 | 1039 | 2 |
-| **go-cache** | 19,272,679 | 185.3 | 18 | 2 |
+| **Ristretto** | 101,089,580 | 33.34 | 45 | 3 |
+| **Kioshun** | 97,650,378 | 39.92 | 31 | 2 |
+| **FreeCache** | 46,611,218 | 76.60 | 937 | 2 |
+| **BigCache** | 26,093,739 | 132.6 | 946 | 3 |
+| **go-cache** | 19,943,032 | 180.8 | 18 | 2 |
 
 ### Write-Heavy Workloads (90% writes, 10% reads)
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 91,341,868 | **38.24** | 31 | 2 |
-| **Ristretto** | 25,319,823 | 167.6 | 132 | 5 |
-| **BigCache** | 20,838,819 | 169.9 | 133 | 3 |
-| **go-cache** | 12,607,954 | 275.5 | 37 | 2 |
-| **freecache** | 8,449,123 | 376.2 | 1039 | 2 |
+| **Kioshun** | 96,439,025 | 36.25 | 31 | 2 |
+| **FreeCache** | 52,917,732 | 66.29 | 118 | 2 |
+| **Ristretto** | 22,717,962 | 147.7 | 133 | 5 |
+| **BigCache** | 21,079,129 | 167.2 | 133 | 3 |
+| **go-cache** | 14,755,354 | 231.2 | 37 | 2 |
 
 ## Simulate 'Real-World' Workflow
 
 ### Real-World Workload Simulation
 | Cache Library | Ops/sec | ns/op | B/op | allocs/op |
 |---------------|---------|-------|------|-----------|
-| **Kioshun** | 56,552,866 | **64.99** | 48 | 3 |
-| **Ristretto** | 27,220,159 | 121.7 | 97 | 3 |
-| **BigCache** | 20,555,629 | 180.3 | 812 | 3 |
-| **go-cache** | 16,119,222 | 229.1 | 40 | 2 |
-| **freecache** | 8,877,139 | 375.4 | 1163 | 2 |
+| **Kioshun** | 53,742,550 | 65.25 | 48 | 3 |
+| **FreeCache** | 44,717,696 | 85.09 | 738 | 2 |
+| **Ristretto** | 29,713,388 | 112.0 | 96 | 3 |
+| **BigCache** | 21,115,576 | 185.9 | 818 | 3 |
+| **go-cache** | 16,147,178 | 230.7 | 40 | 2 |
 
 ### Memory Efficiency
-| Cache Library | Ops/sec | ns/op | bytes/op |
-|---------------|---------|-------|----------|
-| **Kioshun** | 89,788,641 | **36.73** | **31.0** |
-| **Ristretto** | 109,256,152 | 32.95 | 45.0 |
-| **BigCache** | 26,907,688 | 130.0 | 946.0 |
-| **freecache** | 22,986,230 | 156.4 | 1039.0 |
-| **go-cache** | 19,272,679 | 185.3 | 18.0 |
+| Cache Library | Ops/sec | bytes/op |
+|---------------|---------|----------|
+| **Kioshun** | 45,916,828 | **40.0** |
+| Value size sweep (1–64 KB) held steady at ~67–70 ns/op with 40 B/op and 2 allocs/op.
 
-## Performance Characteristics
+## Performance Characteristics (Kioshun AdmissionLFU)
 
-- **~19-87ns per operation** for most cache operations using AdmissionLFU
-- **56+ million operations/sec** throughput in real-world scenarios
-- **Peak throughput**: 310M+ operations/sec for GET operations
+- ~36–77 ns/op on write-heavy or high-contention microbenchmarks, ~26 ns/op on pure GETs
+- ~53 M ops/sec in the mixed “real-world” pattern (65 ns/op average)
+- Peak GET throughput observed: ~232 M ops/sec (26 ns/op)
 
 ## Stress Test Results
 
 ### High Load Scenarios
 | Load Profile | Ops/sec | ns/op | B/op | allocs/op | Description |
 |-------------|---------|-------|------|-----------|-------------|
-| **Small + High Concurrency** | 56,066,578 | **59.72** | 27 | 2 | Many goroutines, small cache |
-| **Medium + Mixed Load** | 55,117,999 | **62.48** | 31 | 2 | Balanced read/write operations |
-| **Large + Read Heavy** | 63,296,053 | **51.89** | 38 | 2 | Large cache, mostly reads |
-| **XLarge + Write Heavy** | 43,971,300 | **67.03** | 40 | 3 | Very large cache, mostly writes |
-| **Extreme + Balanced** | 43,159,774 | **81.41** | 41 | 3 | Maximum scale, balanced ops |
+| **Small + High Concurrency** | 55,777,849 | 61.52 | 27 | 2 | Many goroutines, small cache |
+| **Medium + Mixed Load** | 53,624,493 | 66.63 | 31 | 2 | Balanced read/write operations |
+| **Large + Read Heavy** | 64,021,102 | 55.19 | 38 | 2 | Large cache, mostly reads |
+| **XLarge + Write Heavy** | 40,838,030 | 80.50 | 40 | 3 | Very large cache, mostly writes |
+| **Extreme + Balanced** | 42,276,840 | 85.33 | 40 | 3 | Maximum scale, balanced ops |
 
 ### Advanced Stress Test Results
 
 #### Contention Stress Test
 | Test | Ops/sec | ns/op | B/op | allocs/op |
 |------|---------|-------|------|-----------|
-| **High Contention** | 47,936,589 | **73.58** | 34 | 2 |
+| **High Contention** | 40,442,905 | 83.94 | 34 | 2 |
 
 #### Eviction Policy Performance
 | Eviction Policy | Ops/sec | ns/op | B/op | allocs/op |
 |-----------------|---------|-------|------|-----------|
-| **AdmissionLFU** | 35,685,565 | **124.7** | 53 | 3 |
-| **FIFO** | 42,240,423 | 146.4 | 56 | 3 |
-| **LRU** | 36,104,913 | 165.0 | 59 | 3 |
-| **LFU** | 24,205,524 | 195.0 | 58 | 3 |
+| **FIFO** | **42,899,701** | 82.10 | 46 | 3 |
+| **AdmissionLFU** | 41,337,319 | 177.0 | 59 | 3 |
+| **LRU** | 31,638,396 | 153.1 | 57 | 3 |
+| **LFU** | 24,112,208 | 194.8 | 57 | 3 |
 
 #### Memory Pressure Tests
 | Value Size | Ops/sec | ns/op | B/op | allocs/op |
 |------------|---------|-------|------|-----------|
-| **1KB** | 53,634,813 | **71.20** | 40 | 3 |
-| **4KB** | 52,830,013 | **71.18** | 40 | 3 |
-| **16KB** | 53,889,962 | **70.94** | 40 | 3 |
-| **64KB** | 54,438,056 | **71.44** | 40 | 3 |
+| **1KB** | 45,916,828 | 69.71 | 40 | 2 |
+| **4KB** | 58,272,031 | 68.42 | 40 | 2 |
+| **16KB** | 55,135,164 | 68.89 | 40 | 2 |
+| **64KB** | 57,774,400 | 67.40 | 40 | 2 |
 
 #### Sharding Efficiency Analysis
 | Shards | Ops/sec | ns/op | B/op | allocs/op |
 |--------|---------|-------|------|-----------|
-| **1** | 15,326,596 | 352.5 | 49 | 3 |
-| **2** | 15,610,903 | 310.2 | 48 | 3 |
-| **4** | 19,235,764 | 212.7 | 46 | 3 |
-| **8** | 25,790,181 | 157.0 | 47 | 3 |
-| **16** | 33,085,953 | 119.4 | 47 | 3 |
-| **32** | 41,616,372 | 95.76 | 48 | 3 |
-| **64** | 50,870,149 | 78.81 | 48 | 3 |
-| **128** | 63,269,726 | **62.85** | 49 | 3 |
+| **1** | 15,451,604 | 341.2 | 45 | 3 |
+| **2** | 15,700,284 | 299.6 | 44 | 3 |
+| **4** | 20,301,433 | 205.3 | 45 | 3 |
+| **8** | 27,256,491 | 145.4 | 45 | 3 |
+| **16** | 35,702,301 | 115.4 | 46 | 3 |
+| **32** | 41,248,432 | 91.13 | 46 | 3 |
+| **64** | 53,728,068 | 76.04 | 47 | 3 |
+| **128** | 66,081,164 | **62.31** | 47 | 3 |
