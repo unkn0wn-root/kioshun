@@ -70,25 +70,33 @@ type Stats struct {
 
 // Config groups capacity, sharding, TTL, policy, and telemetry options.
 type Config struct {
-	MaxSize                int64
-	ShardCount             int
-	CleanupInterval        time.Duration
-	DefaultTTL             time.Duration
-	EvictionPolicy         EvictionPolicy
-	StatsEnabled           bool
-	AdmissionResetInterval time.Duration
+	MaxSize                       int64
+	ShardCount                    int
+	CleanupInterval               time.Duration
+	DefaultTTL                    time.Duration
+	EvictionPolicy                EvictionPolicy
+	StatsEnabled                  bool
+	AdmissionResetInterval        time.Duration
+	AdmissionScanRateThreshold    uint64
+	AdmissionScanMissThreshold    uint64
+	AdmissionScanRecencyThreshold time.Duration
+	AdmissionRecencyTieBreak      time.Duration
 }
 
 // DefaultConfig returns sane defaults for a general-purpose cache.
 func DefaultConfig() Config {
 	return Config{
-		MaxSize:                defaultMaxSize,
-		ShardCount:             0,
-		CleanupInterval:        defaultCleanupInterval,
-		DefaultTTL:             defaultTTL,
-		EvictionPolicy:         AdmissionLFU,
-		StatsEnabled:           true,
-		AdmissionResetInterval: 1 * time.Minute,
+		MaxSize:                       defaultMaxSize,
+		ShardCount:                    0,
+		CleanupInterval:               defaultCleanupInterval,
+		DefaultTTL:                    defaultTTL,
+		EvictionPolicy:                AdmissionLFU,
+		StatsEnabled:                  true,
+		AdmissionResetInterval:        1 * time.Minute,
+		AdmissionScanRateThreshold:    defaultScanAdmissionThreshold,
+		AdmissionScanMissThreshold:    defaultScanMissThreshold,
+		AdmissionScanRecencyThreshold: defaultScanRecencyThreshold,
+		AdmissionRecencyTieBreak:      defaultRecencyTieBreak,
 	}
 }
 
@@ -114,24 +122,18 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	if shardCount <= 0 {
 		// Over-provision shards to reduce lock contention.
 		shardCount = runtime.NumCPU() * shardMultiplier
-		if shardCount > maxShardCount {
-			shardCount = maxShardCount
-		}
+		shardCount = min(shardCount, maxShardCount)
 	}
 
 	// Guard against zero per-shard capacity when MaxSize is small; cap shards accordingly.
 	if config.MaxSize > 0 {
 		limit := config.MaxSize
-		if limit > int64(maxShardCount) {
-			limit = int64(maxShardCount)
-		}
+		limit = min(limit, int64(maxShardCount))
 		maxPow2 := 1
 		for (int64(maxPow2) << 1) <= limit {
 			maxPow2 <<= 1
 		}
-		if shardCount > maxPow2 {
-			shardCount = maxPow2
-		}
+		shardCount = min(shardCount, maxPow2)
 	}
 	shardCount = mathutil.NextPowerOf2(shardCount)
 
@@ -170,14 +172,19 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		if config.EvictionPolicy == AdmissionLFU && cache.perShardCap > 0 {
 			// Size frequency sketch counters (~10× capacity; min 1024) and set doorkeeper reset cadence.
 			nc := uint64(cache.perShardCap * 10)
-			if nc < 1024 {
-				nc = 1024
-			}
+			nc = max(nc, uint64(1024))
 			resetInterval := config.AdmissionResetInterval
 			if resetInterval == 0 {
 				resetInterval = 1 * time.Minute
 			}
-			s.admission = newAdaptiveAdmissionFilter(nc, resetInterval)
+			s.admission = newAdaptiveAdmissionFilter(
+				nc,
+				resetInterval,
+				config.AdmissionScanRateThreshold,
+				config.AdmissionScanMissThreshold,
+				config.AdmissionScanRecencyThreshold,
+				config.AdmissionRecencyTieBreak,
+			)
 		}
 		cache.shards[i] = s
 	}

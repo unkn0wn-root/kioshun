@@ -236,8 +236,10 @@ evictLFU():
 
 3. **Workload Detector (Scan Resistance)**:
    - Tracks consecutive admission rejections (fast signal of cold scans)
-   - Optional admissions/sec signal (disabled by default; see note below)
-   - Switches to a more recency-biased admission during detected scans
+   - Uses an admissions/sec signal to flag sudden bursts (defaults: 100 req/s, 50 misses)
+   - Switches to a more recency-biased admission during detected scans (recency window defaults: 100 ms / 1 s)
+
+   Override these thresholds via `Config.AdmissionScanRateThreshold`, `Config.AdmissionScanMissThreshold`, `Config.AdmissionScanRecencyThreshold`, and `Config.AdmissionRecencyTieBreak` while keeping the same defaults when unset.
 
 4. **Adaptive Admission Algorithm**:
    ```

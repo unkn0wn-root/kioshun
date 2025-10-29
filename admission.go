@@ -33,16 +33,14 @@ const (
 	hash3Rotate = 31
 	hash4Rotate = 47
 
-	// Scan detection (switch to recency-biased policy).
-	scanAdmissionThreshold = 100 // admissions/sec
-	scanMissThreshold      = 50  // consecutive misses
-
-	// Time thresholds (ns).
-	scanModeRecencyThreshold = 100e6 // 100ms
-	recencyTieBreakThreshold = 1e9   // 1s
+	// Scan detection (switch to recency-biased policy) defaults.
+	defaultScanAdmissionThreshold = uint64(100)            // admissions/sec
+	defaultScanMissThreshold      = uint64(50)             // consecutive misses
+	defaultScanRecencyThreshold   = 100 * time.Millisecond // 100ms
+	defaultRecencyTieBreak        = 1 * time.Second        // 1s
 
 	// Feedback cadence.
-	evictionPressureInterval = 1e9 // 1s
+	evictionPressureInterval = int64(time.Second)
 )
 
 // hashN rotates+mixes a 64-bit value and masks into [0..mask]; mask should be size-1.
@@ -238,32 +236,37 @@ func (fbf *frequencyBloomFilter) age() {
 // workloadDetector tracks admissions/sec (windowed) and consecutive misses
 // triggers scan mode on thresholds.
 type workloadDetector struct {
-	recentAdmissions    uint64
-	recentAdmissionTime int64
-	admissionRate       uint64
-	consecutiveMisses   uint64
+	recentAdmissions       uint64
+	recentAdmissionTime    int64
+	admissionRate          uint64
+	consecutiveMisses      uint64
+	admissionRateThreshold uint64
+	missThreshold          uint64
 }
 
 // newWorkloadDetector initializes the time window for rate calculations.
-func newWorkloadDetector() *workloadDetector {
+func newWorkloadDetector(rateThreshold, missThreshold uint64) *workloadDetector {
 	return &workloadDetector{
-		recentAdmissionTime: time.Now().UnixNano(),
+		recentAdmissionTime:    time.Now().UnixNano(),
+		admissionRateThreshold: rateThreshold,
+		missThreshold:          missThreshold,
 	}
 }
 
 // detectScan updates admissionRate roughly once per second
 // and returns true if rate or miss streak is high.
-func (wd *workloadDetector) detectScan(keyHash uint64) bool {
+func (wd *workloadDetector) detectScan(_ uint64) bool {
 	now := time.Now().UnixNano()
 	dt := now - wd.recentAdmissionTime
-	if dt > 1e9 {
+	if dt > int64(time.Second) {
 		adm := wd.recentAdmissions
 		r := adm * 1e9 / uint64(dt)
 		wd.admissionRate = r
 		wd.recentAdmissions = 0
 		wd.recentAdmissionTime = now
 	}
-	return wd.admissionRate > scanAdmissionThreshold || wd.consecutiveMisses > scanMissThreshold
+	return (wd.admissionRateThreshold > 0 && wd.admissionRate > wd.admissionRateThreshold) ||
+		(wd.missThreshold > 0 && wd.consecutiveMisses > wd.missThreshold)
 }
 
 // recordAdmission bumps the windowed admissions count and resets the miss streak.
@@ -292,20 +295,44 @@ type adaptiveAdmissionFilter struct {
 	admissionRequests    uint64
 	admissionGrants      uint64
 	scanRejections       uint64
+	scanRecencyThreshold int64
+	recencyTieBreak      int64
 }
 
 // newAdaptiveAdmissionFilter wires up components and seeds probabilities and timers.
-func newAdaptiveAdmissionFilter(n uint64, ri time.Duration) *adaptiveAdmissionFilter {
+func newAdaptiveAdmissionFilter(
+	n uint64,
+	ri time.Duration,
+	scanRateThreshold uint64,
+	scanMissThreshold uint64,
+	scanRecency time.Duration,
+	recencyTie time.Duration,
+) *adaptiveAdmissionFilter {
+	if scanRateThreshold == 0 {
+		scanRateThreshold = defaultScanAdmissionThreshold
+	}
+	if scanMissThreshold == 0 {
+		scanMissThreshold = defaultScanMissThreshold
+	}
+	if scanRecency <= 0 {
+		scanRecency = defaultScanRecencyThreshold
+	}
+	if recencyTie <= 0 {
+		recencyTie = defaultRecencyTieBreak
+	}
+
 	return &adaptiveAdmissionFilter{
 		frequencyFilter:      newFrequencyBloomFilter(n),
 		doorkeeper:           newBloomFilter(n / 8),
-		detector:             newWorkloadDetector(),
+		detector:             newWorkloadDetector(scanRateThreshold, scanMissThreshold),
 		admissionProbability: 70,
 		minProbability:       5,
 		maxProbability:       95,
 		resetInterval:        int64(ri),
 		lastReset:            time.Now().UnixNano(),
 		evictionWindow:       time.Now().UnixNano(),
+		scanRecencyThreshold: scanRecency.Nanoseconds(),
+		recencyTieBreak:      recencyTie.Nanoseconds(),
 	}
 }
 
@@ -355,7 +382,7 @@ func (aaf *adaptiveAdmissionFilter) shouldAdmit(keyHash uint64, vFreq uint64, vA
 // admitDuringScan uses recency to keep fresh items; otherwise admits with a small minimum probability.
 func (aaf *adaptiveAdmissionFilter) admitDuringScan(keyHash uint64, vAge int64) bool {
 	now := time.Now().UnixNano()
-	if vAge > 0 && now-vAge > scanModeRecencyThreshold {
+	if vAge > 0 && aaf.scanRecencyThreshold > 0 && now-vAge > aaf.scanRecencyThreshold {
 		return true
 	}
 	return acceptWithProb(keyHash, aaf.minProbability)
@@ -375,7 +402,9 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, nf, vFreq uin
 		if vAge > 0 {
 			now := time.Now().UnixNano()
 			vr := now - vAge
-			return vr > recencyTieBreakThreshold
+			if aaf.recencyTieBreak > 0 {
+				return vr > aaf.recencyTieBreak
+			}
 		}
 		return acceptWithProb(keyHash, 50)
 	}
