@@ -16,7 +16,7 @@
 ## Table of Contents
 
 - [Cluster (Overview)](#cluster-overview)
-- [Architecture](#architecture)
+- [Cache Architecture](#architecture)
   - [Design](#design)
   - [Eviction](#eviction-policy)
 - [Installation](#installation)
