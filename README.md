@@ -30,10 +30,6 @@
 
 ## Cluster Overview
 
-> [!WARNING]
-> The cluster implementation is under active development.
-  Backward compatibility is not guaranteed across minor releases. Review release notes before upgrading.
-
 > [!NOTE]
 > Clustering is fully **optional**. If you don’t enable the cluster, Kioshun runs as a standalone, in‑process in‑memory cache.
 

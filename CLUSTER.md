@@ -1,11 +1,5 @@
 # Kioshun Cluster
 
-## Status
-
-> **Experimental:** the cluster implementation is under active development.
-  Backward compatibility is not guaranteed across minor releases. Review release notes before upgrading.
-  Wire messages are stable at present, but new fields/messages may be added as features evolve.
-
 This document describes the distributed cache cluster components and protocols used by `kioshun/cluster`. It focuses on the replication model, failure handling, and the wire protocol.
 
 ## Usage Model (peer-to-peer)
