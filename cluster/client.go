@@ -78,10 +78,14 @@ func (n *Node[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	if len(owners) == 0 {
 		return zero, false, ErrNoOwner
 	}
-	if owners[0].ID == n.cfg.ID {
+	for _, own := range owners {
+		if own.ID != n.cfg.ID {
+			continue
+		}
 		if v, ok := n.local.Get(key); ok {
 			return v, true, nil
 		}
+		break
 	}
 
 	fast, slow := make([]*nodeMeta, 0, len(owners)), make([]*nodeMeta, 0, len(owners))

@@ -464,3 +464,42 @@ func TestSetLFUFrequencyReset(t *testing.T) {
 		t.Error("Item 'a' should have been evicted after frequency reset")
 	}
 }
+
+func TestImportMaintainsSizeAndCapacity(t *testing.T) {
+	config := Config{
+		MaxSize:         3,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      0,
+		EvictionPolicy:  LRU,
+	}
+	cache := New[string, string](config)
+	defer cache.Close()
+
+	cache.Import([]Item[string, string]{{Key: "k1", Val: "v1"}})
+	if got := cache.Size(); got != 1 {
+		t.Fatalf("expected size 1 after first import, got %d", got)
+	}
+
+	cache.Import([]Item[string, string]{{Key: "k1", Val: "v1-updated"}})
+	if got := cache.Size(); got != 1 {
+		t.Fatalf("expected size 1 after updating existing key, got %d", got)
+	}
+
+	cache.Import([]Item[string, string]{
+		{Key: "k2", Val: "v2"},
+		{Key: "k3", Val: "v3"},
+	})
+	if got := cache.Size(); got != 3 {
+		t.Fatalf("expected size 3 after importing additional keys, got %d", got)
+	}
+
+	cache.Import([]Item[string, string]{{Key: "k4", Val: "v4"}})
+	if got := cache.Size(); got > config.MaxSize {
+		t.Fatalf("size exceeded max capacity %d, got %d", config.MaxSize, got)
+	}
+
+	if val, found := cache.Get("k4"); !found || val != "v4" {
+		t.Fatalf("expected newest import to be retrievable, got value=%q found=%v", val, found)
+	}
+}
