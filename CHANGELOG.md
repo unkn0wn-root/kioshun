@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [0.3.13](https://github.com/unkn0wn-root/kioshun/compare/v0.3.12...v0.3.13) (2025-10-29)
+
+
+### Bug Fixes
+
+* expiration race when upgrading shard lock during get ([dcbc8f0](https://github.com/unkn0wn-root/kioshun/commit/dcbc8f08b883f60f6617519db8929991e7d7a42c))
+
 ### [0.3.12](https://github.com/unkn0wn-root/kioshun/compare/v0.3.11...v0.3.12) (2025-10-29)
 
 ### [0.3.11](https://github.com/unkn0wn-root/kioshun/compare/v0.3.10...v0.3.11) (2025-09-07)
