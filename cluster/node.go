@@ -1200,9 +1200,7 @@ func (n *Node[K, V]) ingestGossip(g *MsgGossip) {
 	n.mem.integrate(NodeID(g.FromID), g.FromAddr, g.Peers, g.Seen, g.Epoch, now)
 	_, _, curEpoch := n.mem.snapshot()
 
-	if meta, ok := n.mem.peers[NodeID(g.FromID)]; ok {
-		atomic.StoreUint64(&meta.weight, computeWeight(g.Load))
-	}
+	n.mem.setWeight(NodeID(g.FromID), computeWeight(g.Load))
 
 	if n.cfg.MirrorTTL > 0 {
 		exp := now + n.cfg.MirrorTTL.Nanoseconds()

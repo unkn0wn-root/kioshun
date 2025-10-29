@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -118,4 +119,13 @@ func (m *membership) bumpEpoch() uint64 {
 	e := m.epoch
 	m.mu.Unlock()
 	return e
+}
+
+// setWeight updates the rendezvous weight for a peer.
+func (m *membership) setWeight(id NodeID, weight uint64) {
+	m.mu.RLock()
+	if meta, ok := m.peers[id]; ok {
+		atomic.StoreUint64(&meta.weight, weight)
+	}
+	m.mu.RUnlock()
 }
