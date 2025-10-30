@@ -47,7 +47,7 @@ func main() {
 
 	contentConfig := cache.DefaultMiddlewareConfig()
 	contentMiddleware := cache.NewHTTPCacheMiddleware(contentConfig)
-	contentMiddleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Duration{
+	contentMiddleware.SetCachePolicy(cache.ByContentType(map[string]time.Duration{
 		"application/json": 5 * time.Minute,
 		"text/html":        10 * time.Minute,
 		"image/":           1 * time.Hour,
@@ -57,7 +57,7 @@ func main() {
 	// size-based conditional caching
 	conditionalConfig := cache.DefaultMiddlewareConfig()
 	conditionalMiddleware := cache.NewHTTPCacheMiddleware(conditionalConfig)
-	conditionalMiddleware.SetCachePolicy(cache.CacheBySize(100, 1024*1024, 3*time.Minute))
+	conditionalMiddleware.SetCachePolicy(cache.BySize(100, 1024*1024, 3*time.Minute))
 	defer conditionalMiddleware.Close()
 
 	basicMiddleware.OnHit(func(key string) {

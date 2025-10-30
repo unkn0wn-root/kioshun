@@ -22,14 +22,14 @@ type Item[K comparable, V any] struct {
 // Export up to max items for which selectFn(key) is true.
 // Intended for application-level dump/restore. Not used by cluster state
 // transfer, because it does not carry the cluster's LWW versions.
-func (c *InMemoryCache[K, V]) Export(selectFn func(K) bool, max int) []Item[K, V] {
-	out := make([]Item[K, V], 0, max)
+func (c *InMemoryCache[K, V]) Export(selectFn func(K) bool, mx int) []Item[K, V] {
+	out := make([]Item[K, V], 0, mx)
 outer:
 	for _, s := range c.shards {
 		s.mu.RLock()
 		now := time.Now().UnixNano()
 		for k, it := range s.data {
-			if max > 0 && len(out) >= max {
+			if mx > 0 && len(out) >= mx {
 				s.mu.RUnlock()
 				break outer
 			}

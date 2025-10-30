@@ -461,12 +461,12 @@ func TestCachePolicies(t *testing.T) {
 		}
 	})
 
-	t.Run("CacheByContentType", func(t *testing.T) {
+	t.Run("ByContentType", func(t *testing.T) {
 		rules := map[string]time.Duration{
 			"application/json": 10 * time.Minute,
 			"text/html":        5 * time.Minute,
 		}
-		policy := CacheByContentType(rules, 1*time.Minute)
+		policy := ByContentType(rules, 1*time.Minute)
 
 		headers.Set("Content-Type", "application/json")
 		shouldCache, ttl := policy(nil, 200, headers, body)
@@ -481,8 +481,8 @@ func TestCachePolicies(t *testing.T) {
 		}
 	})
 
-	t.Run("CacheBySize", func(t *testing.T) {
-		policy := CacheBySize(5, 20, 1*time.Hour)
+	t.Run("BySize", func(t *testing.T) {
+		policy := BySize(5, 20, 1*time.Hour)
 
 		// Too small
 		shouldCache, _ := policy(nil, 200, headers, []byte("hi"))

@@ -20,13 +20,13 @@ type CachedResponse struct {
 }
 
 type KeyGenerator func(*http.Request) string
-type CachePolicy func(*http.Request, int, http.Header, []byte) (shouldCache bool, ttl time.Duration)
+type Policy func(*http.Request, int, http.Header, []byte) (shouldCache bool, ttl time.Duration)
 type PathExtractor func(string) string
 
 type HTTPCacheMiddleware struct {
 	cache       *InMemoryCache[string, *CachedResponse]
 	keyGen      KeyGenerator
-	policy      CachePolicy
+	policy      Policy
 	onHit       func(string)
 	onMiss      func(string)
 	onSet       func(string, time.Duration)
@@ -217,7 +217,7 @@ func (m *HTTPCacheMiddleware) Close() error {
 }
 
 func (m *HTTPCacheMiddleware) SetKeyGenerator(keyGen KeyGenerator)        { m.keyGen = keyGen }
-func (m *HTTPCacheMiddleware) SetCachePolicy(policy CachePolicy)          { m.policy = policy }
+func (m *HTTPCacheMiddleware) SetCachePolicy(policy Policy)               { m.policy = policy }
 func (m *HTTPCacheMiddleware) SetPathExtractor(extractor PathExtractor)   { m.pathExtract = extractor }
 func (m *HTTPCacheMiddleware) OnHit(callback func(string))                { m.onHit = callback }
 func (m *HTTPCacheMiddleware) OnMiss(callback func(string))               { m.onMiss = callback }
@@ -241,7 +241,7 @@ func DefaultKeyGenerator(r *http.Request) string {
 }
 
 // DefaultCachePolicy creates policy respecting HTTP cache headers
-func DefaultCachePolicy(config MiddlewareConfig) CachePolicy {
+func DefaultCachePolicy(config MiddlewareConfig) Policy {
 	cacheableMethods := make(map[string]bool, len(config.CacheableMethods))
 	for _, method := range config.CacheableMethods {
 		cacheableMethods[method] = true
@@ -394,20 +394,20 @@ func KeyWithUserID(userIDHeader string) KeyGenerator {
 	}
 }
 
-func AlwaysCache(ttl time.Duration) CachePolicy {
-	return func(r *http.Request, statusCode int, headers http.Header, body []byte) (bool, time.Duration) {
+func AlwaysCache(ttl time.Duration) Policy {
+	return func(_ *http.Request, statusCode int, _ http.Header, _ []byte) (bool, time.Duration) {
 		return statusCode >= 200 && statusCode < 300, ttl
 	}
 }
 
-func NeverCache() CachePolicy {
-	return func(r *http.Request, statusCode int, headers http.Header, body []byte) (bool, time.Duration) {
+func NeverCache() Policy {
+	return func(_ *http.Request, _ int, _ http.Header, _ []byte) (bool, time.Duration) {
 		return false, 0
 	}
 }
 
-func CacheByContentType(rules map[string]time.Duration, defaultTTL time.Duration) CachePolicy {
-	return func(r *http.Request, statusCode int, headers http.Header, body []byte) (bool, time.Duration) {
+func ByContentType(rules map[string]time.Duration, defaultTTL time.Duration) Policy {
+	return func(_ *http.Request, statusCode int, headers http.Header, _ []byte) (bool, time.Duration) {
 		if statusCode < 200 || statusCode >= 300 {
 			return false, 0
 		}
@@ -423,9 +423,9 @@ func CacheByContentType(rules map[string]time.Duration, defaultTTL time.Duration
 	}
 }
 
-// CacheBySize caches responses within specified size range
-func CacheBySize(minSize, maxSize int64, ttl time.Duration) CachePolicy {
-	return func(r *http.Request, statusCode int, headers http.Header, body []byte) (bool, time.Duration) {
+// BySize caches responses within specified size range
+func BySize(minSize, maxSize int64, ttl time.Duration) Policy {
+	return func(_ *http.Request, statusCode int, _ http.Header, body []byte) (bool, time.Duration) {
 		if statusCode < 200 || statusCode >= 300 {
 			return false, 0
 		}
