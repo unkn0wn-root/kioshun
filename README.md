@@ -472,7 +472,7 @@ userMiddleware.SetKeyGenerator(cache.KeyWithUserID("X-User-ID"))
 // Content-type based caching with different TTLs
 contentMiddleware := cache.NewHTTPCacheMiddleware(config)
 contentMiddleware.SetKeyGenerator(cache.KeyWithoutQuery()) // Enable invalidation
-contentMiddleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Duration{
+contentMiddleware.SetCachePolicy(cache.ByContentType(map[string]time.Duration{
     "application/json": 5 * time.Minute,
     "text/html":       10 * time.Minute,
     "image/":          1 * time.Hour,
@@ -481,7 +481,7 @@ contentMiddleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Durati
 // Size-based conditional caching
 conditionalMiddleware := cache.NewHTTPCacheMiddleware(config)
 conditionalMiddleware.SetKeyGenerator(cache.KeyWithoutQuery()) // Enable invalidation
-conditionalMiddleware.SetCachePolicy(cache.CacheBySize(100, 1024*1024, 3*time.Minute))
+conditionalMiddleware.SetCachePolicy(cache.BySize(100, 1024*1024, 3*time.Minute))
 
 // Configure eviction policy
 cacheConfig := cache.DefaultMiddlewareConfig()
@@ -539,13 +539,13 @@ middleware.SetCachePolicy(cache.AlwaysCache(5 * time.Minute))
 middleware.SetCachePolicy(cache.NeverCache())
 
 // Content-type based caching
-middleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Duration{
+middleware.SetCachePolicy(cache.ByContentType(map[string]time.Duration{
     "application/json": 5 * time.Minute,
     "text/html":       10 * time.Minute,
 }, 2*time.Minute))
 
 // Size-based caching
-middleware.SetCachePolicy(cache.CacheBySize(100, 1024*1024, 3*time.Minute))
+middleware.SetCachePolicy(cache.BySize(100, 1024*1024, 3*time.Minute))
 ```
 
 ### Monitoring

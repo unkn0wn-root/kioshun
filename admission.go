@@ -13,8 +13,7 @@ const (
 	bloomMixPrime2 = 0xc4ceb9fe1a85ec53
 
 	// Admission policy.
-	baseAdmissionRate  = 70 // seed; live value set in newAdaptiveAdmissionFilter
-	frequencyThreshold = 3  // admit if estimated CMS freq ≥ 3
+	frequencyThreshold = 3 // admit if estimated CMS freq ≥ 3
 
 	// Eviction-pressure feedback (nudges global admission prob once per second).
 	highEvictionRateThreshold = 100
@@ -25,7 +24,6 @@ const (
 	bitsPerWord   = 64
 	frequencyMask = 0x0F
 	maxFrequency  = 15
-	agingFactor   = 2
 
 	// Per-hash rotations for 4 CMS hashes.
 	hash1Rotate = 0
@@ -411,15 +409,10 @@ func (aaf *adaptiveAdmissionFilter) makeAdmissionDecision(keyHash, nf, vFreq uin
 
 	prob := aaf.admissionProbability
 
-	vf := vFreq
-	if vf > 5 {
-		vf = 5
-	}
+	vf := min(vFreq, uint64(5))
 
 	adjustedProb := int64(prob) - int64(vf*10)
-	if adjustedProb < int64(aaf.minProbability) {
-		adjustedProb = int64(aaf.minProbability)
-	}
+	adjustedProb = max(adjustedProb, int64(aaf.minProbability))
 	return acceptWithProb(keyHash, uint32(adjustedProb))
 }
 
@@ -436,15 +429,11 @@ func (aaf *adaptiveAdmissionFilter) adjustAdmissionProbability() {
 			if np > admissionProbabilityStep {
 				np -= admissionProbabilityStep
 			}
-			if np < aaf.minProbability {
-				np = aaf.minProbability
-			}
+			np = max(np, aaf.minProbability)
 			aaf.admissionProbability = np
 		} else if ev < lowEvictionRateThreshold {
 			np := p + admissionProbabilityStep
-			if np > aaf.maxProbability {
-				np = aaf.maxProbability
-			}
+			np = min(np, aaf.maxProbability)
 			aaf.admissionProbability = np
 		}
 

@@ -6,9 +6,9 @@ import (
 )
 
 const (
-	rootPath      = "/" // Default path when none specified
-	pathSeparator = "/" // URL path separator
-	wildcardChar  = "*" // Wildcard character for pattern matching
+	rootPath      = "/"
+	pathSeparator = "/"
+	wildcardChar  = "*"
 )
 
 // PatternNode represents a single node in the path tree.
@@ -177,7 +177,6 @@ func (pi *PatternIndex) collectAllKeys(node *PatternNode) []string {
 	return keys
 }
 
-// Clear resets the index to empty state.
 func (pi *PatternIndex) Clear() {
 	pi.mu.Lock()
 	pi.root = newPatternNode()

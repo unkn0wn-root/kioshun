@@ -108,7 +108,7 @@ func (m *Manager) CloseAll() error {
 	})
 
 	// Phase 2: Clear all registry entries
-	m.caches.Range(func(key, value any) bool {
+	m.caches.Range(func(key, _ any) bool {
 		m.caches.Delete(key)
 		return true
 	})
