@@ -1,6 +1,9 @@
 package cache
 
-import "time"
+import (
+	"sync/atomic"
+	"time"
+)
 
 // Item is a wire-friendly export with absolute expiry.
 // NOTE:
@@ -61,6 +64,7 @@ func (c *InMemoryCache[K, V]) Import(items []Item[K, V]) {
 			ex = c.itemPool.Get().(*cacheItem[V])
 			s.data[it.Key] = ex
 			s.addToLRUHead(ex)
+			atomic.AddInt64(&s.size, 1)
 		} else if c.config.EvictionPolicy == LFU {
 			s.lfuList.remove(ex)
 		}
