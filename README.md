@@ -50,13 +50,15 @@ Kioshun’s cluster turns every service instance into a **small, self-managing p
 
 Small multinode example:
 
-```
+```bash
 # on each server
 CACHE_BIND=:4443
 CACHE_PUBLIC=srv-a:4443   # srv-b / srv-c on others
 CACHE_SEEDS=srv-a:4443,srv-b:4443,srv-c:4443
 CACHE_AUTH=supersecret
+```
 
+```go
 // in code
 local := cache.NewWithDefaults[string, []byte]()
 
