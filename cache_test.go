@@ -15,6 +15,7 @@ func TestCacheBasicOperations(t *testing.T) {
 
 	// Test Set and Get
 	cache.Set("key1", "value1", 1*time.Minute)
+	waitForWrites(t, cache)
 
 	if value, found := cache.Get("key1"); !found || value != "value1" {
 		t.Errorf("Expected 'value1', got '%s', found: %v", value, found)
@@ -41,6 +42,7 @@ func TestCacheExpiration(t *testing.T) {
 
 	// Set value with short TTL
 	cache.Set("expiring", "value", 100*time.Millisecond)
+	waitForWrites(t, cache)
 
 	// Should be available immediately
 	if _, found := cache.Get("expiring"); !found {
@@ -61,6 +63,7 @@ func TestCacheTTL(t *testing.T) {
 	defer cache.Close()
 
 	cache.Set("ttl_key", "value", 1*time.Minute)
+	waitForWrites(t, cache)
 
 	value, ttl, found := cache.GetWithTTL("ttl_key")
 	if !found {
@@ -89,12 +92,14 @@ func TestCacheLRUEviction(t *testing.T) {
 	cache.Set("key1", "value1", 1*time.Hour)
 	cache.Set("key2", "value2", 1*time.Hour)
 	cache.Set("key3", "value3", 1*time.Hour)
+	waitForWrites(t, cache)
 
 	// Access key1 to make it more recently used
 	cache.Get("key1")
 
 	// Add one more item, should evict key2 (least recently used)
 	cache.Set("key4", "value4", 1*time.Hour)
+	waitForWrites(t, cache)
 
 	// key2 should be evicted
 	if _, found := cache.Get("key2"); found {
@@ -119,6 +124,7 @@ func TestCacheStats(t *testing.T) {
 
 	// Set a value
 	cache.Set("key1", "value1", 1*time.Minute)
+	waitForWrites(t, cache)
 
 	// Hit
 	cache.Get("key1")
@@ -140,6 +146,7 @@ func TestCacheExists(t *testing.T) {
 	defer cache.Close()
 
 	cache.Set("key1", "value1", 1*time.Minute)
+	waitForWrites(t, cache)
 
 	if !cache.Exists("key1") {
 		t.Error("Expected key1 to exist")
@@ -157,6 +164,7 @@ func TestCacheKeys(t *testing.T) {
 	cache.Set("key1", "value1", 1*time.Minute)
 	cache.Set("key2", "value2", 1*time.Minute)
 	cache.Set("key3", "value3", 1*time.Minute)
+	waitForWrites(t, cache)
 
 	keys := cache.Keys()
 	if len(keys) != 3 {
@@ -204,6 +212,7 @@ func TestCacheConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+	waitForWrites(t, cache)
 
 	// Verify no data races occurred
 	stats := cache.Stats()
@@ -225,6 +234,7 @@ func TestCacheCleanup(t *testing.T) {
 	// Add items that will expire
 	cache.Set("key1", "value1", 100*time.Millisecond)
 	cache.Set("key2", "value2", 100*time.Millisecond)
+	waitForWrites(t, cache)
 
 	// Wait for items to expire
 	time.Sleep(150 * time.Millisecond)
@@ -260,6 +270,7 @@ func TestCacheCallback(t *testing.T) {
 		callbackKey = key
 		callbackValue = value
 	})
+	waitForWrites(t, cache)
 
 	// Wait for expiration
 	time.Sleep(200 * time.Millisecond)
@@ -294,6 +305,7 @@ func TestCacheManager(t *testing.T) {
 
 	// Use cache
 	cache.Set("key1", "value1", 1*time.Minute)
+	waitForWrites(t, cache)
 	if value, found := cache.Get("key1"); !found || value != "value1" {
 		t.Errorf("Expected 'value1', got '%s', found: %v", value, found)
 	}
@@ -318,12 +330,14 @@ func TestCacheGenerics(t *testing.T) {
 
 	// Test string cache
 	stringCache.Set("key", "value", 1*time.Minute)
+	waitForWrites(t, stringCache)
 	if value, found := stringCache.Get("key"); !found || value != "value" {
 		t.Error("String cache failed")
 	}
 
 	// Test int cache
 	intCache.Set(123, "int_value", 1*time.Minute)
+	waitForWrites(t, intCache)
 	if value, found := intCache.Get(123); !found || value != "int_value" {
 		t.Error("Int cache failed")
 	}
@@ -331,6 +345,7 @@ func TestCacheGenerics(t *testing.T) {
 	// Test struct cache
 	user := User{ID: "123", Name: "Test User", Email: "test@example.com"}
 	structCache.Set("user:123", user, 1*time.Minute)
+	waitForWrites(t, structCache)
 	if value, found := structCache.Get("user:123"); !found || value.ID != "123" {
 		t.Error("Struct cache failed")
 	}
@@ -365,6 +380,150 @@ func TestCacheCloseBehavior(t *testing.T) {
 	}
 }
 
+func TestSetReturnsAfterEnqueueBeforeCommit(t *testing.T) {
+	cache := New[string, string](Config{
+		MaxSize:         10,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  LRU,
+		WriteBufferSize: 1,
+		WriteBatchSize:  1,
+	})
+	defer cache.Close()
+
+	shard := cache.shards[0]
+	shard.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			shard.mu.Unlock()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cache.Set("key", "value", time.Hour)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("set returned error: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("set blocked until commit; expected enqueue-only return")
+	}
+
+	if _, ok := shard.data["key"]; ok {
+		t.Fatal("set committed while shard lock was held")
+	}
+
+	shard.mu.Unlock()
+	locked = false
+	waitForWrites(t, cache)
+
+	if value, found := cache.Get("key"); !found || value != "value" {
+		t.Fatalf("expected value after Wait, got %q found=%v", value, found)
+	}
+}
+
+func TestSetSyncWaitsForCommit(t *testing.T) {
+	cache := New[string, string](Config{
+		MaxSize:         10,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  LRU,
+		WriteBufferSize: 1,
+		WriteBatchSize:  1,
+	})
+	defer cache.Close()
+
+	shard := cache.shards[0]
+	shard.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			shard.mu.Unlock()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cache.SetSync("key", "value", time.Hour)
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("SetSync returned before commit; err=%v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	if _, ok := shard.data["key"]; ok {
+		t.Fatal("set committed while shard lock was held")
+	}
+
+	shard.mu.Unlock()
+	locked = false
+
+	if err := <-done; err != nil {
+		t.Fatalf("SetSync returned error: %v", err)
+	}
+	if value, found := cache.Get("key"); !found || value != "value" {
+		t.Fatalf("expected value after SetSync, got %q found=%v", value, found)
+	}
+}
+
+func TestDeleteOrdersAfterPendingSet(t *testing.T) {
+	cache := New[string, string](Config{
+		MaxSize:         10,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  LRU,
+		WriteBufferSize: 8,
+		WriteBatchSize:  8,
+	})
+	defer cache.Close()
+
+	shard := cache.shards[0]
+	shard.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			shard.mu.Unlock()
+		}
+	}()
+
+	if err := cache.Set("key", "value", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted := make(chan bool, 1)
+	go func() {
+		deleted <- cache.Delete("key")
+	}()
+
+	select {
+	case <-deleted:
+		t.Fatal("delete committed while shard lock was held")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	shard.mu.Unlock()
+	locked = false
+
+	if ok := <-deleted; !ok {
+		t.Fatal("delete returned false for pending set")
+	}
+	waitForWrites(t, cache)
+
+	if _, found := cache.Get("key"); found {
+		t.Fatal("delete after pending set resurrected key")
+	}
+}
+
 // Basic benchmarks are in cache_bench_test.go
 
 type User struct {
@@ -389,6 +548,7 @@ func TestSetInPlaceUpdate(t *testing.T) {
 
 	// Set initial value
 	cache.Set("key1", "value1", time.Hour)
+	waitForWrites(t, cache)
 
 	// Verify initial state
 	if value, found := cache.Get("key1"); !found || value != "value1" {
@@ -403,6 +563,7 @@ func TestSetInPlaceUpdate(t *testing.T) {
 
 	// Update the same key - should reuse the item
 	cache.Set("key1", "value2", time.Hour)
+	waitForWrites(t, cache)
 
 	// Verify update worked
 	if value, found := cache.Get("key1"); !found || value != "value2" {
@@ -442,6 +603,7 @@ func TestSetLFUFrequencyReset(t *testing.T) {
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
+	waitForWrites(t, cache)
 
 	// Access "a" multiple times to increase frequency
 	for i := 0; i < 10; i++ {
@@ -454,10 +616,12 @@ func TestSetLFUFrequencyReset(t *testing.T) {
 
 	// Update "a" with new value - frequency should reset to 1
 	cache.Set("a", 999, time.Hour)
+	waitForWrites(t, cache)
 
 	// Now add a new item to trigger eviction
 	// "a" should now be evicted since its frequency was reset
 	cache.Set("d", 4, time.Hour)
+	waitForWrites(t, cache)
 
 	// Verify that "a" was evicted (due to frequency reset)
 	if _, found := cache.Get("a"); found {

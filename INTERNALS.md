@@ -108,103 +108,82 @@ evictLFU():
 - **Access**: No position updates on access (maintains insertion order)
 - **Eviction**: Remove oldest inserted item (at tail.prev) in O(1)
 
-### AdmissionLFU (Adaptive Admission-controlled Least Frequently Used) - **Default**
-**Implementation**: Approximate LFU with admission control and scan resistance
-- **Access**: Update frequency counter in O(1) using Count-Min Sketch, no heap maintenance
-- **Eviction**: Random sampling (default 5 items, max 20) with LFU selection in O(k) where k = sample size
-- **Admission Control**: Multi-layered frequency-based admission with adaptive thresholds
-- **Scan Resistance**: Detects and adapts to scanning workloads automatically
-- Frequency bloom filter (10×shard size) + doorkeeper bloom filter (1/8 size) + workload detector per shard
+### SieveTinyLFU (Probation-SIEVE TinyLFU) - **Default**
+**Implementation**: segmented admission policy with a TinyLFU sketch, probation FIFO, main SIEVE queue, and compact ghost queue.
+- **Access**: update the TinyLFU sketch on hits and misses. Main-cache hits set a visited bit instead of moving list nodes.
+- **Insertion**: new items enter probation. Items seen in the ghost queue enter main immediately.
+- **Promotion**: probation items with repeated hits move to main with `visited=true`.
+- **Eviction**: probation drops one-hit items quickly; main uses a SIEVE hand that clears visited bits before evicting.
+- **Adaptation**: shard-local controller shifts capacity between probation and main using ghost hits, probation evictions, promotions, and main hits.
 
-**AdmissionLFU Architecture:**
+**SieveTinyLFU Architecture:**
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          Adaptive AdmissionLFU Shard                            │
-├─────────────────────────────┬───────────────────────────────────────────────────┤
-│ Adaptive Admission Filter   │                Cache Items                        │
-│  ┌─────────────────────────┐│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                  │
-│  │  Frequency Bloom Filter ││  │Item │ │Item │ │Item │ │Item │ ...              │
-│  │  Count-Min Sketch       ││  │Freq:│ │Freq:│ │Freq:│ │Freq:│                  │
-│  │  4-bit counters x10*cap ││  │  5  │ │  12 │ │  3  │ │  8  │                  │
-│  │  Hash: 4 functions      ││  └─────┘ └─────┘ └─────┘ └─────┘                  │
-│  │  Auto-aging threshold   ││                                                   │
-│  └─────────────────────────┘│  Random Sample 5 → Compare Frequencies            │
-│  ┌─────────────────────────┐│  Victim Selection: Min(freq, lastAccess)          │
-│  │    Doorkeeper Filter    ││  ↓                                                │
-│  │    Bloom Filter         ││  Adaptive Admission Decision                      │
-│  │    Size: cap/8          ││                                                   │
-│  │    Hash: 3 functions    ││  Normal Mode:                                     │
-│  │    Reset: 1min interval ││  • freq ≥ 3: Always admit                         │
-│  └─────────────────────────┘│  • freq > victim: Always admit                    │
-│  ┌─────────────────────────┐│  • freq = victim & freq > 0: Recency-based        │
-│  │   Workload Detector     ││  • else: Adaptive probability 5-95%               │
-│  │   Sequential patterns   ││                                                   │
-│  │   Admission rate track  ││  Scan Mode (detected patterns):                   │
-│  │   Miss streak tracking  ││  • Recency-based admission                        │
-│  │   Adaptive probability  ││  • Lower admission threshold                      │
-│  └─────────────────────────┘│  • Protect against cache pollution                │
-└─────────────────────────────┴───────────────────────────────────────────────────┘
+Shard
+├── TinyLFU sketch: 4-bit Count-Min Sketch, aged by halving
+├── Probation FIFO (P): new and unproven items
+├── Main SIEVE queue (M): reused items, lazy visited-bit retention
+└── Ghost queue (G): hash plus compact tag record of cold probation evictions
 ```
 
 **Admission Control Components:**
 
-1. **Frequency Estimation (Count-Min Sketch)**:
-   - 4-bit counters packed in uint64 arrays (16 counters per word)
-   - 4 hash functions with xxHash64-based avalanche mixing
-   - Automatic aging: counters halved when total increments ≥ size × 10
-   - Size: 10× shard capacity counters (min 1024 per shard)
+1. **TinyLFU sketch (`countMinSketch`)**
+   - 4-bit counters packed in `uint64` words.
+   - Four rotated hash indexes using the cache hash avalanche.
+   - Records successful `Get`, missed `Get`, new `Set`, and existing-key `Set`.
+   - Ages by halving all counters after a fixed increment window.
 
-2. **Doorkeeper Bloom Filter**:
-   - 3 hash functions for recent access tracking
-   - Size: 1/8 of frequency filter size for memory efficiency
-   - Periodic reset every 1 minute (configurable via AdmissionResetInterval)
-   - Immediate admission for items in doorkeeper (bypass frequency check)
+2. **Probation queue (`P`)**
+   - FIFO segment for new items.
+   - One-hit items are evicted quickly and recorded in the ghost queue.
+   - Reused items are promoted to main.
 
-3. **Workload Detector (Scan Resistance)**:
-   - Tracks consecutive admission rejections (fast signal of cold scans)
-   - Uses an admissions/sec signal to flag sudden bursts (defaults: 100 req/s, 50 misses)
-   - Switches to a more recency-biased admission during detected scans (recency window defaults: 100 ms / 1 s)
+3. **Main queue (`M`)**
+   - SIEVE-style list with one moving hand.
+   - Hits set `visited=true`.
+   - Eviction clears visited bits first; an unvisited item becomes the victim.
 
-   Override these thresholds via `Config.AdmissionScanRateThreshold`, `Config.AdmissionScanMissThreshold`, `Config.AdmissionScanRecencyThreshold`, and `Config.AdmissionRecencyTieBreak` while keeping the same defaults when unset.
+4. **Ghost queue (`G`)**
+   - Fixed-size ring of evicted probation hashes.
+   - A ghost hit means the key has recent reuse pressure, so the new item enters main.
 
-4. **Adaptive Admission Algorithm**:
-   ```
-   Phase 1: Doorkeeper Check
-   if in_doorkeeper(key):
-       refresh_doorkeeper(key)
-       return ADMIT
+5. **Adaptive split**
+   - `Config.ProbationRatio` controls initial probation capacity.
+   - `Config.GhostRatio` controls ghost capacity relative to main.
+   - `Config.Adapt` enables the controller that adjusts probation/main split.
 
-   Phase 2: Scan Detection
-   if detect_scan(key):
-       if victim_age > 100ms:
-           return ADMIT    // Prefer recent items during scan
-       else:
-           return ADMIT if hash(key) % 100 < min_probability(5%)
+**Core Admission Flow:**
+```go
+on get(key):
+    sketch.increment(hash(key))
+    if hit in main: item.visited = true
+    if hit in probation: item.reuse++
+    if probation reuse is high: promote to main
 
-   Phase 3: Update Frequency & Doorkeeper
-   new_freq = frequency_filter.increment(key)
-   doorkeeper.add(key)
+on set(new key):
+    sketch.increment(hash(key))
+    if ghost.has(hash): insert into main
+    else: insert into probation
+    while shard is over capacity:
+        evict from probation or main
+```
 
-   Phase 4: Adaptive Admission Decision
-   if new_freq >= 3:                    // High frequency guarantee
-       return ADMIT
-   elif new_freq > victim_frequency:    // Better than victim
-       return ADMIT
-   elif new_freq == victim_frequency && new_freq > 0:  // Recency tie-breaking
-       return ADMIT if victim_age > 1_second
-   else:                                // Adaptive probabilistic admission
-       probability = adaptive_probability(5-95%) - (victim_frequency * 10)
-       return ADMIT if hash(key) % 100 < max(probability, 5%)
+## Async Write Event Loop
 
-   Phase 5: Probability Adjustment
-   adjust_probability_based_on_eviction_pressure()
-   ```
+`Set` is enqueue-only on the caller path. It computes the shard hash and absolute
+expiration, then pushes a command into the owning shard's bounded write queue.
 
-5. **Adaptive Probability Control**:
-   - Dynamic admission probability between 5% and 95%
-   - Decreases probability (-5%) when eviction rate > 100/second
-   - Increases probability (+5%) when eviction rate < 10/second
-   - Eviction pressure monitored every second
+Each shard has one worker goroutine that drains up to `Config.WriteBatchSize`
+commands, takes the shard write lock once, and applies map updates, policy
+metadata, SieveTinyLFU admission, evictions, and queue maintenance in FIFO order.
+Synchronous callers can also help drain their own shard behind the same drain
+mutex, preserving single-consumer queue semantics while avoiding a worker wakeup
+on the strict mutation path.
+
+`SetSync`, `Delete`, and `Import` wait for the affected shard commands to be
+processed. `Wait`, `Clear`, and `Close` use global shard barriers when they need
+committed state across the whole cache. `Wait` is the global fence: all writes
+accepted before the barriers are visible after it returns.
 
 ## Eviction Policies
 
@@ -213,6 +192,6 @@ const (
     LRU        EvictionPolicy = iota // Least Recently Used
     LFU                              // Least Frequently Used
     FIFO                             // First In, First Out
-    AdmissionLFU                     // Sampled LFU with admission control (default)
+    SieveTinyLFU                     // Probation-SIEVE TinyLFU admission (default)
 )
 ```

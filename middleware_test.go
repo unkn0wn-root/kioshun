@@ -29,6 +29,7 @@ func TestHTTPCacheMiddleware_BasicCaching(t *testing.T) {
 	req1 := httptest.NewRequest("GET", "/test", nil)
 	rec1 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec1.Header().Get("X-Cache") != "MISS" {
 		t.Error("Expected cache miss on first request")
@@ -38,6 +39,7 @@ func TestHTTPCacheMiddleware_BasicCaching(t *testing.T) {
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	rec2 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec2, req2)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec2.Header().Get("X-Cache") != "HIT" {
 		t.Error("Expected cache hit on second request")
@@ -66,11 +68,13 @@ func TestHTTPCacheMiddleware_TTLExpiration(t *testing.T) {
 	req1 := httptest.NewRequest("GET", "/test", nil)
 	rec1 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
 
 	// Second request - should hit cache
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	rec2 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec2, req2)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec2.Header().Get("X-Cache") != "HIT" {
 		t.Error("Expected cache hit")
@@ -83,6 +87,7 @@ func TestHTTPCacheMiddleware_TTLExpiration(t *testing.T) {
 	req3 := httptest.NewRequest("GET", "/test", nil)
 	rec3 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec3, req3)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec3.Header().Get("X-Cache") != "MISS" {
 		t.Error("Expected cache miss after TTL expiration")
@@ -110,10 +115,12 @@ func TestHTTPCacheMiddleware_CachePolicy(t *testing.T) {
 	req1 := httptest.NewRequest("GET", "/test", nil)
 	rec1 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
 
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	rec2 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec2, req2)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec2.Header().Get("X-Cache") != "MISS" {
 		t.Error("GET request should not be cached")
@@ -123,10 +130,12 @@ func TestHTTPCacheMiddleware_CachePolicy(t *testing.T) {
 	req3 := httptest.NewRequest("POST", "/test", nil)
 	rec3 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec3, req3)
+	waitForMiddlewareWrites(t, middleware)
 
 	req4 := httptest.NewRequest("POST", "/test", nil)
 	rec4 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec4, req4)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec4.Header().Get("X-Cache") != "HIT" {
 		t.Error("POST request should be cached")
@@ -153,12 +162,14 @@ func TestHTTPCacheMiddleware_KeyGenerator(t *testing.T) {
 	req1.Header.Set("X-User-ID", "1")
 	rec1 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
 
 	// Same request with User-ID: 1 - should hit cache
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	req2.Header.Set("X-User-ID", "1")
 	rec2 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec2, req2)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec2.Header().Get("X-Cache") != "HIT" {
 		t.Error("Expected cache hit for same user")
@@ -169,6 +180,7 @@ func TestHTTPCacheMiddleware_KeyGenerator(t *testing.T) {
 	req3.Header.Set("X-User-ID", "2")
 	rec3 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec3, req3)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec3.Header().Get("X-Cache") != "MISS" {
 		t.Error("Expected cache miss for different user")
@@ -205,6 +217,7 @@ func TestHTTPCacheMiddleware_Callbacks(t *testing.T) {
 	req1 := httptest.NewRequest("GET", "/test", nil)
 	rec1 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
 
 	if missCount != 1 || setCount != 1 || hitCount != 0 {
 		t.Errorf("Expected 1 miss, 1 set, 0 hits, got %d miss, %d set, %d hits", missCount, setCount, hitCount)
@@ -214,6 +227,7 @@ func TestHTTPCacheMiddleware_Callbacks(t *testing.T) {
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	rec2 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec2, req2)
+	waitForMiddlewareWrites(t, middleware)
 
 	if missCount != 1 || setCount != 1 || hitCount != 1 {
 		t.Errorf("Expected 1 miss, 1 set, 1 hit, got %d miss, %d set, %d hits", missCount, setCount, hitCount)
@@ -253,11 +267,13 @@ func TestHTTPCacheMiddleware_CacheControlHeaders(t *testing.T) {
 			req1 := httptest.NewRequest("GET", "/test-"+tt.name, nil)
 			rec1 := httptest.NewRecorder()
 			wrappedHandler.ServeHTTP(rec1, req1)
+			waitForMiddlewareWrites(t, middleware)
 
 			// Second request
 			req2 := httptest.NewRequest("GET", "/test-"+tt.name, nil)
 			rec2 := httptest.NewRecorder()
 			wrappedHandler.ServeHTTP(rec2, req2)
+			waitForMiddlewareWrites(t, middleware)
 
 			cacheHeader := rec2.Header().Get("X-Cache")
 			if tt.expectCached && cacheHeader != "HIT" {
@@ -289,11 +305,13 @@ func TestHTTPCacheMiddleware_NonCacheableMethods(t *testing.T) {
 			req1 := httptest.NewRequest(method, "/test", nil)
 			rec1 := httptest.NewRecorder()
 			wrappedHandler.ServeHTTP(rec1, req1)
+			waitForMiddlewareWrites(t, middleware)
 
 			// Second request
 			req2 := httptest.NewRequest(method, "/test", nil)
 			rec2 := httptest.NewRecorder()
 			wrappedHandler.ServeHTTP(rec2, req2)
+			waitForMiddlewareWrites(t, middleware)
 
 			if rec2.Header().Get("X-Cache") != "MISS" {
 				t.Errorf("%s request should not be cached", method)
@@ -318,11 +336,13 @@ func TestHTTPCacheMiddleware_Stats(t *testing.T) {
 	req1 := httptest.NewRequest("GET", "/test", nil)
 	rec1 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
 
 	// Second request (hit)
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	rec2 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec2, req2)
+	waitForMiddlewareWrites(t, middleware)
 
 	stats := middleware.Stats()
 	if stats.Hits != 1 || stats.Misses != 1 {
@@ -354,11 +374,13 @@ func TestHTTPCacheMiddleware_Clear(t *testing.T) {
 	req1 := httptest.NewRequest("GET", "/test", nil)
 	rec1 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
 
 	// Verify it's cached
 	req2 := httptest.NewRequest("GET", "/test", nil)
 	rec2 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec2, req2)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec2.Header().Get("X-Cache") != "HIT" {
 		t.Error("Expected cache hit before clear")
@@ -371,6 +393,7 @@ func TestHTTPCacheMiddleware_Clear(t *testing.T) {
 	req3 := httptest.NewRequest("GET", "/test", nil)
 	rec3 := httptest.NewRecorder()
 	wrappedHandler.ServeHTTP(rec3, req3)
+	waitForMiddlewareWrites(t, middleware)
 
 	if rec3.Header().Get("X-Cache") != "MISS" {
 		t.Error("Expected cache miss after clear")
@@ -549,6 +572,7 @@ func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
 		req := httptest.NewRequest("GET", path, nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 
 		if rec.Header().Get("X-Cache") != "MISS" {
 			t.Errorf("Expected MISS for first request to %s", path)
@@ -560,6 +584,7 @@ func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
 		req := httptest.NewRequest("GET", path, nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 
 		if rec.Header().Get("X-Cache") != "HIT" {
 			t.Errorf("Expected HIT for cached request to %s", path)
@@ -572,11 +597,13 @@ func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/users/1", nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 
 		// Verify it's cached
 		req2 := httptest.NewRequest("GET", "/api/users/1", nil)
 		rec2 := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec2, req2)
+		waitForMiddlewareWrites(t, middleware)
 		if rec2.Header().Get("X-Cache") != "HIT" {
 			t.Error("Expected cache hit before invalidation")
 		}
@@ -588,6 +615,7 @@ func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
 		req3 := httptest.NewRequest("GET", "/api/users/1", nil)
 		rec3 := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec3, req3)
+		waitForMiddlewareWrites(t, middleware)
 
 		if rec3.Header().Get("X-Cache") != "MISS" {
 			t.Error("Expected cache miss after invalidation")
@@ -615,6 +643,7 @@ func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test/double", nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 
 		// First invalidation
 		removed1 := middleware.Invalidate("/test/double")
@@ -634,6 +663,7 @@ func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
 		req := httptest.NewRequest("GET", "/", nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 
 		removed := middleware.Invalidate("/")
 		if removed != 1 {
@@ -646,6 +676,7 @@ func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
 		req := httptest.NewRequest("GET", "/test?param=value", nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 
 		// Should invalidate based on path only (query ignored)
 		removed := middleware.Invalidate("/test")
@@ -693,6 +724,7 @@ func TestHTTPCacheMiddleware_CacheHitMissVerification(t *testing.T) {
 				req := httptest.NewRequest("GET", path, nil)
 				rec := httptest.NewRecorder()
 				wrappedHandler.ServeHTTP(rec, req)
+				waitForMiddlewareWrites(t, middleware)
 
 				// Verify header on each request
 				expectedHeader := "MISS"
@@ -736,6 +768,7 @@ func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
 		req := httptest.NewRequest("GET", fmt.Sprintf("/test/%d", i), nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 	}
 
 	// Concurrent invalidation
@@ -764,6 +797,7 @@ func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
 		req := httptest.NewRequest("GET", fmt.Sprintf("/test/%d", i), nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 
 		if rec.Header().Get("X-Cache") != "MISS" {
 			t.Errorf("Expected MISS after concurrent invalidation for /test/%d", i)
@@ -792,6 +826,7 @@ func TestHTTPCacheMiddleware_BasicPatternInvalidation(t *testing.T) {
 		req := httptest.NewRequest("GET", path, nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 	}
 
 	// Test basic wildcard invalidation
@@ -805,6 +840,7 @@ func TestHTTPCacheMiddleware_BasicPatternInvalidation(t *testing.T) {
 		req := httptest.NewRequest("GET", path, nil)
 		rec := httptest.NewRecorder()
 		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
 
 		if rec.Header().Get("X-Cache") != "MISS" {
 			t.Errorf("Expected MISS after invalidation for %s", path)

@@ -10,28 +10,27 @@ import (
 )
 
 const (
-	// Expiration sentinels for Set(): NoExpiration => never expires; DefaultExpiration => use Config.DefaultTTL.
 	NoExpiration      time.Duration = -1
 	DefaultExpiration time.Duration = 0
 
-	// Default capacities/intervals (used by DefaultConfig()).
 	defaultMaxSize         = 10000
 	defaultCleanupInterval = 5 * time.Minute
 	defaultTTL             = 30 * time.Minute
+	defaultWriteBufferSize = 1024
+	defaultWriteBatchSize  = 64
 
-	// Sharding: cap shard count, scale by CPUs, and round to power-of-two for mask-based modulo.
+	// cap shard count, scale by CPUs, and round to 2^n for mask-based modulo.
 	maxShardCount   = 256
 	shardMultiplier = 4
 )
 
-// EvictionPolicy selects the global replacement strategy.
 type EvictionPolicy int
 
 const (
-	LRU          EvictionPolicy = iota // least-recently-used
-	LFU                                // least-frequently-used
-	FIFO                               // first-in-first-out (uses LRU list insertion order)
-	AdmissionLFU                       // victim sampling + adaptive admission (approx-LFU)
+	LRU EvictionPolicy = iota
+	LFU
+	FIFO
+	SieveTinyLFU // probation SIEVE + TinyLFU admission
 )
 
 // Cache is the public API of the sharded in-memory cache.
@@ -40,23 +39,51 @@ type Cache[K comparable, V any] interface {
 	Get(key K) (V, bool)
 	Delete(key K) bool
 	Clear()
+	Wait() error
 	Size() int64
 	Stats() Stats
+	PolicyStats() PolicyStats
 	Close() error
 }
 
-// cacheItem is the node stored in shard maps/lists; fields updated per policy.
+// CommittedCache extends Cache with a synchronous Set path for callers that need
+// read-after-write visibility for one key without paying for a global Wait.
+type CommittedCache[K comparable, V any] interface {
+	Cache[K, V]
+	SetSync(key K, value V, ttl time.Duration) error
+}
+
 type cacheItem[V any] struct {
 	value      V
 	expireTime int64 // absolute ns; 0 => no expiration
 	lastAccess int64 // last touch time (ns) for policies that use it
-	frequency  int64 // LFU counter (policy-dependent)
+	lfuFreq    int64 // exact LFU counter
 	prev       *cacheItem[V]
 	next       *cacheItem[V]
+	sieveQ     *sieveQueue[V]
 	key        any // original key for deletions
+	hash       uint64
+	tag        uint16
+	queue      sieveQueueID
+	reuse      uint8
+	visited    uint32
 }
 
-// Stats exposes approximate telemetry aggregated across shards.
+func acquireCacheItem[V any](pool *sync.Pool) *cacheItem[V] {
+	it := pool.Get().(*cacheItem[V])
+	*it = cacheItem[V]{}
+	return it
+}
+
+func releaseCacheItem[V any](pool *sync.Pool, it *cacheItem[V]) {
+	if it == nil {
+		return
+	}
+	*it = cacheItem[V]{}
+	pool.Put(it)
+}
+
+// Stats exposes approx. telemetry aggregated across shards.
 type Stats struct {
 	Hits        int64
 	Misses      int64
@@ -68,64 +95,87 @@ type Stats struct {
 	Shards      int
 }
 
-// Config groups capacity, sharding, TTL, policy, and telemetry options.
-type Config struct {
-	MaxSize                       int64
-	ShardCount                    int
-	CleanupInterval               time.Duration
-	DefaultTTL                    time.Duration
-	EvictionPolicy                EvictionPolicy
-	StatsEnabled                  bool
-	AdmissionResetInterval        time.Duration
-	AdmissionScanRateThreshold    uint64
-	AdmissionScanMissThreshold    uint64
-	AdmissionScanRecencyThreshold time.Duration
-	AdmissionRecencyTieBreak      time.Duration
+// PolicyStats exposes SieveTinyLFU admission and replacement decisions.
+type PolicyStats struct {
+	Admits             int64
+	Rejects            int64
+	GhostHits          int64
+	Promotions         int64
+	ProbationEvictions int64
+	MainEvictions      int64
 }
 
-// DefaultConfig returns sane defaults for a general-purpose cache.
+// Config groups capacity, sharding, TTL, policy and telemetry options.
+type Config struct {
+	MaxSize         int64
+	ShardCount      int
+	CleanupInterval time.Duration
+	DefaultTTL      time.Duration
+	EvictionPolicy  EvictionPolicy
+	StatsEnabled    bool
+	ProbationRatio  uint8
+	GhostRatio      uint8
+	Adapt           bool
+	// bounded per-shard queue depth for async writes.
+	WriteBufferSize int
+	// caps how many queued writes a shard worker applies under one lock.
+	WriteBatchSize int
+}
+
 func DefaultConfig() Config {
 	return Config{
-		MaxSize:                       defaultMaxSize,
-		ShardCount:                    0,
-		CleanupInterval:               defaultCleanupInterval,
-		DefaultTTL:                    defaultTTL,
-		EvictionPolicy:                AdmissionLFU,
-		StatsEnabled:                  true,
-		AdmissionResetInterval:        1 * time.Minute,
-		AdmissionScanRateThreshold:    defaultScanAdmissionThreshold,
-		AdmissionScanMissThreshold:    defaultScanMissThreshold,
-		AdmissionScanRecencyThreshold: defaultScanRecencyThreshold,
-		AdmissionRecencyTieBreak:      defaultRecencyTieBreak,
+		MaxSize:         defaultMaxSize,
+		ShardCount:      0,
+		CleanupInterval: defaultCleanupInterval,
+		DefaultTTL:      defaultTTL, EvictionPolicy: SieveTinyLFU, StatsEnabled: true, ProbationRatio: defaultProbationRatio, GhostRatio: defaultGhostRatio,
+		Adapt:           true,
+		WriteBufferSize: defaultWriteBufferSize,
+		WriteBatchSize:  defaultWriteBatchSize,
 	}
 }
 
 // InMemoryCache is a sharded, lock-based cache with per-policy metadata.
 type InMemoryCache[K comparable, V any] struct {
 	shards      []*shard[K, V] // shard-local maps + lists + counters
-	shardMask   uint64         // shards is power-of-two; mask = shards-1
+	shardMask   uint64         // shards is 2^n; mask = shards-1
 	config      Config
-	globalStats Stats         // mirrors aggregated Stats()
-	perShardCap int64         // floor(MaxSize / shards); 0 => unlimited
+	perShardCap int64         // floor(MaxSize/shards); 0 => unlimited
 	cleanupCh   chan struct{} // manual cleanup trigger (coalesced)
-	closeCh     chan struct{} // background goroutine shutdown
+	closeCh     chan struct{}
 	closeOnce   sync.Once
-	closed      int32         // 1 => cache closed; hot-path check
-	itemPool    sync.Pool     // *cacheItem[V] reuse to lower GC pressure
-	hasher      hasher[K]     // fast, stable key hash
-	evictor     evictor[K, V] // policy implementation
+	closed      int32 // 1 => cache closed; hot-path check
+	workers     sync.WaitGroup
+	itemPool    sync.Pool // *cacheItem[V] reuse to lower GC pressure
+	waiterPool  sync.Pool // write ack waiters for synchronous mutation paths
+	hasher      hasher[K]
+	evictor     evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
 }
 
-// New builds a cache, sizes shards/capacity, initializes policy data, and starts cleaner if configured.
+type getResult[V any] struct {
+	value      V
+	expireTime int64
+	now        int64
+	ok         bool
+}
+
+// New builds a cache, sizes shards/capacity, initializes policy data and
+// starts the cleaner when configured.
 func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
+	if config.WriteBufferSize <= 0 {
+		config.WriteBufferSize = defaultWriteBufferSize
+	}
+	if config.WriteBatchSize <= 0 {
+		config.WriteBatchSize = defaultWriteBatchSize
+	}
+
 	shardCount := config.ShardCount
 	if shardCount <= 0 {
-		// Over-provision shards to reduce lock contention.
+		// overprovision shards to reduce lock contention.
 		shardCount = runtime.NumCPU() * shardMultiplier
 		shardCount = min(shardCount, maxShardCount)
 	}
 
-	// Guard against zero per-shard capacity when MaxSize is small; cap shards accordingly.
+	// guard against zero per-shard capacity when MaxSize is small.
 	if config.MaxSize > 0 {
 		limit := config.MaxSize
 		limit = min(limit, int64(maxShardCount))
@@ -146,47 +196,58 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		itemPool: sync.Pool{
 			New: func() any { return &cacheItem[V]{} },
 		},
+		waiterPool: sync.Pool{
+			New: func() any { return &writeWaiter{ch: make(chan struct{}, 1)} },
+		},
 	}
 
-	// Precompute per-shard capacity for Set()-time eviction decisions.
+	// precompute the base per-shard capacity. Individual shards receive the
+	// remainder below so the aggregate capacity is exactly MaxSize.
 	if config.MaxSize > 0 {
 		cache.perShardCap = config.MaxSize / int64(shardCount)
 	}
 
 	cache.hasher = newHasher[K]()
-	cache.evictor = createEvictor[K, V](config.EvictionPolicy)
-
-	// Pre-size shard maps; init per-policy structures.
-	capHint := 0
-	if cache.perShardCap > 0 {
-		capHint = int(cache.perShardCap)
+	if config.EvictionPolicy != SieveTinyLFU {
+		cache.evictor = createEvictor[K, V](config.EvictionPolicy)
 	}
 
 	for i := 0; i < shardCount; i++ {
-		s := &shard[K, V]{data: make(map[K]*cacheItem[V], capHint)}
-		s.initLRU() // LRU list is used for LRU, FIFO ordering, and uniform removal
+		sc := int64(0)
+		if config.MaxSize > 0 {
+			sc = cache.perShardCap
+			if int64(i) < config.MaxSize%int64(shardCount) {
+				sc++
+			}
+		}
+		capHint := 0
+		if sc > 0 {
+			capHint = int(sc)
+		}
+
+		s := &shard[K, V]{
+			data:       make(map[K]*cacheItem[V], capHint),
+			cap:        sc,
+			wake:       make(chan struct{}, 1),
+			writeBatch: make([]writeCommand[K, V], config.WriteBatchSize),
+		}
+		s.queue = newWriteQueue[K, V](config.WriteBufferSize, s.wake, cache.closeCh)
+		s.initLRU() // LRU list is used for LRU, FIFO ordering and uniform removval
 
 		if config.EvictionPolicy == LFU {
 			s.lfuList = newLFUList[K, V]() // O(1) freq buckets
 		}
-		if config.EvictionPolicy == AdmissionLFU && cache.perShardCap > 0 {
-			// Size frequency sketch counters (~10× capacity; min 1024) and set doorkeeper reset cadence.
-			nc := uint64(cache.perShardCap * 10)
-			nc = max(nc, uint64(1024))
-			resetInterval := config.AdmissionResetInterval
-			if resetInterval == 0 {
-				resetInterval = 1 * time.Minute
-			}
-			s.admission = newAdaptiveAdmissionFilter(
-				nc,
-				resetInterval,
-				config.AdmissionScanRateThreshold,
-				config.AdmissionScanMissThreshold,
-				config.AdmissionScanRecencyThreshold,
-				config.AdmissionRecencyTieBreak,
-			)
+		if config.EvictionPolicy == SieveTinyLFU && s.cap > 0 {
+			s.sieve = newSieveTinyLFU[V](s.cap, config.ProbationRatio, config.GhostRatio)
+			s.sieve.adaptive = config.Adapt
+			s.readBuf = newReadBuffer() // per-shard read sampling for the sketch
 		}
 		cache.shards[i] = s
+	}
+
+	for _, s := range cache.shards {
+		cache.workers.Add(1)
+		go cache.writeWorker(s)
 	}
 
 	if config.CleanupInterval > 0 {
@@ -201,18 +262,21 @@ func NewWithDefaults[K comparable, V any]() *InMemoryCache[K, V] {
 	return New[K, V](DefaultConfig())
 }
 
-// getShard maps key → shard using hash & mask (fast modulo).
 func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
 	hash := c.hasher.hash(key)
 	return c.shards[hash&c.shardMask]
 }
 
-// get reads an item, applies expiration, and updates policy metadata (locking varies by policy).
-func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
+func (c *InMemoryCache[K, V]) get(key K) getResult[V] {
 	if atomic.LoadInt32(&c.closed) == 1 {
-		return nil, 0, false
+		return getResult[V]{}
 	}
-	shard := c.getShard(key)
+	kh := c.hasher.hash(key)
+	shard := c.shardByHash(kh)
+
+	if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
+		return c.getSieve(key, kh, shard)
+	}
 
 	nw := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
 	shardLockedWrite := false
@@ -232,10 +296,13 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 
 	item, exists := shard.data[key]
 	if !exists {
+		if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
+			shard.sieve.recordAccess(kh)
+		}
 		if c.config.StatsEnabled {
 			atomic.AddInt64(&shard.misses, 1)
 		}
-		return nil, 0, false
+		return getResult[V]{}
 	}
 
 	var now int64
@@ -249,31 +316,29 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 
 				item, exists = shard.data[key]
 				if !exists {
+					if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
+						shard.sieve.recordAccess(kh)
+					}
 					if c.config.StatsEnabled {
 						atomic.AddInt64(&shard.misses, 1)
 					}
-					return nil, now, false
+					return getResult[V]{now: now}
 				}
-				// Item might have been refreshed while upgrading the lock; re-evaluate.
+				// might have been refreshed while upgrading the lock; re-evaluate.
 				continue
 			}
 
-			delete(shard.data, key)
-			shard.removeFromLRU(item)
-
-			if c.config.EvictionPolicy == LFU {
-				shard.lfuList.remove(item)
+			c.removeItem(shard, item, false)
+			if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
+				shard.sieve.recordAccess(kh)
 			}
-
-			c.itemPool.Put(item)
-			atomic.AddInt64(&shard.size, -1)
 
 			if c.config.StatsEnabled {
 				atomic.AddInt64(&shard.expirations, 1)
 				atomic.AddInt64(&shard.misses, 1)
 			}
 
-			return nil, now, false
+			return getResult[V]{now: now}
 		}
 		break
 	}
@@ -283,207 +348,187 @@ func (c *InMemoryCache[K, V]) get(key K) (*cacheItem[V], int64, bool) {
 		shard.moveToLRUHead(item)
 	case LFU:
 		item.lastAccess = now
-		item.frequency++
 		shard.lfuList.increment(item)
-	case AdmissionLFU:
-		atomic.StoreInt64(&item.lastAccess, now)
-		atomic.AddInt64(&item.frequency, 1)
+	case SieveTinyLFU:
+		// only reached for unlimited (cap==0) SieveTinyLFU shards, which have no
+		// policy state; resident reads go through getSieve otherwise.
+		item.lastAccess = now
 	}
 
 	if c.config.StatsEnabled {
 		atomic.AddInt64(&shard.hits, 1)
 	}
 
-	return item, now, true
+	return getResult[V]{
+		value:      item.value,
+		expireTime: item.expireTime,
+		now:        now,
+		ok:         true,
+	}
 }
 
-// Get returns the value for key, if present and not expired.
-func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
-	var zero V
-	item, _, ok := c.get(key)
-	if !ok {
-		return zero, false
-	}
-	return item.value, true
-}
-
-// GetWithTTL returns the value and the remaining TTL (-1 if never expires).
-func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
-	var zero V
-	item, now, ok := c.get(key)
-	if !ok {
-		return zero, 0, false
+func (c *InMemoryCache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V] {
+	if !shard.mu.TryRLock() {
+		return c.getSieveContended(key, kh, shard)
 	}
 
-	if item.expireTime == 0 {
-		return item.value, -1, true
-	}
-
-	ttl := time.Duration(item.expireTime - now)
-	return item.value, ttl, true
-}
-
-// Set inserts/updates a key with TTL, evicting if needed (or consulting AdmissionLFU to skip pollution).
-func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
-	if atomic.LoadInt32(&c.closed) == 1 {
-		return ErrCacheClosed
-	}
-	if ttl == 0 {
-		ttl = c.config.DefaultTTL
-	}
-
-	kh := c.hasher.hash(key)
-	shard := c.shardByHash(kh)
-	now := time.Now().UnixNano()
-
-	var expireTime int64
-	if ttl > 0 {
-		expireTime = now + ttl.Nanoseconds()
-	}
-
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	// In-place update for existing key to preserve list links.
-	if ex, exists := shard.data[key]; exists {
-		ex.value = value
-		ex.lastAccess = now
-		ex.expireTime = expireTime
-
-		switch c.config.EvictionPolicy {
-		case LRU:
-			shard.moveToLRUHead(ex)
-		case LFU:
-			shard.lfuList.remove(ex)
-			ex.frequency = 1
-			shard.lfuList.add(ex)
-		case AdmissionLFU:
-			ex.frequency = 1
+	item, exists := shard.data[key]
+	if !exists {
+		warmup := shard.belowSieveWarmupLocked()
+		shard.mu.RUnlock()
+		if !warmup {
+			shard.sampleRead(kh)
 		}
-		return nil
-	}
-
-	// Capacity enforcement: either evict (LRU/LFU/FIFO) or consult admission filter (AdmissionLFU).
-	if c.perShardCap > 0 && atomic.LoadInt64(&shard.size) >= c.perShardCap {
-		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
-			admissionEvictor := c.evictor.(admissionLFUEvictor[K, V])
-			// Sample → admission → eviction; admission may reject without evicting.
-			if !admissionEvictor.evictWithAdmission(
-				shard, &c.itemPool, c.config.StatsEnabled,
-				shard.admission, kh,
-			) {
-				return nil
-			}
-		} else {
-			// Other policies always evict one victim when full.
-			c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
+		if c.config.StatsEnabled {
+			atomic.AddInt64(&shard.misses, 1)
 		}
+		return getResult[V]{}
 	}
 
-	item := c.itemPool.Get().(*cacheItem[V])
-	item.value = value
-	item.lastAccess = now
-	item.frequency = 1
-	item.key = key
-	item.expireTime = expireTime
-
-	shard.data[key] = item
-	shard.addToLRUHead(item)
-
-	if c.config.EvictionPolicy == LFU {
-		shard.lfuList.add(item)
+	if shard.sieve != nil && !shard.belowSieveWarmupLocked() {
+		shard.sieve.recordReadHit(item)
 	}
 
-	atomic.AddInt64(&shard.size, 1)
-	return nil
-}
-
-// SetWithCallback sets a key and executes a callback once its TTL elapses (re-validates under lock).
-func (c *InMemoryCache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
-	if atomic.LoadInt32(&c.closed) == 1 {
-		return ErrCacheClosed
+	res := getResult[V]{
+		value:      item.value,
+		expireTime: item.expireTime,
+		ok:         true,
 	}
+	shard.mu.RUnlock()
 
-	err := c.Set(key, value, ttl)
-	if err != nil {
-		return err
-	}
-
-	if callback != nil && ttl > 0 {
-		go func() {
-			timer := time.NewTimer(ttl)
-			defer timer.Stop()
-
-			select {
-			case <-timer.C:
-				shard := c.getShard(key)
-				shard.mu.RLock()
-				item, exists := shard.data[key]
-				// Check under lock to avoid firing for updated/removed items.
-				if exists && item.expireTime > 0 && time.Now().UnixNano() > item.expireTime {
-					shard.mu.RUnlock()
-					callback(key, value)
-				} else {
-					shard.mu.RUnlock()
+	if res.expireTime > 0 {
+		res.now = time.Now().UnixNano()
+		if res.now > res.expireTime {
+			shard.mu.Lock()
+			if cur, ok := shard.data[key]; ok && cur.expireTime > 0 && res.now > cur.expireTime {
+				c.removeItem(shard, cur, false)
+				if c.config.StatsEnabled {
+					atomic.AddInt64(&shard.expirations, 1)
+					atomic.AddInt64(&shard.misses, 1)
 				}
-			case <-c.closeCh:
-				return
+				shard.mu.Unlock()
+				return getResult[V]{now: res.now}
 			}
-		}()
+			shard.mu.Unlock()
+
+			return c.getSieve(key, kh, shard)
+		}
 	}
 
-	return nil
+	if c.config.StatsEnabled {
+		atomic.AddInt64(&shard.hits, 1)
+	}
+	// feed the read into the frequency sketch via the per-shard read buffer so
+	// TinyLFU admission reflects read popularity, not just write traffic.
+	shard.sampleRead(kh)
+	return res
 }
 
-// Delete removes a key (if present), unlinks it from lists, and recycles the node.
-func (c *InMemoryCache[K, V]) Delete(key K) bool {
-	if atomic.LoadInt32(&c.closed) == 1 {
-		return false
-	}
-
-	shard := c.getShard(key)
+func (c *InMemoryCache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K, V]) getResult[V] {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	item, exists := shard.data[key]
 	if !exists {
-		return false
+		if shard.sieve != nil && !shard.belowSieveWarmupLocked() {
+			shard.sampleRead(kh)
+		}
+		if c.config.StatsEnabled {
+			atomic.AddInt64(&shard.misses, 1)
+		}
+		return getResult[V]{}
 	}
 
-	delete(shard.data, key)
-	shard.removeFromLRU(item)
-	if c.config.EvictionPolicy == LFU {
-		shard.lfuList.remove(item)
+	now := int64(0)
+	if item.expireTime > 0 {
+		now = time.Now().UnixNano()
+		if now > item.expireTime {
+			c.removeItem(shard, item, false)
+			if c.config.StatsEnabled {
+				atomic.AddInt64(&shard.expirations, 1)
+				atomic.AddInt64(&shard.misses, 1)
+			}
+			return getResult[V]{now: now}
+		}
 	}
 
-	c.itemPool.Put(item)
-	atomic.AddInt64(&shard.size, -1)
+	if shard.sieve != nil && !shard.belowSieveWarmupLocked() {
+		shard.sieve.recordReadHit(item)
+	}
 
-	return true
+	if c.config.StatsEnabled {
+		atomic.AddInt64(&shard.hits, 1)
+	}
+	shard.sampleRead(kh)
+	return getResult[V]{
+		value:      item.value,
+		expireTime: item.expireTime,
+		now:        now,
+		ok:         true,
+	}
 }
 
-// Clear empties all shards and reinitializes policy structures (resets AdmissionLFU state).
-func (c *InMemoryCache[K, V]) Clear() {
-	if atomic.LoadInt32(&c.closed) == 1 {
-		return
+// Get returns the value for key, if present and not expired.
+func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
+	var zero V
+	res := c.get(key)
+	if !res.ok {
+		return zero, false
+	}
+	return res.value, true
+}
+
+// GetWithTTL returns the value and the remaining TTL (-1 if never expires).
+func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
+	var zero V
+	res := c.get(key)
+	if !res.ok {
+		return zero, 0, false
 	}
 
-	for _, shard := range c.shards {
-		shard.mu.Lock()
-		for _, item := range shard.data {
-			c.itemPool.Put(item)
-		}
-		shard.data = make(map[K]*cacheItem[V])
-		shard.initLRU()
-		if c.config.EvictionPolicy == LFU {
-			shard.lfuList = newLFUList[K, V]()
-		}
-		if c.config.EvictionPolicy == AdmissionLFU && shard.admission != nil {
-			shard.admission.Reset()
-		}
-		atomic.StoreInt64(&shard.size, 0)
-		shard.mu.Unlock()
+	if res.expireTime == 0 {
+		return res.value, -1, true
 	}
+
+	ttl := time.Duration(res.expireTime - res.now)
+	return res.value, ttl, true
+}
+
+// Set accepts an async insert/update command for key with TTL.
+// A nil error means the command was enqueued.
+// Call Wait for committed read-after-write visibility.
+func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
+	return c.set(key, value, ttl, nil)
+}
+
+// SetSync inserts or updates key and waits until the owning shard has processed
+// the write. It is the low-latency read-after-write path.
+// Use Wait only when a caller needs a global fence for writes across all shards.
+func (c *InMemoryCache[K, V]) SetSync(key K, value V, ttl time.Duration) error {
+	return c.setAndWait(key, value, ttl)
+}
+
+// SetWithCallback accepts an async Set and schedules the callback after the item is committed.
+// The callback fires once the TTL elapses and re-validates the item under lock.
+// High-cardinality callback workloads should use an external scheduler or
+// periodic cleanup instead of one goroutine and timer per item.
+func (c *InMemoryCache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
+	return c.set(key, value, ttl, callback)
+}
+
+// Delete removes a key (if present), unlinks it from lists and recycles the node.
+func (c *InMemoryCache[K, V]) Delete(key K) bool {
+	kh := c.hasher.hash(key)
+	deleted, err := c.deleteSync(c.shardByHash(kh), key)
+	if err != nil {
+		return false
+	}
+	return deleted
+}
+
+// Clear empties all shards and reinitializes policy structures (resets SieveTinyLFU state).
+func (c *InMemoryCache[K, V]) Clear() {
+	_ = c.enqueueAllAndWait(writeClear)
 }
 
 // Exists checks membership without mutating recency/frequency (removes if expired).
@@ -504,13 +549,7 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 	}
 
 	if item.expireTime > 0 && now > item.expireTime {
-		delete(shard.data, key)
-		shard.removeFromLRU(item)
-		if c.config.EvictionPolicy == LFU {
-			shard.lfuList.remove(item)
-		}
-		c.itemPool.Put(item)
-		atomic.AddInt64(&shard.size, -1)
+		c.removeItem(shard, item, false)
 		if c.config.StatsEnabled {
 			atomic.AddInt64(&shard.expirations, 1)
 		}
@@ -541,7 +580,7 @@ func (c *InMemoryCache[K, V]) Keys() []K {
 	return keys
 }
 
-// Size sums per-shard sizes via atomic loads (O(shards)).
+// Size sums per-shard sizes (O(shards)).
 func (c *InMemoryCache[K, V]) Size() int64 {
 	var totalSize int64
 	for _, shard := range c.shards {
@@ -573,15 +612,38 @@ func (c *InMemoryCache[K, V]) Stats() Stats {
 	return stats
 }
 
-// Close idempotently shuts down background work, clears shards, and marks the cache closed.
+// PolicyStats aggregates SieveTinyLFU policy counters across shards.
+func (c *InMemoryCache[K, V]) PolicyStats() PolicyStats {
+	var ps PolicyStats
+	for _, shard := range c.shards {
+		shard.mu.RLock()
+		if shard.sieve != nil {
+			ps.Admits += shard.sieve.stats.Admits
+			ps.Rejects += shard.sieve.stats.Rejects
+			ps.GhostHits += shard.sieve.stats.GhostHits
+			ps.Promotions += shard.sieve.stats.Promotions
+			ps.ProbationEvictions += shard.sieve.stats.ProbationEvictions
+			ps.MainEvictions += shard.sieve.stats.MainEvictions
+		}
+		shard.mu.RUnlock()
+	}
+	return ps
+}
+
+// Close shuts down background work (idempotently), clears shards and marks the cache closed.
 func (c *InMemoryCache[K, V]) Close() error {
-	var err error
 	c.closeOnce.Do(func() {
-		close(c.closeCh)
-		c.Clear()
+		// stop accepting new producer writes (sequential Set-after-Close fails).
 		atomic.StoreInt32(&c.closed, 1)
+		// Drain everything accepted so far via a barrier, then broadcast shutdown:
+		// workers do a final drain and exit; producers blocked on a full queue wake
+		// and return ErrCacheClosed. No queue is ever closed out from under a sender.
+		c.flush()
+		close(c.closeCh)
+		c.workers.Wait()
+		c.clearDirect()
 	})
-	return err
+	return nil
 }
 
 // TriggerCleanup requests a cleanup run (inline if ticker disabled; coalesced otherwise).
@@ -598,11 +660,9 @@ func (c *InMemoryCache[K, V]) TriggerCleanup() {
 	select {
 	case c.cleanupCh <- struct{}{}:
 	default:
-		// already scheduled
 	}
 }
 
-// cleanupWorker runs the periodic cleaner until Close() signals exit.
 func (c *InMemoryCache[K, V]) cleanupWorker() {
 	ticker := time.NewTicker(c.config.CleanupInterval)
 	defer ticker.Stop()
@@ -619,7 +679,7 @@ func (c *InMemoryCache[K, V]) cleanupWorker() {
 	}
 }
 
-// cleanup removes expired items across shards using a single time anchor.
+// remove expired items across shards using a single time anchor.
 func (c *InMemoryCache[K, V]) cleanup() {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return
@@ -631,7 +691,17 @@ func (c *InMemoryCache[K, V]) cleanup() {
 	}
 }
 
-// shardByHash maps a precomputed hash → shard (saves rehash in hot paths).
 func (c *InMemoryCache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
+}
+
+func (c *InMemoryCache[K, V]) removeItem(s *shard[K, V], it *cacheItem[V], ev bool) {
+	mode := dropLRU
+	switch c.config.EvictionPolicy {
+	case LFU:
+		mode = dropLFU
+	case SieveTinyLFU:
+		mode = dropSieve
+	}
+	s.dropItem(it, &c.itemPool, c.config.StatsEnabled, ev, mode)
 }

@@ -2,13 +2,13 @@
 
 ## Benchmark Configuration
 
-The benchmarks compare **Kioshun** with **AdmissionLFU** eviction policy against other popular Go cache libraries:
+The benchmarks compare **Kioshun** with **SieveTinyLFU** eviction policy against other popular Go cache libraries:
 
 ### Cache Configurations Used
 
 | Cache Library | Configuration | Notes |
 |---------------|---------------|-------|
-| **Kioshun** | MaxSize: 100,000<br>ShardCount: CPU cores × 4<br>EvictionPolicy: **AdmissionLFU**<br>DefaultTTL: 1 hour<br>CleanupInterval: 5 min | AdmissionLFU eviction policy with admission control |
+| **Kioshun** | MaxSize: 100,000<br>ShardCount: CPU cores × 4<br>EvictionPolicy: **SieveTinyLFU**<br>DefaultTTL: 1 hour<br>CleanupInterval: 5 min | SieveTinyLFU eviction policy with admission control |
 | **Ristretto** | NumCounters: 1,000,000<br>MaxCost: 100,000<br>BufferItems: 64 | TinyLFU-based admission policy |
 | **BigCache** | MaxEntriesInWindow: 100,000<br>Shards: CPU cores (power of 2)<br>MaxEntrySize: 64KB<br>HardMaxCacheSize: 256MB | No eviction policy, size-based |
 | **FreeCache** | Size: 128MB | Segmented LRU |
@@ -19,11 +19,12 @@ The benchmarks compare **Kioshun** with **AdmissionLFU** eviction policy against
 - **OS:** macOS (Darwin arm64)
 - **Go Version:** 1.24.7
 - **Benchmark knobs:** `go test -bench … -benchmem`, 16-way parallelism, `-benchtime` 5s (core workloads) / 3s (stress suites)
-- **Kioshun config:** AdmissionLFU, `ShardCount = runtime.NumCPU() * 4` (64 shards), `MaxSize = 100 000`
+- **Kioshun config:** SieveTinyLFU, `ShardCount = runtime.NumCPU() * 4` (64 shards), `MaxSize = 100 000`
 
 ## Running Benchmarks
 
 ```bash
+
 # Run comparison benchmarks
 make bench-compare
 
@@ -112,7 +113,7 @@ make bench
 | **Kioshun** | 45,916,828 | **40.0** |
 | Value size sweep (1–64 KB) held steady at ~67–70 ns/op with 40 B/op and 2 allocs/op.
 
-## Performance Characteristics (Kioshun AdmissionLFU)
+## Performance Characteristics (Kioshun SieveTinyLFU)
 
 - ~36–77 ns/op on write-heavy or high-contention microbenchmarks, ~26 ns/op on pure GETs
 - ~53 M ops/sec in the mixed “real-world” pattern (65 ns/op average)
@@ -140,7 +141,7 @@ make bench
 | Eviction Policy | Ops/sec | ns/op | B/op | allocs/op |
 |-----------------|---------|-------|------|-----------|
 | **FIFO** | **42,899,701** | 82.10 | 46 | 3 |
-| **AdmissionLFU** | 41,337,319 | 177.0 | 59 | 3 |
+| **SieveTinyLFU** | 41,337,319 | 177.0 | 59 | 3 |
 | **LRU** | 31,638,396 | 153.1 | 57 | 3 |
 | **LFU** | 24,112,208 | 194.8 | 57 | 3 |
 

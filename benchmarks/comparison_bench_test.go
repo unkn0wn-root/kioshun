@@ -166,7 +166,7 @@ type RistrettoWrapper struct {
 }
 
 func (r *RistrettoWrapper) Set(key string, value []byte) error {
-	r.cache.Set(key, value, 1)
+	r.cache.SetWithTTL(key, value, 1, 1*time.Hour)
 	return nil
 }
 
@@ -197,8 +197,11 @@ func (r *RistrettoWrapper) Close() error {
 }
 
 func waitForAsync(cache CacheInterface) {
-	if r, ok := cache.(*RistrettoWrapper); ok {
-		r.cache.Wait()
+	switch c := cache.(type) {
+	case *KioshunWrapper:
+		_ = c.cache.Wait()
+	case *RistrettoWrapper:
+		c.cache.Wait()
 	}
 }
 
@@ -212,7 +215,7 @@ func createCaches() map[string]CacheInterface {
 		ShardCount:      runtime.NumCPU() * 4,
 		CleanupInterval: 5 * time.Minute,
 		DefaultTTL:      1 * time.Hour,
-		EvictionPolicy:  cache.AdmissionLFU,
+		EvictionPolicy:  cache.SieveTinyLFU,
 		StatsEnabled:    false,
 	}
 	caches["kioshun"] = &KioshunWrapper{cache: cache.New[string, []byte](kioshuConfig)}
@@ -437,6 +440,7 @@ func BenchmarkCacheComparison_LargeValues(b *testing.B) {
 						i++
 					}
 				})
+				waitForAsync(cache)
 			})
 		}
 	}

@@ -19,6 +19,7 @@ func main() {
 	cache.Set("user:123", "David Kier", 5*time.Minute)
 	cache.Set("user:456", "Michael Ballack", 5*time.Minute)
 	cache.Set("user:789", "Cristiano Bombaldo", 5*time.Minute)
+	cache.Wait()
 
 	if value, found := cache.Get("user:123"); found {
 		fmt.Printf("Found user: %s\n", value)
@@ -64,6 +65,7 @@ func main() {
 	cache.SetWithCallback("temp:data", "temporary value", 2*time.Second, func(key string, value string) {
 		fmt.Printf("Key %s expired with value: %s\n", key, value)
 	})
+	cache.Wait()
 
 	// Wait for expiration
 	time.Sleep(3 * time.Second)

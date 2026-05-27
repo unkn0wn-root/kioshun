@@ -147,8 +147,8 @@ config.EvictionPolicy = cache.LRU
 // LFU (Least Frequently Used)
 config.EvictionPolicy = cache.LFU
 
-// AdmissionLFU - Approximate LFU with Admission Control
-config.EvictionPolicy = cache.AdmissionLFU
+// SieveTinyLFU - Probation SIEVE with TinyLFU admission
+config.EvictionPolicy = cache.SieveTinyLFU
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed information about eviction policies and their performance characteristics.

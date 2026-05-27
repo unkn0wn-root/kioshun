@@ -347,8 +347,8 @@ func BenchmarkCacheShardComparison(b *testing.B) {
 }
 
 func BenchmarkCacheEvictionPolicyComparison(b *testing.B) {
-	policies := []cache.EvictionPolicy{cache.LRU, cache.LFU, cache.FIFO, cache.AdmissionLFU}
-	policyNames := []string{"LRU", "LFU", "FIFO", "AdmissionLFU"}
+	policies := []cache.EvictionPolicy{cache.LRU, cache.LFU, cache.FIFO, cache.SieveTinyLFU}
+	policyNames := []string{"LRU", "LFU", "FIFO", "SieveTinyLFU"}
 
 	for i, policy := range policies {
 		b.Run(policyNames[i], func(b *testing.B) {

@@ -110,8 +110,8 @@ func main() {
     // Set with no expiration
     c.Set("user:123", "David Nice 2", cache.NoExpiration)
 
-    // Set value with custom TTL
-    c.Set("user:123", "David Nice 3", 5*time.Minute)
+    // Set value with custom TTL and immediate read-after-write visibility
+    c.SetSync("user:123", "David Nice 3", 5*time.Minute)
 
     // Get value
     if value, found := c.Get("user:123"); found {
@@ -134,8 +134,10 @@ config := cache.Config{
     ShardCount:      16,                 // Number of shards (0 = auto-detect)
     CleanupInterval: 5 * time.Minute,    // Cleanup frequency
     DefaultTTL:      30 * time.Minute,   // Default expiration time
-    EvictionPolicy:  cache.AdmissionLFU, // Eviction algorithm (default)
+    EvictionPolicy:  cache.SieveTinyLFU, // Eviction algorithm (default)
     StatsEnabled:    true,               // Enable statistics collection
+    WriteBufferSize: 1024,               // Per-shard async write queue
+    WriteBatchSize:  64,                 // Max commands applied per worker batch
 }
 
 cache := cache.New[string, any](config)
@@ -145,18 +147,25 @@ cache := cache.New[string, any](config)
 
 ```go
 cache.Set(key, value, ttl time.Duration) error
+cache.SetSync(key, value, ttl time.Duration) error
 cache.SetWithCallback(key, value, ttl, callback func(key, value)) error
 cache.Get(key) (value, found bool)
 cache.GetWithTTL(key) (value, ttl time.Duration, found bool)
 cache.Keys() []K
 cache.Clear()
+cache.Wait() error
 cache.Delete(key) bool
 cache.Exists(key) bool
 cache.Size() int64
 cache.Stats() Stats
+cache.PolicyStats() PolicyStats
 cache.TriggerCleanup()
 cache.Close() error
 ```
+
+`Set` is asynchronous: it returns after the write is accepted into the owning shard's queue.
+Use `SetSync` when a caller needs read-after-write visibility for one key. Call `Wait`
+only when a caller needs a global fence for writes across all shards.
 
 ### Statistics
 
@@ -170,6 +179,15 @@ type Stats struct {
     Capacity    int64
     HitRatio    float64
     Shards      int
+}
+
+type PolicyStats struct {
+    Admits              int64
+    Rejects             int64
+    GhostHits           int64
+    Promotions          int64
+    ProbationEvictions  int64
+    MainEvictions       int64
 }
 ```
 

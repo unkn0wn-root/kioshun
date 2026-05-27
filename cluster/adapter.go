@@ -95,11 +95,17 @@ func (a *DistributedCache[K, V]) GetOrLoadCtx(ctx context.Context, key K, loader
 // Callers requiring global invalidation should implement an explicit protocol at a higher layer.
 func (a *DistributedCache[K, V]) Clear() { a.n.local.Clear() }
 
+func (a *DistributedCache[K, V]) Wait() error { return a.n.local.Wait() }
+
 // Size returns the size of the local shard only.
 func (a *DistributedCache[K, V]) Size() int64 { return a.n.local.Size() }
 
 // Stats returns statistics from the local shard only.
 func (a *DistributedCache[K, V]) Stats() cache.Stats { return a.n.local.Stats() }
+
+func (a *DistributedCache[K, V]) PolicyStats() cache.PolicyStats {
+	return a.n.local.PolicyStats()
+}
 
 // Close stops the node and returns nil.
 func (a *DistributedCache[K, V]) Close() error { a.n.Stop(); return nil }

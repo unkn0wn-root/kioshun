@@ -5,29 +5,22 @@ import (
 	"time"
 )
 
-// Item is a wire-friendly export with absolute expiry.
-// NOTE:
-//   - Version here is NOT the cluster LWW/HLC version. Export() currently uses a
-//     placeholder (frequency) which is suitable for application-level cache dumps
-//     and warm starts, but not for cluster snapshots.
-//   - Cluster replication/backfill paths supply their own authoritative versions
-//     and call InMemoryCache.Import directly with those values.
+// Item is the application dump format. Export currently fills Version with an
+// LFU placeholder, so it is not a cluster/LWW snapshot format.
 type Item[K comparable, V any] struct {
 	Key       K
 	Val       V
 	ExpireAbs int64  // 0 = no expiration
-	Version   uint64 // reserved for LWW if you add a real version later
+	Version   uint64 // opaque to Import; Export stores a placeholder
 }
 
-// Export up to max items for which selectFn(key) is true.
-// Intended for application-level dump/restore. Not used by cluster state
-// transfer, because it does not carry the cluster's LWW versions.
+// Export returns up to max non-expired items accepted by selectFn.
 func (c *InMemoryCache[K, V]) Export(selectFn func(K) bool, mx int) []Item[K, V] {
 	out := make([]Item[K, V], 0, mx)
+	now := time.Now().UnixNano()
 outer:
 	for _, s := range c.shards {
 		s.mu.RLock()
-		now := time.Now().UnixNano()
 		for k, it := range s.data {
 			if mx > 0 && len(out) >= mx {
 				s.mu.RUnlock()
@@ -43,7 +36,7 @@ outer:
 				Key:       k,
 				Val:       it.value,
 				ExpireAbs: it.expireTime,
-				Version:   uint64(it.frequency), // placeholder
+				Version:   uint64(it.lfuFreq), // placeholder
 			})
 		}
 		s.mu.RUnlock()
@@ -51,35 +44,54 @@ outer:
 	return out
 }
 
-// Import inserts/overwrites with absolute expiry. Cluster replication,
-// backfill, and rebalancing use this to apply authoritative state (including
-// LWW versions) without admission/eviction decisions.
+// Import inserts or overwrites with absolute expiry, bypassing admission policy.
+// Cluster replication and backfill apply authoritative state through it; each
+// Item.Version travels with the data for the cluster's own LWW bookkeeping and
+// is not interpreted here.
 func (c *InMemoryCache[K, V]) Import(items []Item[K, V]) {
+	if len(items) == 0 {
+		return
+	}
+
+	if atomic.LoadInt32(&c.closed) == 1 {
+		return
+	}
+
 	now := time.Now().UnixNano()
-	for _, it := range items {
-		s := c.getShard(it.Key)
-		s.mu.Lock()
-		ex, ok := s.data[it.Key]
-		if !ok {
-			ex = c.itemPool.Get().(*cacheItem[V])
-			s.data[it.Key] = ex
-			s.addToLRUHead(ex)
-			atomic.AddInt64(&s.size, 1)
-		} else if c.config.EvictionPolicy == LFU {
-			s.lfuList.remove(ex)
+	byShard := make(map[*shard[K, V]][]Item[K, V])
+	for _, item := range items {
+		h := c.hasher.hash(item.Key)
+		s := c.shardByHash(h)
+		byShard[s] = append(byShard[s], item)
+	}
+
+	shards := make([]*shard[K, V], 0, len(byShard))
+	waiters := make([]*writeWaiter, 0, len(byShard))
+	for shard, shardItems := range byShard {
+		waiter := c.acquireWriteWaiter()
+		copied := append([]Item[K, V](nil), shardItems...)
+		cmd := writeCommand[K, V]{
+			op:     writeImport,
+			now:    now,
+			result: waiter.ch,
+			extra: &writeExtra[K, V]{
+				items: copied,
+			},
 		}
-		ex.key, ex.value = it.Key, it.Val
-		ex.lastAccess = now
-		ex.expireTime = it.ExpireAbs
-		switch c.config.EvictionPolicy {
-		case LRU:
-			s.moveToLRUHead(ex)
-		case LFU:
-			ex.frequency = 1
-			s.lfuList.add(ex)
-		case AdmissionLFU:
-			ex.frequency = 1
+		if err := shard.queue.enqueue(cmd); err != nil {
+			c.releaseWriteWaiter(waiter)
+			break
 		}
-		s.mu.Unlock()
+		shards = append(shards, shard)
+		waiters = append(waiters, waiter)
+	}
+	for _, shard := range shards {
+		c.tryDrainShard(shard)
+	}
+	for _, waiter := range waiters {
+		if err := c.awaitResult(waiter.ch); err != nil {
+			return
+		}
+		c.releaseWriteWaiter(waiter)
 	}
 }

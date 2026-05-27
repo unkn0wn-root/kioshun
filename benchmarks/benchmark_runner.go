@@ -62,6 +62,36 @@ func main() {
 			benchtime:   "3s",
 		},
 		{
+			name:        "Fair - Get With TTL",
+			pattern:     "BenchmarkCacheFair_Get_TTL",
+			description: "Pre-generated-key lookup comparison with equal TTL semantics",
+			benchtime:   "3s",
+		},
+		{
+			name:        "Fair - Get Without TTL",
+			pattern:     "BenchmarkCacheFair_Get_NoTTL",
+			description: "Pre-generated-key lookup comparison without expiration checks",
+			benchtime:   "3s",
+		},
+		{
+			name:        "Fair - Real World Batch Committed",
+			pattern:     "BenchmarkCacheFair_RealWorldSteadyState_BatchCommitted",
+			description: "Steady-state 50k-user mixed workload; async caches flushed at benchmark end",
+			benchtime:   "3s",
+		},
+		{
+			name:        "Fair - Real World Strict Committed",
+			pattern:     "BenchmarkCacheFair_RealWorldSteadyState_StrictCommitted",
+			description: "Same steady-state workload with each mutation committed before the worker continues",
+			benchtime:   "1s",
+		},
+		{
+			name:        "Fair - Large Values Batch Committed",
+			pattern:     "BenchmarkCacheFair_LargeValues_BatchCommitted",
+			description: "Pre-generated large-value workload with end-of-benchmark async flush",
+			benchtime:   "2s",
+		},
+		{
 			name:        "Heavy Load Tests",
 			pattern:     "BenchmarkCacheHeavyLoad",
 			description: "Extreme load scenarios for kioshun",

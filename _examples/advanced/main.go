@@ -40,6 +40,7 @@ func main() {
 	for _, user := range users {
 		userCache.Set(user.ID, user, time.Duration(30+len(user.Name))*time.Second)
 	}
+	userCache.Wait()
 
 	fmt.Println("\n2. Concurrent access:")
 
@@ -81,6 +82,7 @@ func main() {
 	}
 
 	wg.Wait()
+	userCache.Wait()
 	fmt.Printf("Completed %d concurrent ops\n", numWorkers*operationsPerWorker)
 
 	fmt.Println("\n3. Cache manager for multiple cache instances:")
@@ -123,6 +125,7 @@ func main() {
 			userCache.Get(key)
 		}
 	}
+	userCache.Wait()
 
 	stats := userCache.Stats()
 	fmt.Printf("Performance Statistics:\n")
@@ -144,6 +147,7 @@ func main() {
 
 	shortTTLCache.Set("short_lived_1", "expires_soon", 1*time.Second)
 	shortTTLCache.Set("short_lived_2", "expires_later", 3*time.Second)
+	shortTTLCache.Wait()
 
 	fmt.Printf("Initial size: %d\n", shortTTLCache.Size())
 
@@ -173,6 +177,7 @@ func main() {
 		batchCache.Set(fmt.Sprintf("batch_key_%d", i), fmt.Sprintf("batch_value_%d", i), 1*time.Hour)
 	}
 	insertDuration := time.Since(start)
+	batchCache.Wait()
 
 	// batch read
 	start = time.Now()
