@@ -60,14 +60,6 @@ All notable changes to this project will be documented in this file. See [standa
 ### Features
 
 * add dockerfile(cmd) and docker-compose (_examples) ([5e777a6](https://github.com/unkn0wn-root/kioshun/commit/5e777a62fd56047dd4aa906d2ceb97d8d79598f5))
-* add kioshun adapter ([48a79af](https://github.com/unkn0wn-root/kioshun/commit/48a79afad83b1bc04abc650cfecc052311dcc306))
-* add timeout-only exponential backoff ([ca3fbc1](https://github.com/unkn0wn-root/kioshun/commit/ca3fbc130643b73b9f7105b764ad1eca28d3047c))
-* move trie and util to internal and fix adapter type ([7ff9dac](https://github.com/unkn0wn-root/kioshun/commit/7ff9dac93ee5b71c991e6d56708d257197bdc7be))
-
-
-### Bug Fixes
-
-* adapter type ([98d3842](https://github.com/unkn0wn-root/kioshun/commit/98d38429c08b1477e3c176397f2292d3e2cc4146))
 
 ### [0.2.3](https://github.com/unkn0wn-root/kioshun/compare/v0.2.2...v0.2.3) (2025-08-29)
 
