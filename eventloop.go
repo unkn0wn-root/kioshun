@@ -10,13 +10,12 @@ type writeOp uint8
 const (
 	writeSet writeOp = iota
 	writeClear
-	writeImport
 	writeBarrier
 )
 
 // writeCommand is the shard write-queue payload.
 // Plain Set keeps its hot fields inline.
-// Callback/import data stays behind extra so the common path avoids it.
+// Callback data stays behind extra so the common path avoids it.
 type writeCommand[K comparable, V any] struct {
 	key        K
 	value      V
@@ -31,7 +30,6 @@ type writeCommand[K comparable, V any] struct {
 
 // writeExtra holds the cold fields of a write command.
 type writeExtra[K comparable, V any] struct {
-	items    []Item[K, V]
 	callback func(K, V)
 }
 
@@ -295,13 +293,6 @@ func (c *InMemoryCache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeComma
 			if ch := cmd.resultChan(); ch != nil {
 				acks = append(acks, ch)
 			}
-		case writeImport:
-			if cmd.extra != nil {
-				c.importLocked(s, cmd.extra.items, cmd.now)
-			}
-			if ch := cmd.resultChan(); ch != nil {
-				acks = append(acks, ch)
-			}
 		case writeBarrier:
 			if ch := cmd.resultChan(); ch != nil {
 				acks = append(acks, ch)
@@ -428,41 +419,6 @@ func (c *InMemoryCache[K, V]) clearShardLocked(shard *shard[K, V]) {
 		shard.sieve.reset()
 	}
 	atomic.StoreInt64(&shard.size, 0)
-}
-
-func (c *InMemoryCache[K, V]) importLocked(shard *shard[K, V], items []Item[K, V], now int64) {
-	for _, it := range items {
-		h := c.hasher.hash(it.Key)
-		tag := tagFromHash(h)
-		ex, ok := shard.data[it.Key]
-		if !ok {
-			ex = acquireCacheItem[V](&c.itemPool)
-			shard.data[it.Key] = ex
-			if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
-				ex.hash = h
-				ex.tag = tag
-				shard.sieve.insertMain(ex)
-			} else {
-				shard.addToLRUHead(ex)
-			}
-			atomic.AddInt64(&shard.size, 1)
-		} else if c.config.EvictionPolicy == LFU {
-			shard.lfuList.remove(ex)
-		}
-		ex.key, ex.value = it.Key, it.Val
-		ex.hash = h
-		ex.tag = tag
-		ex.lfuFreq = 0
-		ex.lastAccess = now
-		ex.expireTime = it.ExpireAbs
-		switch c.config.EvictionPolicy {
-		case LRU:
-			shard.moveToLRUHead(ex)
-		case LFU:
-			ex.lfuFreq = 1
-			shard.lfuList.add(ex)
-		}
-	}
 }
 
 func (c *InMemoryCache[K, V]) scheduleCallback(task callbackTask[K, V]) {

@@ -180,7 +180,7 @@ Synchronous callers can also help drain their own shard behind the same drain
 mutex, preserving single-consumer queue semantics while avoiding a worker wakeup
 on the strict mutation path.
 
-`SetSync`, `Delete`, and `Import` wait for the affected shard commands to be
+`SetSync` and `Delete` wait for the affected shard commands to be
 processed. `Wait`, `Clear`, and `Close` use global shard barriers when they need
 committed state across the whole cache. `Wait` is the global fence: all writes
 accepted before the barriers are visible after it returns.
