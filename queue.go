@@ -9,16 +9,20 @@ import (
 // cacheLinePadding isolates contended atomics onto their own cache lines.
 const cacheLinePadding = 64
 
-// writeQueue connects cache producers to a shard's single write worker. It is
-// multi-producer/single-consumer, applies back-pressure instead of dropping
-// writesand must wake blocked producers on shutdown.
+// writeQueue connects cache producers to a shard's single write worker.
+// It's multi-producer/single-consumer, applies back-pressure instead of dropping
+// write must wake blocked producers on shutdown.
 type writeQueue[K comparable, V any] interface {
 	enqueue(cmd writeCommand[K, V]) error
 	tryDequeue(buf []writeCommand[K, V]) int
 }
 
-// signal performs a coalesced, non-blocking wake on a size-1 channel: if a token
-// is already pending the wake is a no-op.
+func newWriteQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) writeQueue[K, V] {
+	return newMPSCQueue[K, V](size, wake, closeCh)
+}
+
+// signal performs a coalesced, non-blocking wake on a size-1 channel:
+// if a token is already pending the wake is a no-op.
 func signal(ch chan struct{}) {
 	select {
 	case ch <- struct{}{}:
@@ -52,7 +56,7 @@ type mpscQueue[K comparable, V any] struct {
 func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) *mpscQueue[K, V] {
 	n := mathutil.NextPowerOf2(size)
 	if n < 2 {
-		// A Vyukov ring needs >= 2 slots: at size 1 a cell's "published" sequence
+		// Vyukov ring needs >= 2 slots: at size 1 a cell's "published" sequence
 		// is indistinguishable from its "freed" sequence so the next enqueue would
 		// overwrite an un-dequeued item.
 		n = 2
@@ -77,7 +81,7 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 		seq := cell.seq.Load()
 		switch dif := int64(seq) - int64(pos); {
 		case dif == 0:
-			// Free for this lap.
+			// free for this lap.
 			if q.head.CompareAndSwap(pos, pos+1) {
 				cell.cmd = cmd
 				cell.seq.Store(pos + 1) // publish (release) for the consumer
@@ -117,8 +121,4 @@ func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
 		signal(q.space) // a producer waiting for room can proceed
 	}
 	return n
-}
-
-func newWriteQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) writeQueue[K, V] {
-	return newMPSCQueue[K, V](size, wake, closeCh)
 }

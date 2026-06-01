@@ -27,18 +27,18 @@ type shard[K comparable, V any] struct {
 	// drains them into the frequency sketch on each wake.
 	readBuf readBuffer
 
-	// intrusive LRU list sentinels (head.next = MRU, tail.prev = LRU).
-	// invariant: head.prev == nil, tail.next == nil, and the head-to-tail chain is linked.
+	// LRU list sentinels (head.next = MRU, tail.prev = LRU).
+	// head.prev == nil, tail.next == nil, and the head-to-tail chain is linked.
 	head *cacheItem[V]
 	tail *cacheItem[V]
 
 	lfuList *lfuList[K, V] // Allocated only for pure LFU policy.
 
-	size        int64 // live items (atomic)
-	hits        int64 // per-shard hits (atomic)
-	misses      int64 // per-shard misses (atomic)
-	evictions   int64 // per-shard evictions (atomic)
-	expirations int64 // per-shard TTL expirations (atomic)
+	size        int64 // live items
+	hits        int64 // per-shard hits
+	misses      int64 // per-shard misses
+	evictions   int64 // per-shard evictions
+	expirations int64 // per-shard TTL expirations
 
 	sieve *sieveTinyLFU[V]
 }

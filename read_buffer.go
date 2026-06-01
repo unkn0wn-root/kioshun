@@ -9,8 +9,9 @@ import (
 
 const (
 	// readStripeSlots is how many access fingerprints a stripe buffers before
-	// producers begin overwriting the oldest unread sample. It also sets the
-	// drain-signal cadence: one wake per filled stripe. Must be a power of two.
+	// producers begin overwriting the oldest unread sample.
+	// It also sets the drain-signal cadence: one wake per filled stripe.
+	// Must be a power of two.
 	readStripeSlots = 64
 	readSlotMask    = readStripeSlots - 1
 
@@ -57,7 +58,7 @@ func newReadBuffer() readBuffer {
 // (coalesced). Wait-free and lossy by design.
 func (rb *readBuffer) sample(h uint64) bool {
 	if h == 0 {
-		h = 1 // reserve 0 as the empty-slot sentinel
+		h = 1 // reserve 0 as the empty slot sentinel
 	}
 	st := &rb.stripes[uint64(procID())&rb.mask]
 	i := st.tail.Add(1) - 1

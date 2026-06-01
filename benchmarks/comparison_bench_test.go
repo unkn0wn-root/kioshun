@@ -4,36 +4,75 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	cache "github.com/unkn0wn-root/kioshun"
 
 	"github.com/allegro/bigcache/v3"
 	"github.com/coocood/freecache"
 	"github.com/dgraph-io/ristretto"
 	gocache "github.com/patrickmn/go-cache"
+	kioshun "github.com/unkn0wn-root/kioshun"
 )
 
-// Test data structures
-type CacheInterface interface {
-	Set(key string, value []byte) error
-	Get(key string) ([]byte, bool)
-	Delete(key string) bool
-	Clear()
-	Size() int64
+const (
+	benchTargetEntries = 100_000
+	benchKeySpace      = 50_000
+	benchOpCount       = 1 << 16
+	benchTTL           = time.Hour
+	benchCleanInterval = 5 * time.Minute
+	benchMemoryBudget  = 256 * 1024 * 1024
+)
+
+type writeMode uint8
+
+const (
+	asyncWrites writeMode = iota
+	strictWrites
+)
+
+type operation uint8
+
+const (
+	opGet operation = iota
+	opSet
+	opDelete
+)
+
+type cacheBench interface {
+	Set(string, []byte) error
+	SetStrict(string, []byte) error
+	Get(string) ([]byte, bool)
+	Delete(string) bool
+	Flush()
 	Close() error
 }
 
-// Wrapper for kioshun cache
+type workloadOp struct {
+	key   string
+	value []byte
+	op    operation
+}
+
+type cacheOptions struct {
+	valueSize int
+	ttl       bool
+}
+
+var cacheOrder = []string{"kioshun", "ristretto", "bigcache", "freecache", "go-cache"}
+
 type KioshunWrapper struct {
-	cache *cache.InMemoryCache[string, []byte]
+	cache *kioshun.InMemoryCache[string, []byte]
+	ttl   time.Duration
 }
 
 func (c *KioshunWrapper) Set(key string, value []byte) error {
-	return c.cache.Set(key, value, 1*time.Hour)
+	return c.cache.Set(key, value, c.ttl)
+}
+
+func (c *KioshunWrapper) SetStrict(key string, value []byte) error {
+	return c.cache.SetSync(key, value, c.ttl)
 }
 
 func (c *KioshunWrapper) Get(key string) ([]byte, bool) {
@@ -44,611 +83,473 @@ func (c *KioshunWrapper) Delete(key string) bool {
 	return c.cache.Delete(key)
 }
 
-func (c *KioshunWrapper) Clear() {
-	c.cache.Clear()
-}
-
-func (c *KioshunWrapper) Size() int64 {
-	return c.cache.Size()
+func (c *KioshunWrapper) Flush() {
+	_ = c.cache.Wait()
 }
 
 func (c *KioshunWrapper) Close() error {
 	return c.cache.Close()
 }
 
-// Wrapper for BigCache
 type BigCacheWrapper struct {
 	cache *bigcache.BigCache
+	once  sync.Once
 }
 
-func (b *BigCacheWrapper) Set(key string, value []byte) error {
-	return b.cache.Set(key, value)
+func (c *BigCacheWrapper) Set(key string, value []byte) error {
+	return c.cache.Set(key, value)
 }
 
-func (b *BigCacheWrapper) Get(key string) ([]byte, bool) {
-	val, err := b.cache.Get(key)
-	if err != nil {
-		return nil, false
-	}
-	return val, true
+func (c *BigCacheWrapper) SetStrict(key string, value []byte) error {
+	return c.Set(key, value)
 }
 
-func (b *BigCacheWrapper) Delete(key string) bool {
-	err := b.cache.Delete(key)
-	return err == nil
+func (c *BigCacheWrapper) Get(key string) ([]byte, bool) {
+	value, err := c.cache.Get(key)
+	return value, err == nil
 }
 
-func (b *BigCacheWrapper) Clear() {
-	b.cache.Reset()
+func (c *BigCacheWrapper) Delete(key string) bool {
+	return c.cache.Delete(key) == nil
 }
 
-func (b *BigCacheWrapper) Size() int64 {
-	return int64(b.cache.Len())
+func (c *BigCacheWrapper) Flush() {}
+
+func (c *BigCacheWrapper) Close() error {
+	var err error
+	c.once.Do(func() {
+		err = c.cache.Close()
+	})
+	return err
 }
 
-func (b *BigCacheWrapper) Close() error {
-	return b.cache.Close()
-}
-
-// Wrapper for FreeCache
 type FreeCacheWrapper struct {
-	cache *freecache.Cache
+	cache         *freecache.Cache
+	expireSeconds int
 }
 
-func (f *FreeCacheWrapper) Set(key string, value []byte) error {
-	return f.cache.Set([]byte(key), value, 3600)
+func (c *FreeCacheWrapper) Set(key string, value []byte) error {
+	return c.cache.Set([]byte(key), value, c.expireSeconds)
 }
 
-func (f *FreeCacheWrapper) Get(key string) ([]byte, bool) {
-	val, err := f.cache.Get([]byte(key))
-	if err != nil {
-		return nil, false
-	}
-	return val, true
+func (c *FreeCacheWrapper) SetStrict(key string, value []byte) error {
+	return c.Set(key, value)
 }
 
-func (f *FreeCacheWrapper) Delete(key string) bool {
-	return f.cache.Del([]byte(key))
+func (c *FreeCacheWrapper) Get(key string) ([]byte, bool) {
+	value, err := c.cache.Get([]byte(key))
+	return value, err == nil
 }
 
-func (f *FreeCacheWrapper) Clear() {
-	f.cache.Clear()
+func (c *FreeCacheWrapper) Delete(key string) bool {
+	return c.cache.Del([]byte(key))
 }
 
-func (f *FreeCacheWrapper) Size() int64 {
-	return f.cache.EntryCount()
-}
+func (c *FreeCacheWrapper) Flush() {}
 
-func (f *FreeCacheWrapper) Close() error {
-	f.cache.Clear()
+func (c *FreeCacheWrapper) Close() error {
+	c.cache.Clear()
 	return nil
 }
 
-// Wrapper for go-cache
 type GoCacheWrapper struct {
 	cache *gocache.Cache
 }
 
-func (g *GoCacheWrapper) Set(key string, value []byte) error {
-	g.cache.Set(key, value, gocache.DefaultExpiration)
+func (c *GoCacheWrapper) Set(key string, value []byte) error {
+	c.cache.Set(key, value, gocache.DefaultExpiration)
 	return nil
 }
 
-func (g *GoCacheWrapper) Get(key string) ([]byte, bool) {
-	val, found := g.cache.Get(key)
+func (c *GoCacheWrapper) SetStrict(key string, value []byte) error {
+	return c.Set(key, value)
+}
+
+func (c *GoCacheWrapper) Get(key string) ([]byte, bool) {
+	value, found := c.cache.Get(key)
 	if !found {
 		return nil, false
 	}
-	return val.([]byte), true
+	return value.([]byte), true
 }
 
-func (g *GoCacheWrapper) Delete(key string) bool {
-	g.cache.Delete(key)
+func (c *GoCacheWrapper) Delete(key string) bool {
+	c.cache.Delete(key)
 	return true
 }
 
-func (g *GoCacheWrapper) Clear() {
-	g.cache.Flush()
-}
+func (c *GoCacheWrapper) Flush() {}
 
-func (g *GoCacheWrapper) Size() int64 {
-	return int64(g.cache.ItemCount())
-}
-
-func (g *GoCacheWrapper) Close() error {
-	g.cache.Flush()
+func (c *GoCacheWrapper) Close() error {
+	c.cache.Flush()
 	return nil
 }
 
-// Wrapper for Ristretto
 type RistrettoWrapper struct {
 	cache *ristretto.Cache
+	ttl   time.Duration
 }
 
-func (r *RistrettoWrapper) Set(key string, value []byte) error {
-	r.cache.SetWithTTL(key, value, 1, 1*time.Hour)
+func (c *RistrettoWrapper) Set(key string, value []byte) error {
+	c.cache.SetWithTTL(key, value, int64(len(value)), c.ttl)
 	return nil
 }
 
-func (r *RistrettoWrapper) Get(key string) ([]byte, bool) {
-	val, found := r.cache.Get(key)
+func (c *RistrettoWrapper) SetStrict(key string, value []byte) error {
+	c.cache.SetWithTTL(key, value, int64(len(value)), c.ttl)
+	c.cache.Wait()
+	return nil
+}
+
+func (c *RistrettoWrapper) Get(key string) ([]byte, bool) {
+	value, found := c.cache.Get(key)
 	if !found {
 		return nil, false
 	}
-	return val.([]byte), true
+	return value.([]byte), true
 }
 
-func (r *RistrettoWrapper) Delete(key string) bool {
-	r.cache.Del(key)
+func (c *RistrettoWrapper) Delete(key string) bool {
+	c.cache.Del(key)
 	return true
 }
 
-func (r *RistrettoWrapper) Clear() {
-	r.cache.Clear()
+func (c *RistrettoWrapper) Flush() {
+	c.cache.Wait()
 }
 
-func (r *RistrettoWrapper) Size() int64 {
-	return int64(r.cache.Metrics.KeysAdded() - r.cache.Metrics.KeysEvicted())
-}
-
-func (r *RistrettoWrapper) Close() error {
-	r.cache.Close()
+func (c *RistrettoWrapper) Close() error {
+	c.cache.Close()
 	return nil
 }
 
-func waitForAsync(cache CacheInterface) {
-	switch c := cache.(type) {
-	case *KioshunWrapper:
-		_ = c.cache.Wait()
-	case *RistrettoWrapper:
-		c.cache.Wait()
-	}
-}
+func newBenchCache(b *testing.B, name string, opts cacheOptions) cacheBench {
+	b.Helper()
 
-// Cache factory functions
-func createCaches() map[string]CacheInterface {
-	caches := make(map[string]CacheInterface)
-
-	// Kioshun cache
-	kioshuConfig := cache.Config{
-		MaxSize:         100000,
-		ShardCount:      runtime.NumCPU() * 4,
-		CleanupInterval: 5 * time.Minute,
-		DefaultTTL:      1 * time.Hour,
-		EvictionPolicy:  cache.SieveTinyLFU,
-		StatsEnabled:    false,
-	}
-	caches["kioshun"] = &KioshunWrapper{cache: cache.New[string, []byte](kioshuConfig)}
-
-	// BigCache
-	bigCacheConfig := bigcache.DefaultConfig(1 * time.Hour)
-	// Match BigCache shards to CPU count (power-of-two requirement).
-	shards := 1
-	for shards < runtime.NumCPU() {
-		shards *= 2
-	}
-	bigCacheConfig.Shards = shards
-	bigCacheConfig.MaxEntriesInWindow = 100000
-	bigCacheConfig.MaxEntrySize = 64 * 1024
-	bigCacheConfig.Verbose = false
-	bigCacheConfig.HardMaxCacheSize = 256 // MB
-	bigCache, err := bigcache.New(context.Background(), bigCacheConfig)
-	if err == nil {
-		caches["bigcache"] = &BigCacheWrapper{cache: bigCache}
+	ttl := benchTTL
+	kioshunTTL := benchTTL
+	goCacheTTL := benchTTL
+	freeCacheTTL := int(benchTTL.Seconds())
+	bigCacheTTL := benchTTL
+	if !opts.ttl {
+		ttl = 0
+		kioshunTTL = kioshun.NoExpiration
+		goCacheTTL = gocache.NoExpiration
+		freeCacheTTL = 0
+		bigCacheTTL = 24 * time.Hour
 	}
 
-	// FreeCache (128MB)
-	freeCache := freecache.NewCache(128 * 1024 * 1024)
-	caches["freecache"] = &FreeCacheWrapper{cache: freeCache}
+	kioshunConfig := kioshun.DefaultConfig()
+	kioshunConfig.MaxSize = benchTargetEntries
+	kioshunConfig.DefaultTTL = benchTTL
+	kioshunConfig.StatsEnabled = false
 
-	// Go-cache
-	goCache := gocache.New(1*time.Hour, 5*time.Minute)
-	caches["go-cache"] = &GoCacheWrapper{cache: goCache}
-
-	// Ristretto
-	ristrettoConfig := &ristretto.Config{
-		NumCounters: 1000000,
-		MaxCost:     100000,
-		BufferItems: 64,
-	}
-	ristrettoCache, err := ristretto.NewCache(ristrettoConfig)
-	if err == nil {
-		caches["ristretto"] = &RistrettoWrapper{cache: ristrettoCache}
-	}
-
-	return caches
-}
-
-// Benchmark comparison tests
-func BenchmarkCacheComparison_Set(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
+	switch name {
+	case "kioshun":
+		return &KioshunWrapper{
+			cache: kioshun.New[string, []byte](kioshunConfig),
+			ttl:   kioshunTTL,
 		}
-	}()
-
-	value := make([]byte, 1024)
-	for i := range value {
-		value[i] = byte(i % 256)
+	case "ristretto":
+		ristrettoCache, err := ristretto.NewCache(&ristretto.Config{
+			NumCounters: int64(benchTargetEntries * 10),
+			MaxCost:     int64(benchMemoryBudget),
+			BufferItems: 64,
+			Metrics:     false,
+		})
+		if err != nil {
+			b.Fatalf("create ristretto: %v", err)
+		}
+		return &RistrettoWrapper{cache: ristrettoCache, ttl: ttl}
+	case "bigcache":
+		bigCacheConfig := bigcache.DefaultConfig(bigCacheTTL)
+		bigCacheConfig.CleanWindow = benchCleanInterval
+		if !opts.ttl {
+			bigCacheConfig.CleanWindow = 0
+		}
+		bigCacheConfig.MaxEntriesInWindow = benchTargetEntries
+		bigCacheConfig.MaxEntrySize = opts.valueSize + 256
+		bigCacheConfig.HardMaxCacheSize = benchMemoryBudget / (1024 * 1024)
+		bigCacheConfig.StatsEnabled = false
+		bigCacheConfig.Verbose = false
+		bigCache, err := bigcache.New(context.Background(), bigCacheConfig)
+		if err != nil {
+			b.Fatalf("create bigcache: %v", err)
+		}
+		return &BigCacheWrapper{cache: bigCache}
+	case "freecache":
+		return &FreeCacheWrapper{
+			cache:         freecache.NewCache(benchMemoryBudget),
+			expireSeconds: freeCacheTTL,
+		}
+	case "go-cache":
+		return &GoCacheWrapper{
+			cache: gocache.NewFrom(goCacheTTL, benchCleanInterval, make(map[string]gocache.Item, benchTargetEntries)),
+		}
+	default:
+		b.Fatalf("unknown benchmark cache %q", name)
+		return nil
 	}
+}
 
-	for name, cache := range caches {
+func forEachCache(b *testing.B, opts cacheOptions, fn func(*testing.B, cacheBench)) {
+	b.Helper()
+
+	for _, name := range cacheOrder {
 		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				i := 0
-				for pb.Next() {
-					cache.Set(fmt.Sprintf("key_%d", i), value)
-					i++
-				}
-			})
-			waitForAsync(cache)
+			c := newBenchCache(b, name, opts)
+			defer c.Close()
+			fn(b, c)
 		})
 	}
 }
 
-func BenchmarkCacheComparison_Get(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
-		}
-	}()
+func makeKeys(prefix string, n int) []string {
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("%s:%06d", prefix, i)
+	}
+	return keys
+}
 
-	value := make([]byte, 1024)
+func makeValue(size int) []byte {
+	value := make([]byte, size)
 	for i := range value {
-		value[i] = byte(i % 256)
+		value[i] = byte(i)
 	}
-
-	// Pre-populate all caches
-	for _, cache := range caches {
-		for i := 0; i < 10000; i++ {
-			cache.Set(fmt.Sprintf("key_%d", i), value)
-		}
-		waitForAsync(cache)
-	}
-
-	for name, cache := range caches {
-		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				i := 0
-				for pb.Next() {
-					cache.Get(fmt.Sprintf("key_%d", i%10000))
-					i++
-				}
-			})
-			waitForAsync(cache)
-		})
-	}
+	return value
 }
 
-func BenchmarkCacheComparison_Mixed(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
-		}
-	}()
-
-	value := make([]byte, 1024)
-	for i := range value {
-		value[i] = byte(i % 256)
+func makeValues(sizes ...int) [][]byte {
+	values := make([][]byte, len(sizes))
+	for i, size := range sizes {
+		values[i] = makeValue(size)
 	}
-
-	for name, cache := range caches {
-		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-				i := 0
-				for pb.Next() {
-					key := fmt.Sprintf("key_%d", i%10000)
-
-					if localRand.Float64() < 0.7 {
-						cache.Get(key)
-					} else {
-						cache.Set(key, value)
-					}
-					i++
-				}
-			})
-			waitForAsync(cache)
-		})
-	}
+	return values
 }
 
-func BenchmarkCacheComparison_HighContention(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
-		}
-	}()
+func runParallelCycle(b *testing.B, n int, fn func(int)) {
+	b.Helper()
 
-	value := make([]byte, 1024)
-	for i := range value {
-		value[i] = byte(i % 256)
-	}
-
-	// Pre-populate with hot keys
-	hotKeys := 100
-	for _, cache := range caches {
-		for i := 0; i < hotKeys; i++ {
-			cache.Set(fmt.Sprintf("hot_key_%d", i), value)
-		}
-		waitForAsync(cache)
-	}
-
-	for name, cache := range caches {
-		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-				i := 0
-				for pb.Next() {
-					// 80% of operations hit the same hot keys
-					var key string
-					if localRand.Float64() < 0.8 {
-						key = fmt.Sprintf("hot_key_%d", localRand.Intn(hotKeys))
-					} else {
-						key = fmt.Sprintf("cold_key_%d", i)
-					}
-
-					if localRand.Float64() < 0.6 {
-						cache.Get(key)
-					} else {
-						cache.Set(key, value)
-					}
-					i++
-				}
-			})
-			waitForAsync(cache)
-		})
-	}
-}
-
-func BenchmarkCacheComparison_LargeValues(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
-		}
-	}()
-
-	valueSizes := []int{1024, 4096, 16384, 65536} // 1KB to 64KB
-
-	for _, size := range valueSizes {
-		value := make([]byte, size)
-		for i := range value {
-			value[i] = byte(i % 256)
-		}
-
-		for name, cache := range caches {
-			b.Run(fmt.Sprintf("%s_size_%dKB", name, size/1024), func(b *testing.B) {
-				b.ResetTimer()
-				b.RunParallel(func(pb *testing.PB) {
-					i := 0
-					for pb.Next() {
-						key := fmt.Sprintf("key_%d", i%1000)
-						if i%3 == 0 {
-							cache.Get(key)
-						} else {
-							cache.Set(key, value)
-						}
-						i++
-					}
-				})
-				waitForAsync(cache)
-			})
-		}
-	}
-}
-
-func BenchmarkCacheComparison_Scalability(b *testing.B) {
-	goroutineCounts := []int{1, 10, 50, 100, 500}
-
-	for _, goroutineCount := range goroutineCounts {
-		b.Run(fmt.Sprintf("goroutines_%d", goroutineCount), func(b *testing.B) {
-			caches := createCaches()
-			defer func() {
-				for _, cache := range caches {
-					cache.Close()
-				}
-			}()
-
-			value := make([]byte, 1024)
-			for i := range value {
-				value[i] = byte(i % 256)
+	var workers atomic.Uint64
+	b.RunParallel(func(pb *testing.PB) {
+		start := int((workers.Add(1) * 7919) % uint64(n))
+		i := start
+		for pb.Next() {
+			fn(i)
+			i++
+			if i == n {
+				i = 0
 			}
+		}
+	})
+}
 
-			for name, cache := range caches {
-				b.Run(name, func(b *testing.B) {
-					b.ResetTimer()
+func prepopulate(c cacheBench, keys []string, value []byte) {
+	for _, key := range keys {
+		_ = c.Set(key, value)
+	}
+	c.Flush()
+}
 
-					var wg sync.WaitGroup
-					opsPerGoroutine := b.N / goroutineCount
+func makeWorkload(keys []string, values [][]byte, readRatio, writeRatio float64, deleteRatio float64, seed int64) []workloadOp {
+	rng := rand.New(rand.NewSource(seed))
+	ops := make([]workloadOp, benchOpCount)
+	for i := range ops {
+		p := rng.Float64()
+		op := opDelete
+		switch {
+		case p < readRatio:
+			op = opGet
+		case p < readRatio+writeRatio:
+			op = opSet
+		case p < readRatio+writeRatio+deleteRatio:
+			op = opDelete
+		default:
+			op = opGet
+		}
+		ops[i] = workloadOp{
+			key:   keys[rng.Intn(len(keys))],
+			value: values[rng.Intn(len(values))],
+			op:    op,
+		}
+	}
+	return ops
+}
 
-					for g := 0; g < goroutineCount; g++ {
-						wg.Add(1)
-						go func(goroutineID int) {
-							defer wg.Done()
-							localRand := rand.New(rand.NewSource(time.Now().UnixNano() + int64(goroutineID)))
+func makeHotWorkload(hotKeys, coldKeys []string, values [][]byte, seed int64) []workloadOp {
+	rng := rand.New(rand.NewSource(seed))
+	ops := make([]workloadOp, benchOpCount)
+	for i := range ops {
+		keys := coldKeys
+		if rng.Float64() < 0.8 {
+			keys = hotKeys
+		}
+		op := opSet
+		if rng.Float64() < 0.6 {
+			op = opGet
+		}
+		ops[i] = workloadOp{
+			key:   keys[rng.Intn(len(keys))],
+			value: values[rng.Intn(len(values))],
+			op:    op,
+		}
+	}
+	return ops
+}
 
-							for i := 0; i < opsPerGoroutine; i++ {
-								key := fmt.Sprintf("key_%d_%d", goroutineID, i)
-
-								if localRand.Float64() < 0.7 {
-									cache.Set(key, value)
-								} else {
-									cache.Get(key)
-								}
-							}
-						}(g)
-					}
-					wg.Wait()
-				})
-			}
-		})
+func applyOp(c cacheBench, op workloadOp, mode writeMode) {
+	switch op.op {
+	case opGet:
+		c.Get(op.key)
+	case opSet:
+		if mode == strictWrites {
+			_ = c.SetStrict(op.key, op.value)
+			return
+		}
+		_ = c.Set(op.key, op.value)
+	case opDelete:
+		c.Delete(op.key)
 	}
 }
 
-func BenchmarkCacheComparison_MemoryEfficiency(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
-		}
-	}()
+func benchmarkSet(b *testing.B, mode writeMode) {
+	keys := makeKeys("set", benchTargetEntries)
+	value := makeValue(1024)
 
-	value := make([]byte, 1024)
-	for i := range value {
-		value[i] = byte(i % 256)
-	}
-
-	for name, cache := range caches {
-		b.Run(name, func(b *testing.B) {
-			var m1, m2 runtime.MemStats
-			runtime.GC()
-			runtime.ReadMemStats(&m1)
-
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				cache.Set(fmt.Sprintf("key_%d", i), value)
+	forEachCache(b, cacheOptions{valueSize: len(value), ttl: true}, func(b *testing.B, c cacheBench) {
+		b.ResetTimer()
+		runParallelCycle(b, len(keys), func(i int) {
+			if mode == strictWrites {
+				_ = c.SetStrict(keys[i], value)
+				return
 			}
+			_ = c.Set(keys[i], value)
+		})
+		b.StopTimer()
+		c.Flush()
+	})
+}
+
+func benchmarkGet(b *testing.B, ttl bool) {
+	keys := makeKeys("get", benchKeySpace)
+	value := makeValue(1024)
+
+	forEachCache(b, cacheOptions{valueSize: len(value), ttl: ttl}, func(b *testing.B, c cacheBench) {
+		prepopulate(c, keys, value)
+		b.ResetTimer()
+		runParallelCycle(b, len(keys), func(i int) {
+			c.Get(keys[i])
+		})
+	})
+}
+
+func benchmarkWorkload(b *testing.B, mode writeMode, name string, ops []workloadOp, prefillKeys []string, prefillValue []byte) {
+	b.Helper()
+
+	b.Run(name, func(b *testing.B) {
+		forEachCache(b, cacheOptions{valueSize: len(prefillValue), ttl: true}, func(b *testing.B, c cacheBench) {
+			prepopulate(c, prefillKeys, prefillValue)
+			b.ResetTimer()
+			runParallelCycle(b, len(ops), func(i int) {
+				applyOp(c, ops[i], mode)
+			})
 			b.StopTimer()
+			c.Flush()
+		})
+	})
+}
 
-			runtime.GC()
-			runtime.ReadMemStats(&m2)
-
-			b.ReportMetric(float64(m2.Alloc-m1.Alloc)/float64(b.N), "bytes/op")
+func benchmarkLargeValues(b *testing.B, mode writeMode) {
+	keys := makeKeys("large", benchKeySpace)
+	for _, size := range []int{1024, 4096, 16 * 1024, 64 * 1024} {
+		b.Run(fmt.Sprintf("%dKB", size/1024), func(b *testing.B) {
+			values := makeValues(size)
+			ops := makeWorkload(keys, values, 0.35, 0.65, 0, int64(size))
+			forEachCache(b, cacheOptions{valueSize: size, ttl: true}, func(b *testing.B, c cacheBench) {
+				prepopulate(c, keys[:1000], values[0])
+				b.ResetTimer()
+				runParallelCycle(b, len(ops), func(i int) {
+					applyOp(c, ops[i], mode)
+				})
+				b.StopTimer()
+				c.Flush()
+			})
 		})
 	}
 }
 
-func BenchmarkCacheComparison_ReadHeavy(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
-		}
-	}()
-
-	value := make([]byte, 1024)
-	for i := range value {
-		value[i] = byte(i % 256)
-	}
-
-	// Pre-populate all caches
-	for _, cache := range caches {
-		for i := 0; i < 10000; i++ {
-			cache.Set(fmt.Sprintf("key_%d", i), value)
-		}
-		waitForAsync(cache)
-	}
-
-	for name, cache := range caches {
-		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-				i := 0
-				for pb.Next() {
-					key := fmt.Sprintf("key_%d", i%10000)
-
-					// 90% reads, 10% writes
-					if localRand.Float64() < 0.9 {
-						cache.Get(key)
-					} else {
-						cache.Set(key, value)
-					}
-					i++
-				}
-			})
-			waitForAsync(cache)
-		})
-	}
+func BenchmarkCacheComparison_Set_Async(b *testing.B) {
+	benchmarkSet(b, asyncWrites)
 }
 
-func BenchmarkCacheComparison_WriteHeavy(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
-		}
-	}()
-
-	value := make([]byte, 1024)
-	for i := range value {
-		value[i] = byte(i % 256)
-	}
-
-	for name, cache := range caches {
-		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-				i := 0
-				for pb.Next() {
-					key := fmt.Sprintf("key_%d", i%10000)
-
-					// 90% writes, 10% reads
-					if localRand.Float64() < 0.9 {
-						cache.Set(key, value)
-					} else {
-						cache.Get(key)
-					}
-					i++
-				}
-			})
-			waitForAsync(cache)
-		})
-	}
+func BenchmarkCacheComparison_Set_Strict(b *testing.B) {
+	benchmarkSet(b, strictWrites)
 }
 
-func BenchmarkCacheComparison_RealWorldWorkload(b *testing.B) {
-	caches := createCaches()
-	defer func() {
-		for _, cache := range caches {
-			cache.Close()
-		}
-	}()
+func BenchmarkCacheComparison_Get_TTL(b *testing.B) {
+	benchmarkGet(b, true)
+}
 
-	// Different sized values to simulate real-world data
-	values := make([][]byte, 5)
-	for i := range values {
-		size := 512 * (i + 1) // 512B to 2.5KB
-		values[i] = make([]byte, size)
-		for j := range values[i] {
-			values[i][j] = byte(j % 256)
-		}
-	}
+func BenchmarkCacheComparison_Get_NoTTL(b *testing.B) {
+	benchmarkGet(b, false)
+}
 
-	for name, cache := range caches {
-		b.Run(name, func(b *testing.B) {
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-				i := 0
-				for pb.Next() {
-					key := fmt.Sprintf("user:profile:%d", i%50000)
-					value := values[localRand.Intn(len(values))]
+func BenchmarkCacheComparison_Mixed_Async(b *testing.B) {
+	keys := makeKeys("mixed", benchKeySpace)
+	value := makeValue(1024)
+	ops := makeWorkload(keys, [][]byte{value}, 0.7, 0.3, 0, 1)
+	benchmarkWorkload(b, asyncWrites, "70read_30write", ops, keys, value)
+}
 
-					// Realistic access pattern: 60% reads, 35% writes, 5% deletes
-					operation := localRand.Float64()
-					switch {
-					case operation < 0.6:
-						cache.Get(key)
-					case operation < 0.95:
-						cache.Set(key, value)
-					default:
-						cache.Delete(key)
-					}
-					i++
-				}
-			})
-			waitForAsync(cache)
-		})
-	}
+func BenchmarkCacheComparison_Mixed_Strict(b *testing.B) {
+	keys := makeKeys("mixed", benchKeySpace)
+	value := makeValue(1024)
+	ops := makeWorkload(keys, [][]byte{value}, 0.7, 0.3, 0, 1)
+	benchmarkWorkload(b, strictWrites, "70read_30write", ops, keys, value)
+}
+
+func BenchmarkCacheComparison_ReadHeavy_Async(b *testing.B) {
+	keys := makeKeys("read-heavy", benchKeySpace)
+	value := makeValue(1024)
+	ops := makeWorkload(keys, [][]byte{value}, 0.9, 0.1, 0, 2)
+	benchmarkWorkload(b, asyncWrites, "90read_10write", ops, keys, value)
+}
+
+func BenchmarkCacheComparison_WriteHeavy_Async(b *testing.B) {
+	keys := makeKeys("write-heavy", benchKeySpace)
+	value := makeValue(1024)
+	ops := makeWorkload(keys, [][]byte{value}, 0.1, 0.9, 0, 3)
+	benchmarkWorkload(b, asyncWrites, "10read_90write", ops, keys, value)
+}
+
+func BenchmarkCacheComparison_HighContention_Async(b *testing.B) {
+	hotKeys := makeKeys("hot", 100)
+	coldKeys := makeKeys("cold", benchKeySpace)
+	value := makeValue(1024)
+	ops := makeHotWorkload(hotKeys, coldKeys, [][]byte{value}, 4)
+	prefill := append(append([]string{}, hotKeys...), coldKeys...)
+	benchmarkWorkload(b, asyncWrites, "80hot_60read", ops, prefill, value)
+}
+
+func BenchmarkCacheComparison_RealWorld_Async(b *testing.B) {
+	keys := makeKeys("user:profile", benchKeySpace)
+	values := makeValues(512, 1024, 1536, 2048, 2560)
+	ops := makeWorkload(keys, values, 0.6, 0.35, 0.05, 5)
+	benchmarkWorkload(b, asyncWrites, "60read_35write_5delete", ops, keys, values[1])
+}
+
+func BenchmarkCacheComparison_RealWorld_Strict(b *testing.B) {
+	keys := makeKeys("user:profile", benchKeySpace)
+	values := makeValues(512, 1024, 1536, 2048, 2560)
+	ops := makeWorkload(keys, values, 0.6, 0.35, 0.05, 5)
+	benchmarkWorkload(b, strictWrites, "60read_35write_5delete", ops, keys, values[1])
+}
+
+func BenchmarkCacheComparison_LargeValues_Async(b *testing.B) {
+	benchmarkLargeValues(b, asyncWrites)
+}
+
+func BenchmarkCacheComparison_LargeValues_Strict(b *testing.B) {
+	benchmarkLargeValues(b, strictWrites)
 }

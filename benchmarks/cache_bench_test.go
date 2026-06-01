@@ -188,7 +188,7 @@ func BenchmarkCacheEviction(b *testing.B) {
 		ShardCount:      16,
 		CleanupInterval: 1 * time.Minute,
 		DefaultTTL:      1 * time.Hour,
-		EvictionPolicy:  cache.LRU,
+		EvictionPolicy:  cache.SieveTinyLFU,
 		StatsEnabled:    true,
 	}
 	cache := cache.New[string, string](config)
@@ -323,7 +323,7 @@ func BenchmarkCacheShardComparison(b *testing.B) {
 				ShardCount:      shardCount,
 				CleanupInterval: 1 * time.Minute,
 				DefaultTTL:      1 * time.Hour,
-				EvictionPolicy:  cache.LRU,
+				EvictionPolicy:  cache.SieveTinyLFU,
 				StatsEnabled:    true,
 			}
 			cache := cache.New[string, string](config)
@@ -378,7 +378,7 @@ func BenchmarkCacheStatsEnabled(b *testing.B) {
 			ShardCount:      16,
 			CleanupInterval: 1 * time.Minute,
 			DefaultTTL:      1 * time.Hour,
-			EvictionPolicy:  cache.LRU,
+			EvictionPolicy:  cache.SieveTinyLFU,
 			StatsEnabled:    true,
 		}
 		cache := cache.New[string, string](config)
@@ -400,7 +400,7 @@ func BenchmarkCacheStatsEnabled(b *testing.B) {
 			ShardCount:      16,
 			CleanupInterval: 1 * time.Minute,
 			DefaultTTL:      1 * time.Hour,
-			EvictionPolicy:  cache.LRU,
+			EvictionPolicy:  cache.SieveTinyLFU,
 			StatsEnabled:    false,
 		}
 		cache := cache.New[string, string](config)

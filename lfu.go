@@ -1,7 +1,8 @@
 package cache
 
-// freqNode buckets items by exact frequency. Empty non-sentinel buckets are
-// removed eagerly, so head.next is always the current minimum.
+// freqNode buckets items by exact frequency.
+// Empty non-sentinel buckets are removed eagerly,
+// so head.next is always the current minimum.
 type freqNode[K comparable, V any] struct {
 	freq  int64                      // exact frequency (>= 0); head sentinel uses 0
 	items map[*cacheItem[V]]struct{} // set of items at this frequency
@@ -9,8 +10,6 @@ type freqNode[K comparable, V any] struct {
 	next  *freqNode[K, V]
 }
 
-// lfuList keeps ascending frequency buckets for O(1) add/increment/remove under
-// the shard lock.
 type lfuList[K comparable, V any] struct {
 	head     *freqNode[K, V]
 	freqMap  map[int64]*freqNode[K, V]         // freq → bucket
@@ -42,7 +41,6 @@ func (l *lfuList[K, V]) add(item *cacheItem[V]) {
 func (l *lfuList[K, V]) increment(item *cacheItem[V]) {
 	cur := l.itemFreq[item]
 	if cur == nil {
-		// Defensive: treat an unindexed resident as new.
 		l.add(item)
 		return
 	}
@@ -66,13 +64,13 @@ func (l *lfuList[K, V]) increment(item *cacheItem[V]) {
 	}
 }
 
-// removeLFU returns one item from the minimum-frequency bucket.
+// removeLFU returns one item from the minimum frequency bucket.
 func (l *lfuList[K, V]) removeLFU() *cacheItem[V] {
 	node := l.head.next
 	if node == l.head {
 		return nil // list is empty
 	}
-	// By invariant, non-sentinel buckets are never empty.
+	// non-sentinel buckets are never empty.
 	var victim *cacheItem[V]
 	for it := range node.items {
 		victim = it

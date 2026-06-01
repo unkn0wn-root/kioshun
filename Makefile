@@ -41,7 +41,7 @@ bench-full: bench-deps
 .PHONY: bench-compare
 bench-compare: bench-deps
 	@echo "Running performance comparison..."
-	cd benchmarks && $(GOTEST) -bench='BenchmarkCacheComparison|BenchmarkCacheFair' -benchmem -run=^$$ .
+	cd benchmarks && $(GOTEST) -bench='BenchmarkCacheComparison' -benchmem -run=^$$ .
 
 .PHONY: lint
 lint:
