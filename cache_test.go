@@ -505,6 +505,110 @@ func TestManagerRegisterValidatesConfig(t *testing.T) {
 	}
 }
 
+func TestManagerRemoveDropsConfig(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	const customMaxSize = 12345
+	cfg := DefaultConfig()
+	cfg.MaxSize = customMaxSize
+	if err := manager.Register("c", cfg); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	first, err := GetCache[string, int](manager, "c")
+	if err != nil {
+		t.Fatalf("GetCache() error = %v", err)
+	}
+	if got := first.Stats().Capacity; got != customMaxSize {
+		t.Fatalf("Capacity before Remove = %d, want %d", got, customMaxSize)
+	}
+
+	if err := manager.Remove("c"); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+
+	// Remove drops the registration, so a fresh GetCache rebuilds from
+	// DefaultConfig rather than resurrecting the removed config.
+	second, err := GetCache[string, int](manager, "c")
+	if err != nil {
+		t.Fatalf("GetCache() after Remove error = %v", err)
+	}
+	if second == first {
+		t.Fatal("expected a new cache instance after Remove")
+	}
+	if got, want := second.Stats().Capacity, DefaultConfig().MaxSize; got != want {
+		t.Fatalf("Capacity after Remove = %d, want default %d", got, want)
+	}
+}
+
+func TestManagerCloseAllPreservesConfigs(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	const customMaxSize = 4096
+	cfg := DefaultConfig()
+	cfg.MaxSize = customMaxSize
+	if err := manager.Register("c", cfg); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if _, err := GetCache[string, int](manager, "c"); err != nil {
+		t.Fatalf("GetCache() error = %v", err)
+	}
+
+	if err := manager.CloseAll(); err != nil {
+		t.Fatalf("CloseAll() error = %v", err)
+	}
+
+	// CloseAll closes instances but keeps registrations, so the name rebuilds
+	// from its registered config.
+	cache, err := GetCache[string, int](manager, "c")
+	if err != nil {
+		t.Fatalf("GetCache() after CloseAll error = %v", err)
+	}
+	if got := cache.Stats().Capacity; got != customMaxSize {
+		t.Fatalf("Capacity after CloseAll = %d, want registered %d", got, customMaxSize)
+	}
+}
+
+func TestGetCacheWithConfig(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	const firstMaxSize = 2048
+	cfg := DefaultConfig()
+	cfg.MaxSize = firstMaxSize
+
+	// No prior Register: the cache is created from the passed config.
+	first, err := GetCacheWithConfig[string, int](manager, "c", cfg)
+	if err != nil {
+		t.Fatalf("GetCacheWithConfig() error = %v", err)
+	}
+	if got := first.Stats().Capacity; got != firstMaxSize {
+		t.Fatalf("Capacity = %d, want %d", got, firstMaxSize)
+	}
+
+	// Existing entry: the passed config is ignored (get-or-create) and the same
+	// instance is returned, never reconfigured.
+	other := DefaultConfig()
+	other.MaxSize = 9999
+	second, err := GetCacheWithConfig[string, int](manager, "c", other)
+	if err != nil {
+		t.Fatalf("GetCacheWithConfig() error = %v", err)
+	}
+	if second != first {
+		t.Fatal("expected the existing cache instance to be returned")
+	}
+	if got := second.Stats().Capacity; got != firstMaxSize {
+		t.Fatalf("Capacity after second call = %d, want unchanged %d", got, firstMaxSize)
+	}
+
+	// Type mismatch is reported, mirroring GetCache.
+	if _, err := GetCacheWithConfig[string, string](manager, "c", cfg); !errors.Is(err, ErrTypeMismatch) {
+		t.Fatalf("GetCacheWithConfig() type mismatch error = %v, want ErrTypeMismatch", err)
+	}
+}
+
 func TestCacheCloseBehavior(t *testing.T) {
 	cache := newDefaultTestCache[string, string](t)
 

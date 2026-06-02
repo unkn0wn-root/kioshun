@@ -17,7 +17,7 @@ func newWriteQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-
 	return newMPSCQueue[K, V](size, wake, closeCh)
 }
 
-// signal performs a coalesced, non-blocking wake on a size-1 channel:
+// signal performs wake on a size-1 channel:
 // if a token is already pending the wake is a no-op.
 func signal(ch chan struct{}) {
 	select {

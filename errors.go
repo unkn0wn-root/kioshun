@@ -38,13 +38,6 @@ func newCacheError(op, name string, cause error) *CacheError {
 	}
 }
 
-func wrapError(op string, err error) *CacheError {
-	return &CacheError{
-		Op:    op,
-		Cause: err,
-	}
-}
-
 // ConfigError describes an invalid cache configuration field.
 type ConfigError struct {
 	Field  string
