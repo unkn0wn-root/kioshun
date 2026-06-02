@@ -6,8 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/unkn0wn-root/kioshun/internal/mathutil"
 )
 
 const (
@@ -214,7 +212,7 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 		}
 		shardCount = min(shardCount, maxPow2)
 	}
-	shardCount = mathutil.NextPowerOf2(shardCount)
+	shardCount = nextPowerOf2(shardCount)
 
 	cache := &Cache[K, V]{
 		shards:    make([]*shard[K, V], shardCount),

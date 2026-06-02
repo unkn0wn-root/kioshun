@@ -3,8 +3,6 @@ package kioshun
 import (
 	"runtime"
 	"sync/atomic"
-
-	"github.com/unkn0wn-root/kioshun/internal/mathutil"
 )
 
 const (
@@ -43,7 +41,7 @@ type readBuffer struct {
 // newReadBuffer sizes the stripe set to GOMAXPROCS (capped)
 // rounded to a 2^n for mask-based indexing.
 func newReadBuffer() readBuffer {
-	n := max(mathutil.NextPowerOf2(min(runtime.GOMAXPROCS(0), maxReadStripes)), 1)
+	n := max(nextPowerOf2(min(runtime.GOMAXPROCS(0), maxReadStripes)), 1)
 	return readBuffer{
 		stripes: make([]readStripe, n),
 		mask:    uint64(n - 1),
