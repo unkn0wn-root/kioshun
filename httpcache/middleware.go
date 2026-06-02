@@ -14,7 +14,6 @@ import (
 	"github.com/unkn0wn-root/kioshun"
 )
 
-// Response is a cached HTTP response snapshot.
 type Response struct {
 	StatusCode int
 	Headers    http.Header
@@ -31,7 +30,6 @@ type Policy func(*http.Request, int, http.Header, []byte) (shouldCache bool, ttl
 // PathExtractor recovers a URL path from a cache key for pattern invalidation.
 type PathExtractor func(string) string
 
-// Middleware caches eligible net/http responses.
 type Middleware struct {
 	cache       *kioshun.Cache[string, *Response]
 	keyGen      KeyGenerator
@@ -49,160 +47,8 @@ type Middleware struct {
 	pathExtract func(string) string
 }
 
-// Config controls HTTP response caching behavior. Zero-valued fields are filled
-// from DefaultConfig; use the Disable* fields to turn off default-on features.
-type Config struct {
-	MaxSize         int64
-	ShardCount      int
-	CleanupInterval time.Duration
-	DefaultTTL      time.Duration
-	EvictionPolicy  kioshun.EvictionPolicy
-	ProbationRatio  uint8
-	GhostRatio      uint8
-	DisableAdapt    bool // Disable SieveTinyLFU adaptive sizing.
-	DisableStats    bool // Disable cache statistics collection.
-	DisableCleanup  bool // Disable periodic cleanup.
-	// DisableCacheSizeLimit makes MaxSize unlimited in the backing cache.
-	DisableCacheSizeLimit bool
-	// DisableBodySizeLimit allows caching responses of any body size.
-	DisableBodySizeLimit bool
-
-	CacheableMethods []string
-	CacheableStatus  []int
-	IgnoreHeaders    []string
-	MaxBodySize      int64
-
-	HitHeader  string // Default: "X-Cache"
-	MissHeader string // Default: "X-Cache"
-}
-
-// DefaultConfig returns the default HTTP middleware configuration.
-func DefaultConfig() Config {
-	return Config{
-		MaxSize:          100000,
-		ShardCount:       16,
-		CleanupInterval:  5 * time.Minute,
-		DefaultTTL:       5 * time.Minute,
-		EvictionPolicy:   kioshun.SieveTinyLFU,
-		CacheableMethods: []string{"GET", "HEAD"},
-		CacheableStatus:  []int{200, 201, 300, 301, 302, 304, 404, 410},
-		IgnoreHeaders:    []string{"Date", "Server", "X-Request-Id", "X-Trace-Id"},
-		MaxBodySize:      10 * 1024 * 1024, // 10MB
-		HitHeader:        "X-Cache",
-		MissHeader:       "X-Cache",
-	}
-}
-
-// Validate reports invalid HTTP cache configuration values.
-func (c Config) Validate() error {
-	if c.MaxSize < 0 {
-		return fmt.Errorf("httpcache: MaxSize must be >= 0")
-	}
-	if c.ShardCount < 0 {
-		return fmt.Errorf("httpcache: ShardCount must be >= 0")
-	}
-	if c.CleanupInterval < 0 {
-		return fmt.Errorf("httpcache: CleanupInterval must be >= 0")
-	}
-	if c.DefaultTTL < 0 && c.DefaultTTL != kioshun.NoExpiration {
-		return fmt.Errorf("httpcache: DefaultTTL must be >= 0 or NoExpiration")
-	}
-	switch c.EvictionPolicy {
-	case kioshun.DefaultEvictionPolicy, kioshun.LRU, kioshun.LFU, kioshun.FIFO, kioshun.SieveTinyLFU:
-	default:
-		return fmt.Errorf("httpcache: EvictionPolicy must be a known eviction policy")
-	}
-	if c.ProbationRatio > 100 {
-		return fmt.Errorf("httpcache: ProbationRatio must be <= 100")
-	}
-	if c.GhostRatio > 100 {
-		return fmt.Errorf("httpcache: GhostRatio must be <= 100")
-	}
-	if c.MaxBodySize < 0 {
-		return fmt.Errorf("httpcache: MaxBodySize must be >= 0")
-	}
-	return nil
-}
-
-func normalizeConfig(config Config) (Config, error) {
-	if err := config.Validate(); err != nil {
-		return Config{}, err
-	}
-	config = configWithDefaults(config)
-	if err := config.Validate(); err != nil {
-		return Config{}, err
-	}
-	return config, nil
-}
-
-func configWithDefaults(config Config) Config {
-	defaults := DefaultConfig()
-	normalized := defaults
-
-	if config.MaxSize != 0 {
-		normalized.MaxSize = config.MaxSize
-	}
-	if config.ShardCount != 0 {
-		normalized.ShardCount = config.ShardCount
-	}
-	if config.CleanupInterval != 0 {
-		normalized.CleanupInterval = config.CleanupInterval
-	}
-	if config.DefaultTTL != 0 {
-		normalized.DefaultTTL = config.DefaultTTL
-	}
-	if config.EvictionPolicy != kioshun.DefaultEvictionPolicy {
-		normalized.EvictionPolicy = config.EvictionPolicy
-	}
-	if config.ProbationRatio != 0 {
-		normalized.ProbationRatio = config.ProbationRatio
-	}
-	if config.GhostRatio != 0 {
-		normalized.GhostRatio = config.GhostRatio
-	}
-	if config.CacheableMethods != nil {
-		normalized.CacheableMethods = cloneStrings(config.CacheableMethods)
-	}
-	if config.CacheableStatus != nil {
-		normalized.CacheableStatus = append([]int(nil), config.CacheableStatus...)
-	}
-	if config.IgnoreHeaders != nil {
-		normalized.IgnoreHeaders = cloneStrings(config.IgnoreHeaders)
-	}
-	if config.MaxBodySize != 0 {
-		normalized.MaxBodySize = config.MaxBodySize
-	}
-	if config.HitHeader != "" {
-		normalized.HitHeader = config.HitHeader
-	}
-	if config.MissHeader != "" {
-		normalized.MissHeader = config.MissHeader
-	}
-
-	normalized.DisableAdapt = config.DisableAdapt
-	normalized.DisableStats = config.DisableStats
-	normalized.DisableCleanup = config.DisableCleanup
-	normalized.DisableCacheSizeLimit = config.DisableCacheSizeLimit
-	normalized.DisableBodySizeLimit = config.DisableBodySizeLimit
-	if normalized.DisableCleanup {
-		normalized.CleanupInterval = 0
-	}
-	if normalized.DisableCacheSizeLimit {
-		normalized.MaxSize = 0
-	}
-	if normalized.DisableBodySizeLimit {
-		normalized.MaxBodySize = 0
-	}
-	return normalized
-}
-
-func cloneStrings(values []string) []string {
-	return append([]string(nil), values...)
-}
-
-// New constructs response-caching middleware.
 func New(config Config) (*Middleware, error) {
-	config, err := normalizeConfig(config)
+	config, err := resolveConfig(config)
 	if err != nil {
 		return nil, err
 	}
@@ -293,61 +139,6 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	})
 }
 
-// serveCached writes a cached response and emits cache-hit metadata.
-func (m *Middleware) serveCached(w http.ResponseWriter, cached *Response, key string) {
-	if m.onHit != nil {
-		m.onHit(key)
-	}
-
-	for k, v := range cached.Headers {
-		w.Header()[k] = append([]string(nil), v...)
-	}
-
-	w.Header().Set(m.hitHeader, "HIT")
-	w.Header().Set("X-Cache-Date", cached.CachedAt.Format(time.RFC3339))
-	w.Header().Set("X-Cache-Age", time.Since(cached.CachedAt).String())
-
-	w.WriteHeader(cached.StatusCode)
-	w.Write(cached.Body)
-}
-
-func ignoredHeaders(config Config) map[string]struct{} {
-	headers := make(map[string]struct{}, len(config.IgnoreHeaders)+5)
-	for _, name := range config.IgnoreHeaders {
-		if name != "" {
-			headers[http.CanonicalHeaderKey(name)] = struct{}{}
-		}
-	}
-	for _, name := range []string{
-		"X-Cache",
-		"X-Cache-Date",
-		"X-Cache-Age",
-		config.HitHeader,
-		config.MissHeader,
-	} {
-		if name != "" {
-			headers[http.CanonicalHeaderKey(name)] = struct{}{}
-		}
-	}
-	return headers
-}
-
-func (m *Middleware) cachedHeaders(headers http.Header) http.Header {
-	cached := make(http.Header, len(headers))
-	for name, values := range headers {
-		if _, ignored := m.ignore[http.CanonicalHeaderKey(name)]; ignored {
-			continue
-		}
-		cached[name] = append([]string(nil), values...)
-	}
-	return cached
-}
-
-func (m *Middleware) cacheableRequest(r *http.Request) bool {
-	_, ok := m.methods[r.Method]
-	return ok
-}
-
 // Stats returns cache statistics.
 func (m *Middleware) Stats() kioshun.Stats { return m.cache.Stats() }
 
@@ -402,6 +193,61 @@ func (m *Middleware) SetPathExtractor(extractor PathExtractor)   { m.pathExtract
 func (m *Middleware) OnHit(callback func(string))                { m.onHit = callback }
 func (m *Middleware) OnMiss(callback func(string))               { m.onMiss = callback }
 func (m *Middleware) OnSet(callback func(string, time.Duration)) { m.onSet = callback }
+
+// serveCached writes a cached response and emits cache-hit metadata.
+func (m *Middleware) serveCached(w http.ResponseWriter, cached *Response, key string) {
+	if m.onHit != nil {
+		m.onHit(key)
+	}
+
+	for k, v := range cached.Headers {
+		w.Header()[k] = append([]string(nil), v...)
+	}
+
+	w.Header().Set(m.hitHeader, "HIT")
+	w.Header().Set("X-Cache-Date", cached.CachedAt.Format(time.RFC3339))
+	w.Header().Set("X-Cache-Age", time.Since(cached.CachedAt).String())
+
+	w.WriteHeader(cached.StatusCode)
+	w.Write(cached.Body)
+}
+
+func ignoredHeaders(config Config) map[string]struct{} {
+	headers := make(map[string]struct{}, len(config.IgnoreHeaders)+5)
+	for _, name := range config.IgnoreHeaders {
+		if name != "" {
+			headers[http.CanonicalHeaderKey(name)] = struct{}{}
+		}
+	}
+	for _, name := range []string{
+		"X-Cache",
+		"X-Cache-Date",
+		"X-Cache-Age",
+		config.HitHeader,
+		config.MissHeader,
+	} {
+		if name != "" {
+			headers[http.CanonicalHeaderKey(name)] = struct{}{}
+		}
+	}
+	return headers
+}
+
+func (m *Middleware) cachedHeaders(headers http.Header) http.Header {
+	cached := make(http.Header, len(headers))
+	for name, values := range headers {
+		if _, ignored := m.ignore[http.CanonicalHeaderKey(name)]; ignored {
+			continue
+		}
+		cached[name] = append([]string(nil), values...)
+	}
+	return cached
+}
+
+func (m *Middleware) cacheableRequest(r *http.Request) bool {
+	_, ok := m.methods[r.Method]
+	return ok
+}
 
 // DefaultKeyGenerator hashes the method, full URL, and common vary headers.
 func DefaultKeyGenerator(r *http.Request) string {
