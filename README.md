@@ -13,6 +13,13 @@
   *Thread-safe, sharded in-memory cache for Go*
 </div>
 
+> [!WARNING]
+> Kioshun v4 is a breaking redesign, not a drop-in upgrade from earlier releases!
+> The biggest change is that clustering has been removed: the old peer-to-peer features are no longer part of the project. The focus is now on continuously improving cache performance and correctness.
+> The cache core was also rebuilt: the previous `AdmissionLFU` default has been replaced by `SieveTinyLFU` with probation/main queues, ghost entries, TinyLFU sketching, adaptive segment sizing and queued/batched writes.
+> Public APIs changed as part of the redesign, including `New` and `NewDefault` replacing `NewWithDefaults`, cache policy/config names changing and HTTP middleware moving to the `httpcache` package.
+> Review the v4 docs and examples before upgrading.
+
 ## Index
 
 - [What is Kioshun?](#what-is-kioshun)
