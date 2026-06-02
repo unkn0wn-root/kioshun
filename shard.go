@@ -119,7 +119,7 @@ func (s *shard[K, V]) sampleRead(h uint64) {
 		return
 	}
 	if s.readBuf.sample(h) {
-		signal(s.wake) // a drain may already be pending
+		signal(s.wake) // may already be pending
 	}
 }
 

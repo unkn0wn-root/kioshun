@@ -174,8 +174,8 @@ func (c *Cache[K, V]) deleteSync(s *shard[K, V], key K) (bool, error) {
 	return deleted, err
 }
 
-// Wait blocks until all writes accepted before the barrier are committed.
-func (c *Cache[K, V]) Wait() error {
+// Sync blocks until all writes accepted before the barrier are committed.
+func (c *Cache[K, V]) Sync() error {
 	return c.enqueueAllAndWait(writeBarrier)
 }
 

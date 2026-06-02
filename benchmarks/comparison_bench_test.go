@@ -84,7 +84,7 @@ func (c *KioshunWrapper) Delete(key string) bool {
 }
 
 func (c *KioshunWrapper) Flush() {
-	_ = c.cache.Wait()
+	_ = c.cache.Sync()
 }
 
 func (c *KioshunWrapper) Close() error {

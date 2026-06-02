@@ -49,7 +49,7 @@ func runTraceInto(c *Cache[int, int], tr []int) (hit, miss int) {
 		if err := c.Set(k, k, time.Hour); err != nil {
 			panic(err)
 		}
-		if err := c.Wait(); err != nil {
+		if err := c.Sync(); err != nil {
 			panic(err)
 		}
 	}

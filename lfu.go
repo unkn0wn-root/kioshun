@@ -12,8 +12,8 @@ type freqNode[K comparable, V any] struct {
 
 type lfuList[K comparable, V any] struct {
 	head     *freqNode[K, V]
-	freqMap  map[int64]*freqNode[K, V]            // freq → bucket
-	itemFreq map[*cacheItem[K, V]]*freqNode[K, V] // item → bucket
+	freqMap  map[int64]*freqNode[K, V]            // freq -> bucket
+	itemFreq map[*cacheItem[K, V]]*freqNode[K, V] // item -> bucket
 }
 
 // newLFUList creates a circular list with a freq==0 sentinel.

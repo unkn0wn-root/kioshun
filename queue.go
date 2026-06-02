@@ -54,13 +54,10 @@ type mpscQueue[K comparable, V any] struct {
 }
 
 func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) *mpscQueue[K, V] {
-	n := mathutil.NextPowerOf2(size)
-	if n < 2 {
-		// Vyukov ring needs >= 2 slots: at size 1 a cell's "published" sequence
-		// is indistinguishable from its "freed" sequence so the next enqueue would
-		// overwrite an un-dequeued item.
-		n = 2
-	}
+	// Vyukov ring needs >= 2 slots: at size 1 a cell's "published" sequence
+	// is indistinguishable from its "freed" sequence so the next enqueue would
+	// overwrite an un-dequeued item.
+	n := max(mathutil.NextPowerOf2(size), 2)
 	q := &mpscQueue[K, V]{
 		mask:    uint64(n - 1),
 		buffer:  make([]mpscCell[K, V], n),

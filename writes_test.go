@@ -4,7 +4,7 @@ import "testing"
 
 func waitForWrites[K comparable, V any](t testing.TB, c *Cache[K, V]) {
 	t.Helper()
-	if err := c.Wait(); err != nil {
+	if err := c.Sync(); err != nil {
 		t.Fatalf("wait for async writes: %v", err)
 	}
 }

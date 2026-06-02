@@ -1,13 +1,17 @@
 package httpcache
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/unkn0wn-root/kioshun"
 )
 
 func newTestMiddleware(t testing.TB, config Config) *Middleware {
@@ -21,8 +25,440 @@ func newTestMiddleware(t testing.TB, config Config) *Middleware {
 
 func waitForMiddlewareWrites(t testing.TB, m *Middleware) {
 	t.Helper()
-	if err := m.cache.Wait(); err != nil {
-		t.Fatalf("Wait() error = %v", err)
+	if err := m.cache.Sync(); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+}
+
+type committingResponseWriter struct {
+	header    http.Header
+	committed http.Header
+	body      bytes.Buffer
+	status    int
+}
+
+type informationalResponseWriter struct {
+	header    http.Header
+	committed http.Header
+	body      bytes.Buffer
+	statuses  []int
+}
+
+func newInformationalResponseWriter() *informationalResponseWriter {
+	return &informationalResponseWriter{header: make(http.Header)}
+}
+
+func (w *informationalResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *informationalResponseWriter) WriteHeader(status int) {
+	w.statuses = append(w.statuses, status)
+	if status >= 100 && status <= 199 && status != http.StatusSwitchingProtocols {
+		return
+	}
+	if w.committed == nil {
+		w.committed = w.header.Clone()
+	}
+}
+
+func (w *informationalResponseWriter) Write(body []byte) (int, error) {
+	if w.committed == nil {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.body.Write(body)
+}
+
+func newCommittingResponseWriter() *committingResponseWriter {
+	return &committingResponseWriter{header: make(http.Header)}
+}
+
+func (w *committingResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *committingResponseWriter) WriteHeader(status int) {
+	if w.committed != nil {
+		return
+	}
+	w.status = status
+	w.committed = w.header.Clone()
+}
+
+func (w *committingResponseWriter) Write(body []byte) (int, error) {
+	if w.committed == nil {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.body.Write(body)
+}
+
+func (w *committingResponseWriter) HeaderValue(name string) string {
+	if w.committed != nil {
+		return w.committed.Get(name)
+	}
+	return w.header.Get(name)
+}
+
+func TestNewDefaultsPartialConfigPerField(t *testing.T) {
+	middleware := newTestMiddleware(t, Config{
+		ShardCount: 32,
+		DefaultTTL: time.Hour,
+	})
+	defer middleware.Close()
+
+	stats := middleware.Stats()
+	if stats.Capacity != DefaultConfig().MaxSize {
+		t.Fatalf("capacity=%d, want default %d", stats.Capacity, DefaultConfig().MaxSize)
+	}
+	if stats.Shards != 32 {
+		t.Fatalf("shards=%d, want 32", stats.Shards)
+	}
+	if middleware.maxBodySize != DefaultConfig().MaxBodySize {
+		t.Fatalf("maxBodySize=%d, want default %d", middleware.maxBodySize, DefaultConfig().MaxBodySize)
+	}
+
+	req := httptest.NewRequest("GET", "/partial", nil)
+	shouldCache, ttl := middleware.policy(req, http.StatusOK, http.Header{}, []byte("body"))
+	if !shouldCache {
+		t.Fatal("policy rejected default-size body")
+	}
+	if ttl != time.Hour {
+		t.Fatalf("ttl=%v, want %v", ttl, time.Hour)
+	}
+}
+
+func TestNewCanDisableCacheAndBodySizeLimits(t *testing.T) {
+	config := DefaultConfig()
+	config.DisableCacheSizeLimit = true
+	config.DisableBodySizeLimit = true
+	config.MaxBodySize = 0
+
+	middleware := newTestMiddleware(t, config)
+	defer middleware.Close()
+
+	if capacity := middleware.Stats().Capacity; capacity != 0 {
+		t.Fatalf("capacity=%d, want unlimited capacity 0", capacity)
+	}
+	if middleware.limitBody {
+		t.Fatal("limitBody=true, want false")
+	}
+
+	largeBody := bytes.Repeat([]byte("x"), int(DefaultConfig().MaxBodySize)+1)
+	req := httptest.NewRequest("GET", "/unlimited", nil)
+	shouldCache, ttl := middleware.policy(req, http.StatusOK, http.Header{}, largeBody)
+	if !shouldCache {
+		t.Fatal("policy rejected large body with body size limit disabled")
+	}
+	if ttl != DefaultConfig().DefaultTTL {
+		t.Fatalf("ttl=%v, want %v", ttl, DefaultConfig().DefaultTTL)
+	}
+}
+
+func TestNewRejectsNegativeLimitsEvenWhenDisabled(t *testing.T) {
+	if _, err := New(Config{MaxSize: -1, DisableCacheSizeLimit: true}); err == nil {
+		t.Fatal("New() accepted negative MaxSize with cache size limit disabled")
+	}
+	if _, err := New(Config{MaxBodySize: -1, DisableBodySizeLimit: true}); err == nil {
+		t.Fatal("New() accepted negative MaxBodySize with body size limit disabled")
+	}
+}
+
+func TestDefaultCachePolicyAllowsNoExpirationDefaultTTL(t *testing.T) {
+	policy := DefaultCachePolicy(Config{DefaultTTL: kioshun.NoExpiration})
+	req := httptest.NewRequest("GET", "/no-expiration", nil)
+
+	shouldCache, ttl := policy(req, http.StatusOK, http.Header{}, []byte("body"))
+	if !shouldCache {
+		t.Fatal("DefaultCachePolicy rejected cacheable response")
+	}
+	if ttl != kioshun.NoExpiration {
+		t.Fatalf("ttl=%v, want NoExpiration", ttl)
+	}
+}
+
+func TestDefaultCachePolicyDefaultsZeroConfig(t *testing.T) {
+	policy := DefaultCachePolicy(Config{})
+	req := httptest.NewRequest("GET", "/zero", nil)
+
+	shouldCache, ttl := policy(req, http.StatusOK, http.Header{}, []byte("body"))
+	if !shouldCache {
+		t.Fatal("DefaultCachePolicy(Config{}) rejected non-empty body")
+	}
+	if ttl != DefaultConfig().DefaultTTL {
+		t.Fatalf("ttl=%v, want %v", ttl, DefaultConfig().DefaultTTL)
+	}
+}
+
+func TestHTTPCacheMiddleware_MissHeaderBeforeCommittedResponse(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	wrappedHandler := middleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("response"))
+	}))
+
+	req := httptest.NewRequest("GET", "/miss", nil)
+	rec := newCommittingResponseWriter()
+	wrappedHandler.ServeHTTP(rec, req)
+	waitForMiddlewareWrites(t, middleware)
+
+	if rec.HeaderValue("X-Cache") != "MISS" {
+		t.Fatalf("X-Cache=%q, want MISS", rec.HeaderValue("X-Cache"))
+	}
+}
+
+func TestHTTPCacheMiddleware_CapturesImplicitStatusHeaders(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("response"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	req1 := httptest.NewRequest("GET", "/implicit", nil)
+	rec1 := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
+
+	req2 := httptest.NewRequest("GET", "/implicit", nil)
+	rec2 := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec2.Code)
+	}
+	if rec2.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("X-Cache=%q, want HIT", rec2.Header().Get("X-Cache"))
+	}
+	if ct := rec2.Header().Get("Content-Type"); ct != "text/plain" {
+		t.Fatalf("Content-Type=%q, want text/plain", ct)
+	}
+}
+
+func TestHTTPCacheMiddleware_IgnoresConfiguredHeaders(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Date", time.Now().Format(time.RFC1123))
+		w.Header().Set("X-Request-Id", "request-1")
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("response"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	req1 := httptest.NewRequest("GET", "/ignored", nil)
+	rec1 := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
+
+	req2 := httptest.NewRequest("GET", "/ignored", nil)
+	rec2 := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec2, req2)
+
+	if rec2.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("X-Cache=%q, want HIT", rec2.Header().Get("X-Cache"))
+	}
+	if rec2.Header().Get("X-Request-Id") != "" {
+		t.Fatalf("X-Request-Id=%q, want empty", rec2.Header().Get("X-Request-Id"))
+	}
+	if rec2.Header().Get("Date") != "" {
+		t.Fatalf("Date=%q, want empty", rec2.Header().Get("Date"))
+	}
+	if rec2.Header().Get("Content-Type") != "text/plain" {
+		t.Fatalf("Content-Type=%q, want text/plain", rec2.Header().Get("Content-Type"))
+	}
+}
+
+func TestHTTPCacheMiddleware_LargeBodyIsNotCached(t *testing.T) {
+	config := DefaultConfig()
+	config.MaxBodySize = 4
+	middleware := newTestMiddleware(t, config)
+	defer middleware.Close()
+
+	var setCount int
+	middleware.OnSet(func(string, time.Duration) { setCount++ })
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("12345"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest("GET", "/large", nil)
+		rec := httptest.NewRecorder()
+		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
+		if rec.Header().Get("X-Cache") != "MISS" {
+			t.Fatalf("request %d X-Cache=%q, want MISS", i+1, rec.Header().Get("X-Cache"))
+		}
+	}
+	if setCount != 0 {
+		t.Fatalf("setCount=%d, want 0", setCount)
+	}
+}
+
+func TestHTTPCacheMiddleware_FlushDisablesCaching(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("part"))
+		w.(http.Flusher).Flush()
+		w.Write([]byte("tail"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest("GET", "/stream", nil)
+		rec := httptest.NewRecorder()
+		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
+		if rec.Header().Get("X-Cache") != "MISS" {
+			t.Fatalf("request %d X-Cache=%q, want MISS", i+1, rec.Header().Get("X-Cache"))
+		}
+	}
+}
+
+func TestHTTPCacheMiddleware_InformationalStatusDoesNotCommitFinalStatus(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", "</style.css>; rel=preload")
+		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte("created"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	req1 := httptest.NewRequest("GET", "/early-hints", nil)
+	rec1 := newInformationalResponseWriter()
+	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
+
+	if len(rec1.statuses) != 2 || rec1.statuses[0] != http.StatusEarlyHints || rec1.statuses[1] != http.StatusCreated {
+		t.Fatalf("statuses=%v, want [103 201]", rec1.statuses)
+	}
+
+	req2 := httptest.NewRequest("GET", "/early-hints", nil)
+	rec2 := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("status=%d, want 201", rec2.Code)
+	}
+	if rec2.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("X-Cache=%q, want HIT", rec2.Header().Get("X-Cache"))
+	}
+	if body := rec2.Body.String(); body != "created" {
+		t.Fatalf("body=%q, want created", body)
+	}
+}
+
+func TestHTTPCacheMiddleware_SwitchingProtocolsIsNotCached(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	var setCount int
+	middleware.OnSet(func(string, time.Duration) { setCount++ })
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest("GET", "/switch", nil)
+		rec := httptest.NewRecorder()
+		wrappedHandler.ServeHTTP(rec, req)
+		waitForMiddlewareWrites(t, middleware)
+		if rec.Header().Get("X-Cache") != "MISS" {
+			t.Fatalf("request %d X-Cache=%q, want MISS", i+1, rec.Header().Get("X-Cache"))
+		}
+	}
+	if setCount != 0 {
+		t.Fatalf("setCount=%d, want 0", setCount)
+	}
+}
+
+func TestHTTPCacheMiddleware_NonCacheableMethodBypassesCachedKey(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	middleware.SetKeyGenerator(func(*http.Request) string { return "shared-key" })
+
+	var calls int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := atomic.AddInt32(&calls, 1)
+		w.Write([]byte(fmt.Sprintf("%s:%d", r.Method, call)))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	req1 := httptest.NewRequest("GET", "/shared", nil)
+	rec1 := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec1, req1)
+	waitForMiddlewareWrites(t, middleware)
+
+	req2 := httptest.NewRequest("POST", "/shared", nil)
+	rec2 := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec2, req2)
+	waitForMiddlewareWrites(t, middleware)
+
+	if rec2.Header().Get("X-Cache") == "HIT" {
+		t.Fatal("POST received cached GET response")
+	}
+	if body := rec2.Body.String(); body != "POST:2" {
+		t.Fatalf("POST body=%q, want POST:2", body)
+	}
+}
+
+func TestHTTPCacheMiddleware_InvalidationCleansStalePatternKeys(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	middleware.SetPathExtractor(PathExtractorFromKey)
+	middleware.patternIdx.addKey("/stale", "GET:/stale")
+
+	if removed := middleware.Invalidate("/stale"); removed != 0 {
+		t.Fatalf("removed=%d, want 0", removed)
+	}
+	if keys := middleware.patternIdx.getMatchingKeys("/stale"); len(keys) != 0 {
+		t.Fatalf("stale pattern keys=%v, want none", keys)
+	}
+}
+
+func TestHTTPCacheMiddleware_InvalidateByFuncCleansPatternIndex(t *testing.T) {
+	middleware := newTestMiddleware(t, DefaultConfig())
+	defer middleware.Close()
+
+	middleware.SetKeyGenerator(KeyWithoutQuery())
+	middleware.SetPathExtractor(PathExtractorFromKey)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("response"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	req := httptest.NewRequest("GET", "/func/stale", nil)
+	rec := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec, req)
+	waitForMiddlewareWrites(t, middleware)
+
+	removed := middleware.InvalidateByFunc(func(key string) bool {
+		return strings.Contains(key, "/func/stale")
+	})
+	if removed != 1 {
+		t.Fatalf("removed=%d, want 1", removed)
+	}
+	if keys := middleware.patternIdx.getMatchingKeys("/func/stale"); len(keys) != 0 {
+		t.Fatalf("pattern keys=%v, want none", keys)
 	}
 }
 
@@ -39,7 +475,7 @@ func TestHTTPCacheMiddleware_BasicCaching(t *testing.T) {
 		w.Write([]byte(`{"message": "test"}`))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// First request - should miss cache
 	req1 := httptest.NewRequest("GET", "/test", nil)
@@ -78,7 +514,7 @@ func TestHTTPCacheMiddleware_TTLExpiration(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// First request
 	req1 := httptest.NewRequest("GET", "/test", nil)
@@ -112,6 +548,7 @@ func TestHTTPCacheMiddleware_TTLExpiration(t *testing.T) {
 
 func TestHTTPCacheMiddleware_CachePolicy(t *testing.T) {
 	config := DefaultConfig()
+	config.CacheableMethods = []string{"GET", "POST"}
 	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
@@ -125,7 +562,7 @@ func TestHTTPCacheMiddleware_CachePolicy(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// GET request - should not be cached
 	req1 := httptest.NewRequest("GET", "/test", nil)
@@ -171,7 +608,7 @@ func TestHTTPCacheMiddleware_KeyGenerator(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// Request with User-ID: 1
 	req1 := httptest.NewRequest("GET", "/test", nil)
@@ -227,7 +664,7 @@ func TestHTTPCacheMiddleware_Callbacks(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// First request
 	req1 := httptest.NewRequest("GET", "/test", nil)
@@ -277,7 +714,7 @@ func TestHTTPCacheMiddleware_CacheControlHeaders(t *testing.T) {
 				w.Write([]byte("response"))
 			})
 
-			wrappedHandler := middleware.Middleware(handler)
+			wrappedHandler := middleware.Wrap(handler)
 
 			// First request
 			req1 := httptest.NewRequest("GET", "/test-"+tt.name, nil)
@@ -312,7 +749,7 @@ func TestHTTPCacheMiddleware_NonCacheableMethods(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	methods := []string{"POST", "PUT", "DELETE", "PATCH"}
 	for _, method := range methods {
@@ -329,8 +766,8 @@ func TestHTTPCacheMiddleware_NonCacheableMethods(t *testing.T) {
 			wrappedHandler.ServeHTTP(rec2, req2)
 			waitForMiddlewareWrites(t, middleware)
 
-			if rec2.Header().Get("X-Cache") != "MISS" {
-				t.Errorf("%s request should not be cached", method)
+			if rec2.Header().Get("X-Cache") == "HIT" {
+				t.Errorf("%s request should not be served from cache", method)
 			}
 		})
 	}
@@ -346,7 +783,7 @@ func TestHTTPCacheMiddleware_Stats(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// First request (miss)
 	req1 := httptest.NewRequest("GET", "/test", nil)
@@ -384,7 +821,7 @@ func TestHTTPCacheMiddleware_Clear(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// Cache an item
 	req1 := httptest.NewRequest("GET", "/test", nil)
@@ -580,7 +1017,7 @@ func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
 		w.Write([]byte("response for " + r.URL.Path))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// Cache multiple paths
 	paths := []string{"/api/users/", "/api/users/1", "/api/users/2/profile", "/api/posts/1", "/api/posts/2"}
@@ -652,7 +1089,7 @@ func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	t.Run("DoubleInvalidation", func(t *testing.T) {
 		// Cache an item
@@ -716,7 +1153,7 @@ func TestHTTPCacheMiddleware_CacheHitMissVerification(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	tests := []struct {
 		name           string
@@ -777,7 +1214,7 @@ func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// Cache multiple items
 	for i := 0; i < 100; i++ {
@@ -834,7 +1271,7 @@ func TestHTTPCacheMiddleware_BasicPatternInvalidation(t *testing.T) {
 		w.Write([]byte("response"))
 	})
 
-	wrappedHandler := middleware.Middleware(handler)
+	wrappedHandler := middleware.Wrap(handler)
 
 	// Cache a few simple paths
 	paths := []string{"/api/users", "/api/posts"}

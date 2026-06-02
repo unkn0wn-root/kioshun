@@ -20,8 +20,13 @@ func newKioshunCache[K comparable, V any](b testing.TB, config cache.Config) *ca
 	return c
 }
 
+func newKioshunDefaultCache[K comparable, V any](b testing.TB) *cache.Cache[K, V] {
+	b.Helper()
+	return cache.NewDefault[K, V]()
+}
+
 func BenchmarkCacheSet(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	b.ResetTimer()
@@ -35,7 +40,7 @@ func BenchmarkCacheSet(b *testing.B) {
 }
 
 func BenchmarkCacheGet(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	// Pre-populate cache
@@ -54,7 +59,7 @@ func BenchmarkCacheGet(b *testing.B) {
 }
 
 func BenchmarkCacheGetMiss(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	b.ResetTimer()
@@ -68,7 +73,7 @@ func BenchmarkCacheGetMiss(b *testing.B) {
 }
 
 func BenchmarkCacheSetGet(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	b.ResetTimer()
@@ -87,7 +92,7 @@ func BenchmarkCacheSetGet(b *testing.B) {
 }
 
 func BenchmarkCacheHeavyRead(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	// Pre-populate cache
@@ -111,7 +116,7 @@ func BenchmarkCacheHeavyRead(b *testing.B) {
 }
 
 func BenchmarkCacheHeavyWrite(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	b.ResetTimer()
@@ -130,7 +135,7 @@ func BenchmarkCacheHeavyWrite(b *testing.B) {
 }
 
 func BenchmarkCacheExpiration(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	b.ResetTimer()
@@ -144,7 +149,7 @@ func BenchmarkCacheExpiration(b *testing.B) {
 }
 
 func BenchmarkCacheSize(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	// Pre-populate cache
@@ -159,7 +164,7 @@ func BenchmarkCacheSize(b *testing.B) {
 }
 
 func BenchmarkCacheStats(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	// Pre-populate cache and generate some stats
@@ -177,7 +182,7 @@ func BenchmarkCacheStats(b *testing.B) {
 }
 
 func BenchmarkCacheDelete(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	// Pre-populate cache
@@ -210,7 +215,7 @@ func BenchmarkCacheEviction(b *testing.B) {
 }
 
 func BenchmarkCacheWithTTL(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	// Pre-populate cache
@@ -229,7 +234,7 @@ func BenchmarkCacheWithTTL(b *testing.B) {
 }
 
 func BenchmarkCacheExists(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	// Pre-populate cache
@@ -248,7 +253,7 @@ func BenchmarkCacheExists(b *testing.B) {
 }
 
 func BenchmarkCacheKeys(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	// Pre-populate cache
@@ -269,7 +274,7 @@ func BenchmarkCacheScalability(b *testing.B) {
 	for _, size := range sizes {
 		for _, numGoroutines := range goroutines {
 			b.Run(fmt.Sprintf("size-%d-goroutines-%d", size, numGoroutines), func(b *testing.B) {
-				cache := cache.NewDefault[string, string]()
+				cache := newKioshunDefaultCache[string, string](b)
 				defer cache.Close()
 
 				// Pre-populate cache
@@ -303,7 +308,7 @@ func BenchmarkCacheScalability(b *testing.B) {
 }
 
 func BenchmarkCacheMemoryUsage(b *testing.B) {
-	cache := cache.NewDefault[string, string]()
+	cache := newKioshunDefaultCache[string, string](b)
 	defer cache.Close()
 
 	var m1, m2 runtime.MemStats
@@ -427,7 +432,7 @@ func BenchmarkCacheStatsEnabled(b *testing.B) {
 }
 
 func BenchmarkCacheRealisticWorkload(b *testing.B) {
-	cache := cache.NewDefault[string, []byte]()
+	cache := newKioshunDefaultCache[string, []byte](b)
 	defer cache.Close()
 
 	data := make([]byte, 1024) // 1KB values

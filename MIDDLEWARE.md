@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-    // Create middleware with defaults (FIFO eviction)
+    // Create middleware with defaults (SieveTinyLFU eviction)
     config := httpcache.DefaultConfig()
     config.DefaultTTL = 5 * time.Minute
     config.MaxSize = 100000
@@ -27,7 +27,7 @@ func main() {
     defer middleware.Close()
 
     // Wrap your handlers
-    http.Handle("/api/users", middleware.Middleware(usersHandler))
+    http.Handle("/api/users", middleware.Wrap(usersHandler))
     http.ListenAndServe(":8080", nil)
 }
 ```
@@ -37,7 +37,7 @@ func main() {
 ### Basic Setup
 
 ```go
-config := httpcache.DefaultConfig() // default uses FIFO
+config := httpcache.DefaultConfig() // default uses SieveTinyLFU
 config.DefaultTTL = 5 * time.Minute
 config.MaxSize = 100000
 config.ShardCount = 16
@@ -52,7 +52,7 @@ defer middleware.Close()
 // middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
 
 // Use with any HTTP framework
-http.Handle("/api/users", middleware.Middleware(usersHandler))
+http.Handle("/api/users", middleware.Wrap(usersHandler))
 ```
 
 ## Framework Compatibility
@@ -61,19 +61,19 @@ The middleware works seamlessly with all major Go HTTP frameworks:
 
 ```go
 // Standard net/http
-http.Handle("/api/users", middleware.Middleware(handler))
+http.Handle("/api/users", middleware.Wrap(handler))
 
 // Gin Framework
-router.Use(gin.WrapH(middleware.Middleware(http.DefaultServeMux)))
+router.Use(gin.WrapH(middleware.Wrap(http.DefaultServeMux)))
 
 // Echo Framework
-e.Use(echo.WrapMiddleware(middleware.Middleware))
+e.Use(echo.WrapMiddleware(middleware.Wrap))
 
 // Chi Router
-r.Use(middleware.Middleware)
+r.Use(middleware.Wrap)
 
 // Gorilla Mux
-r.Use(middleware.Middleware)
+r.Use(middleware.Wrap)
 ```
 
 ## Middleware Configuration
@@ -81,7 +81,7 @@ r.Use(middleware.Middleware)
 ### Advanced Configuration Examples
 
 ```go
-apiConfig := httpcache.DefaultConfig() // default config uses FIFO
+apiConfig := httpcache.DefaultConfig() // default config uses SieveTinyLFU
 apiConfig.MaxSize = 50000
 apiConfig.ShardCount = 32
 apiConfig.DefaultTTL = 10 * time.Minute
@@ -337,7 +337,7 @@ func main() {
     middleware.SetPathExtractor(httpcache.PathExtractorFromKey)
 
     // Setup handlers
-    http.Handle("/api/users", middleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    http.Handle("/api/users", middleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(map[string]any{
             "users": []string{"alice", "bob", "charlie"},
@@ -345,7 +345,7 @@ func main() {
         })
     })))
 
-    http.Handle("/api/users/", middleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    http.Handle("/api/users/", middleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(map[string]any{
             "user": "user-data",

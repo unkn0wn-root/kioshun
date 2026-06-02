@@ -61,7 +61,7 @@ func main() {
 
     // Queue a write for high-throughput paths
     c.SetAsync("user:456", "David Nice 3", 5*time.Minute)
-    c.Wait()
+    c.Sync()
 
     // Get value
     if value, found := c.Get("user:123"); found {
@@ -112,18 +112,18 @@ c.Get(key) (value, found bool)
 c.GetWithTTL(key) (value, ttl time.Duration, found bool)
 c.Keys() []K
 c.Clear()
-c.Wait() error
+c.Sync() error
 c.Delete(key) bool
 c.Exists(key) bool
 c.Size() int64
 c.Stats() Stats
 c.PolicyStats() PolicyStats
-c.TriggerCleanup()
+c.Cleanup()
 c.Close() error
 ```
 
 `Set` is synchronous and gives immediate read-after-write visibility for the key.
-Use `SetAsync` for queued high-throughput writes, and call `Wait` when a caller
+Use `SetAsync` for queued high-throughput writes, and call `Sync` when a caller
 needs a global fence for queued writes across all shards.
 
 Invalid configurations return `ConfigError` and match `ErrInvalidConfig` with
@@ -170,7 +170,7 @@ if err != nil {
 }
 defer middleware.Close()
 
-http.Handle("/api/users", middleware.Middleware(usersHandler))
+http.Handle("/api/users", middleware.Wrap(usersHandler))
 ```
 > See **[MIDDLEWARE.md](MIDDLEWARE.md)** for complete documentation, examples, and advanced configuration.
 

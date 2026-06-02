@@ -1,9 +1,11 @@
 package httpcache
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/md5"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -39,11 +41,16 @@ type Middleware struct {
 	onSet       func(string, time.Duration)
 	hitHeader   string
 	missHeader  string
+	ignore      map[string]struct{}
+	methods     map[string]struct{}
+	maxBodySize int64
+	limitBody   bool
 	patternIdx  *patternIndex
 	pathExtract func(string) string
 }
 
-// Config controls HTTP response caching behavior.
+// Config controls HTTP response caching behavior. Zero-valued fields are filled
+// from DefaultConfig; use the Disable* fields to turn off default-on features.
 type Config struct {
 	MaxSize         int64
 	ShardCount      int
@@ -52,8 +59,13 @@ type Config struct {
 	EvictionPolicy  kioshun.EvictionPolicy
 	ProbationRatio  uint8
 	GhostRatio      uint8
-	Adapt           bool
-	StatsEnabled    bool
+	DisableAdapt    bool // Disable SieveTinyLFU adaptive sizing.
+	DisableStats    bool // Disable cache statistics collection.
+	DisableCleanup  bool // Disable periodic cleanup.
+	// DisableCacheSizeLimit makes MaxSize unlimited in the backing cache.
+	DisableCacheSizeLimit bool
+	// DisableBodySizeLimit allows caching responses of any body size.
+	DisableBodySizeLimit bool
 
 	CacheableMethods []string
 	CacheableStatus  []int
@@ -71,9 +83,7 @@ func DefaultConfig() Config {
 		ShardCount:       16,
 		CleanupInterval:  5 * time.Minute,
 		DefaultTTL:       5 * time.Minute,
-		EvictionPolicy:   kioshun.FIFO,
-		Adapt:            true,
-		StatsEnabled:     true,
+		EvictionPolicy:   kioshun.SieveTinyLFU,
 		CacheableMethods: []string{"GET", "HEAD"},
 		CacheableStatus:  []int{200, 201, 300, 301, 302, 304, 404, 410},
 		IgnoreHeaders:    []string{"Date", "Server", "X-Request-Id", "X-Trace-Id"},
@@ -83,10 +93,118 @@ func DefaultConfig() Config {
 	}
 }
 
+// Validate reports invalid HTTP cache configuration values.
+func (c Config) Validate() error {
+	if c.MaxSize < 0 {
+		return fmt.Errorf("httpcache: MaxSize must be >= 0")
+	}
+	if c.ShardCount < 0 {
+		return fmt.Errorf("httpcache: ShardCount must be >= 0")
+	}
+	if c.CleanupInterval < 0 {
+		return fmt.Errorf("httpcache: CleanupInterval must be >= 0")
+	}
+	if c.DefaultTTL < 0 && c.DefaultTTL != kioshun.NoExpiration {
+		return fmt.Errorf("httpcache: DefaultTTL must be >= 0 or NoExpiration")
+	}
+	switch c.EvictionPolicy {
+	case kioshun.DefaultEvictionPolicy, kioshun.LRU, kioshun.LFU, kioshun.FIFO, kioshun.SieveTinyLFU:
+	default:
+		return fmt.Errorf("httpcache: EvictionPolicy must be a known eviction policy")
+	}
+	if c.ProbationRatio > 100 {
+		return fmt.Errorf("httpcache: ProbationRatio must be <= 100")
+	}
+	if c.GhostRatio > 100 {
+		return fmt.Errorf("httpcache: GhostRatio must be <= 100")
+	}
+	if c.MaxBodySize < 0 {
+		return fmt.Errorf("httpcache: MaxBodySize must be >= 0")
+	}
+	return nil
+}
+
+func normalizeConfig(config Config) (Config, error) {
+	if err := config.Validate(); err != nil {
+		return Config{}, err
+	}
+	config = configWithDefaults(config)
+	if err := config.Validate(); err != nil {
+		return Config{}, err
+	}
+	return config, nil
+}
+
+func configWithDefaults(config Config) Config {
+	defaults := DefaultConfig()
+	normalized := defaults
+
+	if config.MaxSize != 0 {
+		normalized.MaxSize = config.MaxSize
+	}
+	if config.ShardCount != 0 {
+		normalized.ShardCount = config.ShardCount
+	}
+	if config.CleanupInterval != 0 {
+		normalized.CleanupInterval = config.CleanupInterval
+	}
+	if config.DefaultTTL != 0 {
+		normalized.DefaultTTL = config.DefaultTTL
+	}
+	if config.EvictionPolicy != kioshun.DefaultEvictionPolicy {
+		normalized.EvictionPolicy = config.EvictionPolicy
+	}
+	if config.ProbationRatio != 0 {
+		normalized.ProbationRatio = config.ProbationRatio
+	}
+	if config.GhostRatio != 0 {
+		normalized.GhostRatio = config.GhostRatio
+	}
+	if config.CacheableMethods != nil {
+		normalized.CacheableMethods = cloneStrings(config.CacheableMethods)
+	}
+	if config.CacheableStatus != nil {
+		normalized.CacheableStatus = append([]int(nil), config.CacheableStatus...)
+	}
+	if config.IgnoreHeaders != nil {
+		normalized.IgnoreHeaders = cloneStrings(config.IgnoreHeaders)
+	}
+	if config.MaxBodySize != 0 {
+		normalized.MaxBodySize = config.MaxBodySize
+	}
+	if config.HitHeader != "" {
+		normalized.HitHeader = config.HitHeader
+	}
+	if config.MissHeader != "" {
+		normalized.MissHeader = config.MissHeader
+	}
+
+	normalized.DisableAdapt = config.DisableAdapt
+	normalized.DisableStats = config.DisableStats
+	normalized.DisableCleanup = config.DisableCleanup
+	normalized.DisableCacheSizeLimit = config.DisableCacheSizeLimit
+	normalized.DisableBodySizeLimit = config.DisableBodySizeLimit
+	if normalized.DisableCleanup {
+		normalized.CleanupInterval = 0
+	}
+	if normalized.DisableCacheSizeLimit {
+		normalized.MaxSize = 0
+	}
+	if normalized.DisableBodySizeLimit {
+		normalized.MaxBodySize = 0
+	}
+	return normalized
+}
+
+func cloneStrings(values []string) []string {
+	return append([]string(nil), values...)
+}
+
 // New constructs response-caching middleware.
 func New(config Config) (*Middleware, error) {
-	if config.MaxSize == 0 {
-		config = DefaultConfig()
+	config, err := normalizeConfig(config)
+	if err != nil {
+		return nil, err
 	}
 
 	cacheConfig := kioshun.Config{
@@ -97,8 +215,11 @@ func New(config Config) (*Middleware, error) {
 		EvictionPolicy:  config.EvictionPolicy,
 		ProbationRatio:  config.ProbationRatio,
 		GhostRatio:      config.GhostRatio,
-		Adapt:           config.Adapt,
-		StatsEnabled:    config.StatsEnabled,
+		Adapt:           !config.DisableAdapt,
+		StatsEnabled:    !config.DisableStats,
+	}
+	if config.DisableCleanup {
+		cacheConfig.CleanupInterval = 0
 	}
 
 	cache, err := kioshun.New[string, *Response](cacheConfig)
@@ -112,23 +233,25 @@ func New(config Config) (*Middleware, error) {
 		policy:      DefaultCachePolicy(config),
 		hitHeader:   config.HitHeader,
 		missHeader:  config.MissHeader,
+		ignore:      ignoredHeaders(config),
+		methods:     cacheableMethodSet(config.CacheableMethods),
+		maxBodySize: config.MaxBodySize,
+		limitBody:   !config.DisableBodySizeLimit,
 		patternIdx:  newPatternIndex(),
 		pathExtract: defaultPathExtractor,
-	}
-
-	if m.hitHeader == "" {
-		m.hitHeader = "X-Cache"
-	}
-	if m.missHeader == "" {
-		m.missHeader = "X-Cache"
 	}
 
 	return m, nil
 }
 
-// Middleware wraps an HTTP handler with response caching.
-func (m *Middleware) Middleware(next http.Handler) http.Handler {
+// Wrap wraps an HTTP handler with response caching.
+func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !m.cacheableRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		key := m.keyGen(r)
 		if cached, found := m.cache.Get(key); found {
 			m.serveCached(w, cached, key)
@@ -139,14 +262,19 @@ func (m *Middleware) Middleware(next http.Handler) http.Handler {
 			m.onMiss(key)
 		}
 
-		rw := newResponseWriter(w)
+		rw := newResponseWriter(w, m.missHeader, m.maxBodySize, m.limitBody)
 		next.ServeHTTP(rw, r)
+		rw.finish()
 
 		body := rw.buf.Bytes()
-		if shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body); shouldCache {
+		if rw.cacheable() {
+			shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body)
+			if !shouldCache {
+				return
+			}
 			cached := &Response{
 				StatusCode: rw.statusCode,
-				Headers:    rw.headers.Clone(),
+				Headers:    m.cachedHeaders(rw.headers),
 				Body:       make([]byte, len(body)),
 				CachedAt:   time.Now(),
 			}
@@ -162,8 +290,6 @@ func (m *Middleware) Middleware(next http.Handler) http.Handler {
 				}
 			}
 		}
-
-		w.Header().Set(m.missHeader, "MISS")
 	})
 }
 
@@ -174,7 +300,7 @@ func (m *Middleware) serveCached(w http.ResponseWriter, cached *Response, key st
 	}
 
 	for k, v := range cached.Headers {
-		w.Header()[k] = v
+		w.Header()[k] = append([]string(nil), v...)
 	}
 
 	w.Header().Set(m.hitHeader, "HIT")
@@ -183,6 +309,43 @@ func (m *Middleware) serveCached(w http.ResponseWriter, cached *Response, key st
 
 	w.WriteHeader(cached.StatusCode)
 	w.Write(cached.Body)
+}
+
+func ignoredHeaders(config Config) map[string]struct{} {
+	headers := make(map[string]struct{}, len(config.IgnoreHeaders)+5)
+	for _, name := range config.IgnoreHeaders {
+		if name != "" {
+			headers[http.CanonicalHeaderKey(name)] = struct{}{}
+		}
+	}
+	for _, name := range []string{
+		"X-Cache",
+		"X-Cache-Date",
+		"X-Cache-Age",
+		config.HitHeader,
+		config.MissHeader,
+	} {
+		if name != "" {
+			headers[http.CanonicalHeaderKey(name)] = struct{}{}
+		}
+	}
+	return headers
+}
+
+func (m *Middleware) cachedHeaders(headers http.Header) http.Header {
+	cached := make(http.Header, len(headers))
+	for name, values := range headers {
+		if _, ignored := m.ignore[http.CanonicalHeaderKey(name)]; ignored {
+			continue
+		}
+		cached[name] = append([]string(nil), values...)
+	}
+	return cached
+}
+
+func (m *Middleware) cacheableRequest(r *http.Request) bool {
+	_, ok := m.methods[r.Method]
+	return ok
 }
 
 // Stats returns cache statistics.
@@ -200,10 +363,10 @@ func (m *Middleware) Invalidate(urlPattern string) int {
 
 	matchingKeys := m.patternIdx.getMatchingKeys(urlPattern)
 	for _, key := range matchingKeys {
+		if path := m.pathExtract(key); path != "" {
+			m.patternIdx.removeKey(path, key)
+		}
 		if m.cache.Delete(key) {
-			if path := m.pathExtract(key); path != "" {
-				m.patternIdx.removeKey(path, key)
-			}
 			removed++
 		}
 	}
@@ -218,6 +381,9 @@ func (m *Middleware) InvalidateByFunc(fn func(string) bool) int {
 
 	for _, key := range keys {
 		if fn(key) && m.cache.Delete(key) {
+			if path := m.pathExtract(key); path != "" {
+				m.patternIdx.removeKey(path, key)
+			}
 			removed++
 		}
 	}
@@ -255,10 +421,8 @@ func DefaultKeyGenerator(r *http.Request) string {
 
 // DefaultCachePolicy builds a policy that respects HTTP cache headers.
 func DefaultCachePolicy(config Config) Policy {
-	cacheableMethods := make(map[string]bool, len(config.CacheableMethods))
-	for _, method := range config.CacheableMethods {
-		cacheableMethods[method] = true
-	}
+	config = configWithDefaults(config)
+	cacheableMethods := cacheableMethodSet(config.CacheableMethods)
 
 	cacheableStatus := make(map[int]bool, len(config.CacheableStatus))
 	for _, status := range config.CacheableStatus {
@@ -266,20 +430,18 @@ func DefaultCachePolicy(config Config) Policy {
 	}
 
 	return func(r *http.Request, statusCode int, headers http.Header, body []byte) (bool, time.Duration) {
-		if !cacheableMethods[r.Method] {
+		if _, ok := cacheableMethods[r.Method]; !ok {
 			return false, 0
 		}
 		if !cacheableStatus[statusCode] {
 			return false, 0
 		}
-		if int64(len(body)) > config.MaxBodySize {
+		if !config.DisableBodySizeLimit && int64(len(body)) > config.MaxBodySize {
 			return false, 0
 		}
 
 		cacheControl := headers.Get("Cache-Control")
-		if strings.Contains(cacheControl, "no-cache") ||
-			strings.Contains(cacheControl, "no-store") ||
-			strings.Contains(cacheControl, "private") {
+		if hasCacheControlDirective(cacheControl, "no-cache", "no-store", "private") {
 			return false, 0
 		}
 
@@ -300,6 +462,16 @@ func DefaultCachePolicy(config Config) Policy {
 	}
 }
 
+func cacheableMethodSet(methods []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(methods))
+	for _, method := range methods {
+		if method != "" {
+			set[method] = struct{}{}
+		}
+	}
+	return set
+}
+
 // PathBasedKeyGenerator keys responses by request method and path.
 func PathBasedKeyGenerator(r *http.Request) string {
 	return r.Method + ":" + r.URL.Path
@@ -309,34 +481,123 @@ func PathBasedKeyGenerator(r *http.Request) string {
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
-	buf        *bytes.Buffer
+	buf        bytes.Buffer
 	headers    http.Header
+	missHeader string
+	maxBody    int64
+	limitBody  bool
+	wrote      bool
+	tooLarge   bool
+	streamed   bool
 }
 
-func newResponseWriter(w http.ResponseWriter) *responseWriter {
+func newResponseWriter(w http.ResponseWriter, missHeader string, maxBody int64, limitBody bool) *responseWriter {
 	return &responseWriter{
 		ResponseWriter: w,
 		statusCode:     200,
-		buf:            new(bytes.Buffer),
-		headers:        make(http.Header),
+		missHeader:     missHeader,
+		maxBody:        maxBody,
+		limitBody:      limitBody,
 	}
 }
 
 // WriteHeader captures status code and headers.
 func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-
-	for k, v := range rw.ResponseWriter.Header() {
-		rw.headers[k] = v
+	if isInformationalStatus(code) {
+		rw.ResponseWriter.WriteHeader(code)
+		return
+	}
+	if rw.wrote {
+		return
 	}
 
+	rw.statusCode = code
+	rw.headers = rw.ResponseWriter.Header().Clone()
+	if code == http.StatusSwitchingProtocols {
+		rw.streamed = true
+	}
+	if rw.missHeader != "" {
+		rw.ResponseWriter.Header().Set(rw.missHeader, "MISS")
+	}
+	rw.wrote = true
 	rw.ResponseWriter.WriteHeader(code)
 }
 
 // Write captures response body while passing through.
 func (rw *responseWriter) Write(data []byte) (int, error) {
-	rw.buf.Write(data)
+	if !rw.wrote {
+		rw.WriteHeader(http.StatusOK)
+	}
+	rw.capture(data)
 	return rw.ResponseWriter.Write(data)
+}
+
+func (rw *responseWriter) capture(data []byte) {
+	if rw.streamed || rw.tooLarge || len(data) == 0 {
+		return
+	}
+	if !rw.limitBody {
+		rw.buf.Write(data)
+		return
+	}
+	remaining := rw.maxBody - int64(rw.buf.Len())
+	if remaining <= 0 {
+		rw.tooLarge = true
+		return
+	}
+	if int64(len(data)) > remaining {
+		rw.buf.Write(data[:int(remaining)])
+		rw.tooLarge = true
+		return
+	}
+	rw.buf.Write(data)
+}
+
+func (rw *responseWriter) finish() {
+	if !rw.wrote {
+		rw.WriteHeader(http.StatusOK)
+	}
+}
+
+func (rw *responseWriter) cacheable() bool {
+	return !rw.streamed && !rw.tooLarge
+}
+
+func isInformationalStatus(code int) bool {
+	return code >= 100 && code <= 199 && code != http.StatusSwitchingProtocols
+}
+
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
+func (rw *responseWriter) Flush() {
+	_ = rw.FlushError()
+}
+
+func (rw *responseWriter) FlushError() error {
+	rw.streamed = true
+	if !rw.wrote {
+		rw.WriteHeader(http.StatusOK)
+	}
+	return http.NewResponseController(rw.ResponseWriter).Flush()
+}
+
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	rw.streamed = true
+	conn, brw, err := http.NewResponseController(rw.ResponseWriter).Hijack()
+	if err == nil {
+		rw.wrote = true
+	}
+	return conn, brw, err
+}
+
+func (rw *responseWriter) Push(target string, opts *http.PushOptions) error {
+	pusher, ok := rw.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, opts)
 }
 
 // KeyWithVaryHeaders hashes the method, full URL, and selected vary headers.
@@ -458,11 +719,29 @@ func extractMaxAge(cacheControl string) time.Duration {
 	parts := strings.Split(cacheControl, ",")
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "max-age=") {
-			if seconds, err := strconv.Atoi(part[8:]); err == nil && seconds > 0 {
+		name, value, ok := strings.Cut(part, "=")
+		if ok && strings.EqualFold(strings.TrimSpace(name), "max-age") {
+			if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds > 0 {
 				return time.Duration(seconds) * time.Second
 			}
 		}
 	}
 	return 0
+}
+
+func hasCacheControlDirective(cacheControl string, directives ...string) bool {
+	if cacheControl == "" {
+		return false
+	}
+
+	for _, part := range strings.Split(cacheControl, ",") {
+		name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
+		name = strings.TrimSpace(name)
+		for _, directive := range directives {
+			if strings.EqualFold(name, directive) {
+				return true
+			}
+		}
+	}
+	return false
 }

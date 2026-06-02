@@ -551,7 +551,7 @@ func TestSieveTinyLFUCleanupRemovesExpiredQueueItem(t *testing.T) {
 	c.Set(1, 1, time.Millisecond)
 	waitForWrites(t, c)
 	time.Sleep(2 * time.Millisecond)
-	c.TriggerCleanup()
+	c.Cleanup()
 
 	s := c.shards[0]
 	s.mu.RLock()

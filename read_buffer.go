@@ -11,7 +11,7 @@ const (
 	// readStripeSlots is how many access fingerprints a stripe buffers before
 	// producers begin overwriting the oldest unread sample.
 	// It also sets the drain-signal cadence: one wake per filled stripe.
-	// Must be a power of two.
+	// Note: must be 2^n.
 	readStripeSlots = 64
 	readSlotMask    = readStripeSlots - 1
 
@@ -27,8 +27,8 @@ const (
 // are overwritten — acceptable because samples only feed the frequency sketch,
 // where a dropped sample costs a little accuracy but never correctness.
 type readStripe struct {
-	tail atomic.Uint64                  // next write index (producers; monotonic)
-	head uint64                         // next read index (consumer only)
+	tail atomic.Uint64                  // next write index (producers)
+	head uint64                         // next read index (consumer)
 	buf  [readStripeSlots]atomic.Uint64 // fingerprints; 0 == empty slot
 }
 
@@ -40,13 +40,10 @@ type readBuffer struct {
 	mask    uint64
 }
 
-// newReadBuffer sizes the stripe set to GOMAXPROCS (capped), rounded to a power
-// of two for mask-based indexing.
+// newReadBuffer sizes the stripe set to GOMAXPROCS (capped)
+// rounded to a 2^n for mask-based indexing.
 func newReadBuffer() readBuffer {
-	n := mathutil.NextPowerOf2(min(runtime.GOMAXPROCS(0), maxReadStripes))
-	if n < 1 {
-		n = 1
-	}
+	n := max(mathutil.NextPowerOf2(min(runtime.GOMAXPROCS(0), maxReadStripes)), 1)
 	return readBuffer{
 		stripes: make([]readStripe, n),
 		mask:    uint64(n - 1),
@@ -55,7 +52,7 @@ func newReadBuffer() readBuffer {
 
 // sample records an access fingerprint into the caller's P-local stripe and
 // reports whether that stripe just filled, so the caller can wake the drain
-// (coalesced). Wait-free and lossy by design.
+// (coalesced). Lossy by design.
 func (rb *readBuffer) sample(h uint64) bool {
 	if h == 0 {
 		h = 1 // reserve 0 as the empty slot sentinel

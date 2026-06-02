@@ -181,17 +181,18 @@ mutex, preserving single-consumer queue semantics while avoiding a worker wakeup
 on the strict mutation path.
 
 `Set` and `Delete` wait for the affected shard commands to be
-processed. `Wait`, `Clear`, and `Close` use global shard barriers when they need
-committed state across the whole cache. `Wait` is the global fence: all writes
+processed. `Sync`, `Clear`, and `Close` use global shard barriers when they need
+committed state across the whole cache. `Sync` is the global fence: all writes
 accepted before the barriers are visible after it returns.
 
 ## Eviction Policies
 
 ```go
 const (
-    LRU        EvictionPolicy = iota // Least Recently Used
-    LFU                              // Least Frequently Used
-    FIFO                             // First In, First Out
-    SieveTinyLFU                     // Probation-SIEVE TinyLFU admission (default)
+    DefaultEvictionPolicy EvictionPolicy = iota // Package default
+    LRU                                         // Least Recently Used
+    LFU                                         // Least Frequently Used
+    FIFO                                        // First In, First Out
+    SieveTinyLFU                                // Probation-SIEVE TinyLFU admission (default)
 )
 ```

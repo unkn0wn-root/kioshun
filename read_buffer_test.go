@@ -133,7 +133,7 @@ func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
 
 	const key = 7
 	c.Set(key, key, time.Hour)
-	if err := c.Wait(); err != nil {
+	if err := c.Sync(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,7 +144,7 @@ func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
 	}
 	// Interleave a write so the worker drains read samples alongside writes.
 	c.Set(key, key+1, time.Hour)
-	if err := c.Wait(); err != nil {
+	if err := c.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	if v, ok := c.Get(key); !ok || v != key+1 {
@@ -177,7 +177,7 @@ func TestReadMissesFeedAdmissionSketch(t *testing.T) {
 			t.Fatal("unexpected hit for miss-sampling key")
 		}
 	}
-	if err := c.Wait(); err != nil {
+	if err := c.Sync(); err != nil {
 		t.Fatal(err)
 	}
 

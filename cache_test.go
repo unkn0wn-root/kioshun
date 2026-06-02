@@ -20,8 +20,19 @@ func newTestCache[K comparable, V any](t testing.TB, config Config) *Cache[K, V]
 	return cache
 }
 
+func newDefaultTestCache[K comparable, V any](t testing.TB) *Cache[K, V] {
+	t.Helper()
+	return NewDefault[K, V]()
+}
+
+func TestDefaultConfigValid(t *testing.T) {
+	if err := DefaultConfig().Validate(); err != nil {
+		t.Fatalf("DefaultConfig() is invalid: %v", err)
+	}
+}
+
 func TestCacheBasicOperations(t *testing.T) {
-	cache := NewDefault[string, string]()
+	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
 	// Test Set and Get
@@ -48,7 +59,7 @@ func TestCacheBasicOperations(t *testing.T) {
 }
 
 func TestCacheExpiration(t *testing.T) {
-	cache := NewDefault[string, string]()
+	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
 	// Set value with short TTL
@@ -70,7 +81,7 @@ func TestCacheExpiration(t *testing.T) {
 }
 
 func TestCacheTTL(t *testing.T) {
-	cache := NewDefault[string, string]()
+	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
 	cache.Set("ttl_key", "value", 1*time.Minute)
@@ -124,7 +135,7 @@ func TestCacheLRUEviction(t *testing.T) {
 }
 
 func TestCacheStats(t *testing.T) {
-	cache := NewDefault[string, string]()
+	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
 	// Initial stats
@@ -153,7 +164,7 @@ func TestCacheStats(t *testing.T) {
 }
 
 func TestCacheExists(t *testing.T) {
-	cache := NewDefault[string, string]()
+	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
 	cache.Set("key1", "value1", 1*time.Minute)
@@ -169,7 +180,7 @@ func TestCacheExists(t *testing.T) {
 }
 
 func TestCacheKeys(t *testing.T) {
-	cache := NewDefault[string, string]()
+	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
 	cache.Set("key1", "value1", 1*time.Minute)
@@ -191,7 +202,7 @@ func TestCacheKeys(t *testing.T) {
 }
 
 func TestCacheConcurrency(t *testing.T) {
-	cache := NewDefault[string, int]()
+	cache := newDefaultTestCache[string, int](t)
 	defer cache.Close()
 
 	var wg sync.WaitGroup
@@ -251,7 +262,7 @@ func TestCacheCleanup(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Force cleanup
-	cache.TriggerCleanup()
+	cache.Cleanup()
 	time.Sleep(50 * time.Millisecond)
 
 	// Items should be cleaned up
@@ -266,7 +277,7 @@ func TestCacheCleanup(t *testing.T) {
 }
 
 func TestCacheCallback(t *testing.T) {
-	cache := NewDefault[string, string]()
+	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
 	var callbackCalled int32
@@ -330,13 +341,13 @@ func TestCacheManager(t *testing.T) {
 
 func TestCacheGenerics(t *testing.T) {
 	// Test with different types
-	stringCache := NewDefault[string, string]()
+	stringCache := newDefaultTestCache[string, string](t)
 	defer stringCache.Close()
 
-	intCache := NewDefault[int, string]()
+	intCache := newDefaultTestCache[int, string](t)
 	defer intCache.Close()
 
-	structCache := NewDefault[string, User]()
+	structCache := newDefaultTestCache[string, User](t)
 	defer structCache.Close()
 
 	// Test string cache
@@ -495,7 +506,7 @@ func TestManagerRegisterValidatesConfig(t *testing.T) {
 }
 
 func TestCacheCloseBehavior(t *testing.T) {
-	cache := NewDefault[string, string]()
+	cache := newDefaultTestCache[string, string](t)
 
 	// Set a value
 	cache.Set("key1", "value1", 1*time.Minute)
@@ -567,7 +578,7 @@ func TestSetAsyncReturnsAfterEnqueueBeforeCommit(t *testing.T) {
 	waitForWrites(t, cache)
 
 	if value, found := cache.Get("key"); !found || value != "value" {
-		t.Fatalf("expected value after Wait, got %q found=%v", value, found)
+		t.Fatalf("expected value after Sync, got %q found=%v", value, found)
 	}
 }
 

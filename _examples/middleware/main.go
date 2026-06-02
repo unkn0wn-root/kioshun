@@ -90,7 +90,7 @@ func main() {
 	}
 
 	// CACHING ENDPOINTS
-	http.Handle("/basic/users", basicMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/basic/users", basicMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond) // simulate database query
 
 		w.Header().Set("Content-Type", "application/json")
@@ -103,7 +103,7 @@ func main() {
 		})
 	})))
 
-	http.Handle("/basic/user/", basicMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/basic/user/", basicMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		userID := strings.TrimPrefix(r.URL.Path, "/basic/user/")
 		time.Sleep(50 * time.Millisecond)
 
@@ -128,7 +128,7 @@ func main() {
 	})))
 
 	// API ENDPOINTS
-	http.Handle("/api/products", apiMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/api/products", apiMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond) // simulate complex database query
 
 		products := []map[string]any{
@@ -147,7 +147,7 @@ func main() {
 		})
 	})))
 
-	http.Handle("/api/search", apiMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/api/search", apiMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
 		if query == "" {
 			query = "all"
@@ -170,7 +170,7 @@ func main() {
 	})))
 
 	// USER-SPECIFIC CACHING
-	http.Handle("/user/profile", userMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/user/profile", userMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		userID := r.Header.Get("X-User-ID")
 		if userID == "" {
 			userID = "anonymous"
@@ -192,7 +192,7 @@ func main() {
 	})))
 
 	// CONTENT-TYPE BASED CACHING
-	http.Handle("/content/json", contentMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/content/json", contentMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -202,27 +202,27 @@ func main() {
 		})
 	})))
 
-	http.Handle("/content/html", contentMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/content/html", contentMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
 		w.Header().Set("Content-Type", "text/html")
 		html := fmt.Sprintf(`<html><body><h1>HTML Content</h1><p>TTL: 10 minutes</p><p>Time: %s</p></body></html>`, time.Now().Format(time.RFC3339))
 		w.Write([]byte(html))
 	})))
 
-	http.Handle("/content/image", contentMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/content/image", contentMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte("fake-png-data-cached-for-1-hour-" + time.Now().Format("15:04:05")))
 	})))
 
 	// SIZE-BASED CONDITIONAL CACHING
-	http.Handle("/conditional/small", conditionalMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/conditional/small", conditionalMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"size":"small"}`)) // too small - won't be cached
 	})))
 
-	http.Handle("/conditional/large", conditionalMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/conditional/large", conditionalMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 
