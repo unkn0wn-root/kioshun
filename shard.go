@@ -12,7 +12,7 @@ type shard[K comparable, V any] struct {
 
 	queue writeQueue[K, V] // async mutation transport consumed by this shard's worker
 
-	// worker's coalesced wake-up: producers ping it after enqueuing a
+	// worker's wake-up: producers ping it after enqueuing a
 	// write and read sampling pings it when a stripe fills. Buffered size 1.
 	wake chan struct{}
 
@@ -43,6 +43,9 @@ type shard[K comparable, V any] struct {
 	sieve *sieveTinyLFU[K, V]
 }
 
+// itemDropMode selects which policy owns an item's intrusive links.
+// Sieve and LFU maintain extra metadata, so generic removal must know which
+// unlink path keeps auxiliary state consistent with data.
 type itemDropMode uint8
 
 const (
@@ -51,6 +54,10 @@ const (
 	dropSieve
 )
 
+// dropItem removes a resident item from data, unlinks its policy metadata, and
+// returns the cacheItem to the pool. The data check rejects stale queue or hand
+// pointers that may still reference an item after another path already removed
+// or replaced it.
 func (s *shard[K, V]) dropItem(
 	item *cacheItem[K, V],
 	itemPool *sync.Pool,
@@ -108,6 +115,9 @@ func (s *shard[K, V]) ownsItem(item *cacheItem[K, V]) bool {
 	return ok && s.data[key] == item
 }
 
+// belowSieveWarmupLocked reports the initial fill phase for bounded
+// SieveTinyLFU shards. During warmup admission is unconditional so the cache can
+// seed resident state before the frequency sketch starts rejecting candidates.
 func (s *shard[K, V]) belowSieveWarmupLocked() bool {
 	return s.cap > 0 && s.size*2 < s.cap
 }
@@ -192,6 +202,9 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[K, V]) {
 	oldNext.prev = item
 }
 
+// cleanup expires items under the shard lock and mirrors the same policy unlink
+// rules used by normal deletion. It gathers keys first so the scan phase stays
+// separate from unlinking and item pooling.
 func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool *sync.Pool, statsEnabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
