@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import _ "unsafe" // for go:linkname
 

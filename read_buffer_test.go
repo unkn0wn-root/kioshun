@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"sync"
@@ -120,7 +120,7 @@ func TestReadBufferConcurrentSampleDrain(t *testing.T) {
 // external read would race. The deterministic sample->drain->sketch assertion
 // lives in TestReadBufferSampleThenDrainFeedsSketch.
 func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         64,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -153,7 +153,7 @@ func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
 }
 
 func TestReadMissesFeedAdmissionSketch(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         64,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -165,7 +165,7 @@ func TestReadMissesFeedAdmissionSketch(t *testing.T) {
 	defer c.Close()
 
 	for i := 0; i < 32; i++ {
-		if err := c.SetSync(i, i, time.Hour); err != nil {
+		if err := c.Set(i, i, time.Hour); err != nil {
 			t.Fatal(err)
 		}
 	}

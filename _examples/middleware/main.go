@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	cache "github.com/unkn0wn-root/kioshun"
+	"github.com/unkn0wn-root/kioshun/httpcache"
 )
 
 type APIResponse struct {
@@ -23,31 +23,39 @@ type User struct {
 	Email string `json:"email"`
 }
 
+func mustMiddleware(config httpcache.Config) *httpcache.Middleware {
+	middleware, err := httpcache.New(config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return middleware
+}
+
 func main() {
 	fmt.Println("=== HTTP Cache Middleware Example ===")
 
-	basicConfig := cache.DefaultMiddlewareConfig()
+	basicConfig := httpcache.DefaultConfig()
 	basicConfig.DefaultTTL = 2 * time.Minute
-	basicMiddleware := cache.NewHTTPCacheMiddleware(basicConfig)
+	basicMiddleware := mustMiddleware(basicConfig)
 	defer basicMiddleware.Close()
 
-	apiConfig := cache.DefaultMiddlewareConfig()
+	apiConfig := httpcache.DefaultConfig()
 	apiConfig.MaxSize = 50000
 	apiConfig.ShardCount = 32
 	apiConfig.DefaultTTL = 5 * time.Minute
 	apiConfig.MaxBodySize = 5 * 1024 * 1024 // 5MB
-	apiMiddleware := cache.NewHTTPCacheMiddleware(apiConfig)
+	apiMiddleware := mustMiddleware(apiConfig)
 	defer apiMiddleware.Close()
 
-	userConfig := cache.DefaultMiddlewareConfig()
+	userConfig := httpcache.DefaultConfig()
 	userConfig.DefaultTTL = 10 * time.Minute
-	userMiddleware := cache.NewHTTPCacheMiddleware(userConfig)
-	userMiddleware.SetKeyGenerator(cache.KeyWithUserID("X-User-ID"))
+	userMiddleware := mustMiddleware(userConfig)
+	userMiddleware.SetKeyGenerator(httpcache.KeyWithUserID("X-User-ID"))
 	defer userMiddleware.Close()
 
-	contentConfig := cache.DefaultMiddlewareConfig()
-	contentMiddleware := cache.NewHTTPCacheMiddleware(contentConfig)
-	contentMiddleware.SetCachePolicy(cache.ByContentType(map[string]time.Duration{
+	contentConfig := httpcache.DefaultConfig()
+	contentMiddleware := mustMiddleware(contentConfig)
+	contentMiddleware.SetCachePolicy(httpcache.ByContentType(map[string]time.Duration{
 		"application/json": 5 * time.Minute,
 		"text/html":        10 * time.Minute,
 		"image/":           1 * time.Hour,
@@ -55,9 +63,9 @@ func main() {
 	defer contentMiddleware.Close()
 
 	// size-based conditional caching
-	conditionalConfig := cache.DefaultMiddlewareConfig()
-	conditionalMiddleware := cache.NewHTTPCacheMiddleware(conditionalConfig)
-	conditionalMiddleware.SetCachePolicy(cache.BySize(100, 1024*1024, 3*time.Minute))
+	conditionalConfig := httpcache.DefaultConfig()
+	conditionalMiddleware := mustMiddleware(conditionalConfig)
+	conditionalMiddleware.SetCachePolicy(httpcache.BySize(100, 1024*1024, 3*time.Minute))
 	defer conditionalMiddleware.Close()
 
 	basicMiddleware.OnHit(func(key string) {

@@ -1,4 +1,4 @@
-package cache
+package httpcache
 
 import (
 	"fmt"
@@ -10,11 +10,27 @@ import (
 	"time"
 )
 
+func newTestMiddleware(t testing.TB, config Config) *Middleware {
+	t.Helper()
+	middleware, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return middleware
+}
+
+func waitForMiddlewareWrites(t testing.TB, m *Middleware) {
+	t.Helper()
+	if err := m.cache.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+}
+
 func TestHTTPCacheMiddleware_BasicCaching(t *testing.T) {
-	config := DefaultMiddlewareConfig()
+	config := DefaultConfig()
 	config.DefaultTTL = 1 * time.Second
 
-	middleware := NewHTTPCacheMiddleware(config)
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -51,10 +67,10 @@ func TestHTTPCacheMiddleware_BasicCaching(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_TTLExpiration(t *testing.T) {
-	config := DefaultMiddlewareConfig()
+	config := DefaultConfig()
 	config.DefaultTTL = 50 * time.Millisecond
 
-	middleware := NewHTTPCacheMiddleware(config)
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -95,8 +111,8 @@ func TestHTTPCacheMiddleware_TTLExpiration(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_CachePolicy(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	// Custom policy that only caches POST requests
@@ -143,8 +159,8 @@ func TestHTTPCacheMiddleware_CachePolicy(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_KeyGenerator(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	// Custom key generator that includes user ID
@@ -188,8 +204,8 @@ func TestHTTPCacheMiddleware_KeyGenerator(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_Callbacks(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	var hitCount, missCount, setCount int
@@ -235,8 +251,8 @@ func TestHTTPCacheMiddleware_Callbacks(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_CacheControlHeaders(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	tests := []struct {
@@ -287,8 +303,8 @@ func TestHTTPCacheMiddleware_CacheControlHeaders(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_NonCacheableMethods(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -321,8 +337,8 @@ func TestHTTPCacheMiddleware_NonCacheableMethods(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_Stats(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -359,8 +375,8 @@ func TestHTTPCacheMiddleware_Stats(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_Clear(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -551,8 +567,8 @@ func TestExtractMaxAge(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	// Use path-based key generator for pattern matching
@@ -624,8 +640,8 @@ func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	middleware.SetKeyGenerator(KeyWithoutQuery())
@@ -687,8 +703,8 @@ func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_CacheHitMissVerification(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	var hitCount, missCount int
@@ -749,8 +765,8 @@ func TestHTTPCacheMiddleware_CacheHitMissVerification(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	middleware.SetKeyGenerator(KeyWithoutQuery())
@@ -806,8 +822,8 @@ func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_BasicPatternInvalidation(t *testing.T) {
-	config := DefaultMiddlewareConfig()
-	middleware := NewHTTPCacheMiddleware(config)
+	config := DefaultConfig()
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
 
 	middleware.SetKeyGenerator(KeyWithoutQuery())

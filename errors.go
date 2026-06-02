@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"errors"
@@ -42,5 +42,35 @@ func wrapError(op string, err error) *CacheError {
 	return &CacheError{
 		Op:    op,
 		Cause: err,
+	}
+}
+
+// ConfigError describes an invalid cache configuration field.
+type ConfigError struct {
+	Field  string
+	Value  any
+	Reason string
+}
+
+func (e *ConfigError) Error() string {
+	if e == nil {
+		return ErrInvalidConfig.Error()
+	}
+	if e.Reason == "" {
+		return fmt.Sprintf("%v: %s has invalid value %v", ErrInvalidConfig, e.Field, e.Value)
+	}
+	return fmt.Sprintf("%v: %s %s (got %v)", ErrInvalidConfig, e.Field, e.Reason, e.Value)
+}
+
+// Unwrap returns ErrInvalidConfig so errors.Is can match configuration errors.
+func (e *ConfigError) Unwrap() error {
+	return ErrInvalidConfig
+}
+
+func newConfigError(field string, value any, reason string) *ConfigError {
+	return &ConfigError{
+		Field:  field,
+		Value:  value,
+		Reason: reason,
 	}
 }

@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"sync/atomic"
@@ -49,17 +49,17 @@ type callbackTask[K comparable, V any] struct {
 	callback   func(K, V)
 }
 
-func (c *InMemoryCache[K, V]) set(key K, value V, ttl time.Duration, callback func(K, V)) error {
+func (c *Cache[K, V]) set(key K, value V, ttl time.Duration, callback func(K, V)) error {
 	s, cmd := c.setCommand(key, value, ttl, callback)
 	return c.enqueue(s, cmd)
 }
 
-func (c *InMemoryCache[K, V]) setAndWait(key K, value V, ttl time.Duration) error {
-	s, cmd := c.setCommand(key, value, ttl, nil)
+func (c *Cache[K, V]) setAndWait(key K, value V, ttl time.Duration, callback func(K, V)) error {
+	s, cmd := c.setCommand(key, value, ttl, callback)
 	return c.applySetSync(s, cmd)
 }
 
-func (c *InMemoryCache[K, V]) setCommand(key K, value V, ttl time.Duration, callback func(K, V)) (*shard[K, V], writeCommand[K, V]) {
+func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback func(K, V)) (*shard[K, V], writeCommand[K, V]) {
 	if ttl == DefaultExpiration {
 		ttl = c.config.DefaultTTL
 	}
@@ -89,7 +89,7 @@ func (c *InMemoryCache[K, V]) setCommand(key K, value V, ttl time.Duration, call
 
 // enqueue is the async producer boundary: closed caches fail immediately and a
 // full queue applies backpressure until the shard worker frees space.
-func (c *InMemoryCache[K, V]) enqueue(s *shard[K, V], cmd writeCommand[K, V]) error {
+func (c *Cache[K, V]) enqueue(s *shard[K, V], cmd writeCommand[K, V]) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
 	}
@@ -98,7 +98,7 @@ func (c *InMemoryCache[K, V]) enqueue(s *shard[K, V], cmd writeCommand[K, V]) er
 
 // awaitResult waits for a command's ack, abandoning the wait if the cache shuts
 // down so callers never hang on a command that won't be processed.
-func (c *InMemoryCache[K, V]) awaitResult(ch chan struct{}) error {
+func (c *Cache[K, V]) awaitResult(ch chan struct{}) error {
 	select {
 	case <-ch:
 		return nil
@@ -107,11 +107,11 @@ func (c *InMemoryCache[K, V]) awaitResult(ch chan struct{}) error {
 	}
 }
 
-func (c *InMemoryCache[K, V]) acquireWriteWaiter() *writeWaiter {
+func (c *Cache[K, V]) acquireWriteWaiter() *writeWaiter {
 	return c.waiterPool.Get().(*writeWaiter)
 }
 
-func (c *InMemoryCache[K, V]) releaseWriteWaiter(waiter *writeWaiter) {
+func (c *Cache[K, V]) releaseWriteWaiter(waiter *writeWaiter) {
 	select {
 	case <-waiter.ch:
 	default:
@@ -119,12 +119,12 @@ func (c *InMemoryCache[K, V]) releaseWriteWaiter(waiter *writeWaiter) {
 	c.waiterPool.Put(waiter)
 }
 
-// syncMutate is the synchronous write path shared by SetSync and Delete. It
+// syncMutate is the synchronous write path shared by Set and Delete. It
 // takes drainMu (the queue's single-consumer token), flushes queued writes so
 // the direct mutation observes prior writes in order, then mutates under the
 // shard lock. The closed-check is repeated after drainMu is held so a concurrent
 // Close cannot race past the barrier into a shard being torn down.
-func (c *InMemoryCache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
+func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
 	}
@@ -144,13 +144,29 @@ func (c *InMemoryCache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 	return nil
 }
 
-func (c *InMemoryCache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error {
-	return c.syncMutate(s, func() {
-		c.applySetLocked(s, cmd.key, cmd.value, cmd.expireTime, cmd.now, cmd.hash, cmd.tag)
+func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error {
+	var task *callbackTask[K, V]
+	err := c.syncMutate(s, func() {
+		committed := c.applySetLocked(s, cmd.key, cmd.value, cmd.expireTime, cmd.now, cmd.hash, cmd.tag)
+		if committed && cmd.expireTime > 0 && cmd.extra != nil && cmd.extra.callback != nil {
+			task = &callbackTask[K, V]{
+				key:        cmd.key,
+				value:      cmd.value,
+				expireTime: cmd.expireTime,
+				callback:   cmd.extra.callback,
+			}
+		}
 	})
+	if err != nil {
+		return err
+	}
+	if task != nil {
+		c.scheduleCallback(*task)
+	}
+	return nil
 }
 
-func (c *InMemoryCache[K, V]) deleteSync(s *shard[K, V], key K) (bool, error) {
+func (c *Cache[K, V]) deleteSync(s *shard[K, V], key K) (bool, error) {
 	var deleted bool
 	err := c.syncMutate(s, func() {
 		deleted = c.deleteLocked(s, key)
@@ -159,11 +175,11 @@ func (c *InMemoryCache[K, V]) deleteSync(s *shard[K, V], key K) (bool, error) {
 }
 
 // Wait blocks until all writes accepted before the barrier are committed.
-func (c *InMemoryCache[K, V]) Wait() error {
+func (c *Cache[K, V]) Wait() error {
 	return c.enqueueAllAndWait(writeBarrier)
 }
 
-func (c *InMemoryCache[K, V]) enqueueAllAndWait(op writeOp) error {
+func (c *Cache[K, V]) enqueueAllAndWait(op writeOp) error {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ErrCacheClosed
 	}
@@ -171,14 +187,14 @@ func (c *InMemoryCache[K, V]) enqueueAllAndWait(op writeOp) error {
 }
 
 // flush drains every shard's accepted writes during shutdown
-func (c *InMemoryCache[K, V]) flush() {
+func (c *Cache[K, V]) flush() {
 	_ = c.enqueueBarrierAll(writeBarrier)
 }
 
 // enqueueBarrierAll pushes a barrier command to every shard and waits for each
 // ack, giving an ordered fence: all writes a shard accepted before its barrier
 // are applied before this returns. Waits abandon on shutdown via awaitResult.
-func (c *InMemoryCache[K, V]) enqueueBarrierAll(op writeOp) error {
+func (c *Cache[K, V]) enqueueBarrierAll(op writeOp) error {
 	waiters := make([]*writeWaiter, 0, len(c.shards))
 	for _, s := range c.shards {
 		waiter := c.acquireWriteWaiter()
@@ -205,7 +221,7 @@ func (c *InMemoryCache[K, V]) enqueueBarrierAll(op writeOp) error {
 	return nil
 }
 
-func (c *InMemoryCache[K, V]) clearDirect() {
+func (c *Cache[K, V]) clearDirect() {
 	for _, shard := range c.shards {
 		shard.mu.Lock()
 		c.clearShardLocked(shard)
@@ -213,7 +229,7 @@ func (c *InMemoryCache[K, V]) clearDirect() {
 	}
 }
 
-func (c *InMemoryCache[K, V]) writeWorker(s *shard[K, V]) {
+func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 	defer c.workers.Done()
 
 	for {
@@ -231,7 +247,7 @@ func (c *InMemoryCache[K, V]) writeWorker(s *shard[K, V]) {
 // tryDrainShard replays sampled reads, then applies queued writes in batches,
 // without blocking behind another active drain. Reads replay
 // first (and between batches) so admission/eviction sees current frequencies.
-func (c *InMemoryCache[K, V]) tryDrainShard(s *shard[K, V]) {
+func (c *Cache[K, V]) tryDrainShard(s *shard[K, V]) {
 	if !s.drainMu.TryLock() {
 		return
 	}
@@ -239,13 +255,13 @@ func (c *InMemoryCache[K, V]) tryDrainShard(s *shard[K, V]) {
 	s.drainMu.Unlock()
 }
 
-func (c *InMemoryCache[K, V]) drainShard(s *shard[K, V]) {
+func (c *Cache[K, V]) drainShard(s *shard[K, V]) {
 	s.drainMu.Lock()
 	c.drainShardLocked(s)
 	s.drainMu.Unlock()
 }
 
-func (c *InMemoryCache[K, V]) drainShardLocked(s *shard[K, V]) {
+func (c *Cache[K, V]) drainShardLocked(s *shard[K, V]) {
 	batch := s.writeBatch
 	if len(batch) == 0 {
 		batchSize := c.config.WriteBatchSize
@@ -266,7 +282,7 @@ func (c *InMemoryCache[K, V]) drainShardLocked(s *shard[K, V]) {
 	}
 }
 
-func (c *InMemoryCache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]) {
+func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]) {
 	var ackBuf [8]chan struct{}
 	acks := ackBuf[:0]
 	var callbacks []callbackTask[K, V]
@@ -309,7 +325,7 @@ func (c *InMemoryCache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeComma
 	}
 }
 
-func (c *InMemoryCache[K, V]) applySetLocked(
+func (c *Cache[K, V]) applySetLocked(
 	shard *shard[K, V],
 	key K,
 	value V,
@@ -397,7 +413,7 @@ func (c *InMemoryCache[K, V]) applySetLocked(
 	return true
 }
 
-func (c *InMemoryCache[K, V]) deleteLocked(shard *shard[K, V], key K) bool {
+func (c *Cache[K, V]) deleteLocked(shard *shard[K, V], key K) bool {
 	item, exists := shard.data[key]
 	if !exists {
 		return false
@@ -406,7 +422,7 @@ func (c *InMemoryCache[K, V]) deleteLocked(shard *shard[K, V], key K) bool {
 	return true
 }
 
-func (c *InMemoryCache[K, V]) clearShardLocked(shard *shard[K, V]) {
+func (c *Cache[K, V]) clearShardLocked(shard *shard[K, V]) {
 	for _, item := range shard.data {
 		releaseCacheItem(&c.itemPool, item)
 	}
@@ -421,7 +437,7 @@ func (c *InMemoryCache[K, V]) clearShardLocked(shard *shard[K, V]) {
 	atomic.StoreInt64(&shard.size, 0)
 }
 
-func (c *InMemoryCache[K, V]) scheduleCallback(task callbackTask[K, V]) {
+func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
 	delay := time.Duration(task.expireTime - time.Now().UnixNano())
 	if delay < 0 {
 		delay = 0

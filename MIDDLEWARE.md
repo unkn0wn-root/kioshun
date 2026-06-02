@@ -10,16 +10,20 @@ package main
 import (
     "net/http"
     "time"
-    cache "github.com/unkn0wn-root/kioshun"
+
+    "github.com/unkn0wn-root/kioshun/httpcache"
 )
 
 func main() {
     // Create middleware with defaults (FIFO eviction)
-    config := cache.DefaultMiddlewareConfig()
+    config := httpcache.DefaultConfig()
     config.DefaultTTL = 5 * time.Minute
     config.MaxSize = 100000
 
-    middleware := cache.NewHTTPCacheMiddleware(config)
+    middleware, err := httpcache.New(config)
+    if err != nil {
+        panic(err)
+    }
     defer middleware.Close()
 
     // Wrap your handlers
@@ -33,16 +37,19 @@ func main() {
 ### Basic Setup
 
 ```go
-config := cache.DefaultMiddlewareConfig() // default uses FIFO
+config := httpcache.DefaultConfig() // default uses FIFO
 config.DefaultTTL = 5 * time.Minute
 config.MaxSize = 100000
 config.ShardCount = 16
 
-middleware := cache.NewHTTPCacheMiddleware(config)
+middleware, err := httpcache.New(config)
+if err != nil {
+    // handle invalid configuration
+}
 defer middleware.Close()
 
 // IMPORTANT: Enable invalidation if needed
-// middleware.SetKeyGenerator(cache.KeyWithoutQuery())
+// middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
 
 // Use with any HTTP framework
 http.Handle("/api/users", middleware.Middleware(usersHandler))
@@ -74,42 +81,57 @@ r.Use(middleware.Middleware)
 ### Advanced Configuration Examples
 
 ```go
-apiConfig := cache.DefaultMiddlewareConfig() // default config uses FIFO
+apiConfig := httpcache.DefaultConfig() // default config uses FIFO
 apiConfig.MaxSize = 50000
 apiConfig.ShardCount = 32
 apiConfig.DefaultTTL = 10 * time.Minute
 apiConfig.MaxBodySize = 5 * 1024 * 1024 // 5MB
 
-apiMiddleware := cache.NewHTTPCacheMiddleware(apiConfig)
+apiMiddleware, err := httpcache.New(apiConfig)
+if err != nil {
+    // handle invalid configuration
+}
 // Enable invalidation for API endpoints
-apiMiddleware.SetKeyGenerator(cache.KeyWithoutQuery())
+apiMiddleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
 
 // User-specific caching
-userMiddleware := cache.NewHTTPCacheMiddleware(config)
-userMiddleware.SetKeyGenerator(cache.KeyWithUserID("X-User-ID"))
+userMiddleware, err := httpcache.New(config)
+if err != nil {
+    // handle invalid configuration
+}
+userMiddleware.SetKeyGenerator(httpcache.KeyWithUserID("X-User-ID"))
 // Note: User-specific caching uses different key format - invalidation works differently
 
 // Content-type based caching with different TTLs
-contentMiddleware := cache.NewHTTPCacheMiddleware(config)
-contentMiddleware.SetKeyGenerator(cache.KeyWithoutQuery()) // Enable invalidation
-contentMiddleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Duration{
+contentMiddleware, err := httpcache.New(config)
+if err != nil {
+    // handle invalid configuration
+}
+contentMiddleware.SetKeyGenerator(httpcache.KeyWithoutQuery()) // Enable invalidation
+contentMiddleware.SetCachePolicy(httpcache.ByContentType(map[string]time.Duration{
     "application/json": 5 * time.Minute,
     "text/html":       10 * time.Minute,
     "image/":          1 * time.Hour,
 }, 2*time.Minute))
 
 // Size-based conditional caching
-conditionalMiddleware := cache.NewHTTPCacheMiddleware(config)
-conditionalMiddleware.SetKeyGenerator(cache.KeyWithoutQuery()) // Enable invalidation
-conditionalMiddleware.SetCachePolicy(cache.CacheBySize(100, 1024*1024, 3*time.Minute))
+conditionalMiddleware, err := httpcache.New(config)
+if err != nil {
+    // handle invalid configuration
+}
+conditionalMiddleware.SetKeyGenerator(httpcache.KeyWithoutQuery()) // Enable invalidation
+conditionalMiddleware.SetCachePolicy(httpcache.BySize(100, 1024*1024, 3*time.Minute))
 
 // Configure eviction policy
-cacheConfig := cache.DefaultMiddlewareConfig()
-cacheConfig.EvictionPolicy = cache.FIFO
+cacheConfig := httpcache.DefaultConfig()
+cacheConfig.EvictionPolicy = kioshun.FIFO
 cacheConfig.MaxSize = 100000
 cacheConfig.DefaultTTL = 5 * time.Minute
 
-middleware := cache.NewHTTPCacheMiddleware(cacheConfig)
+middleware, err := httpcache.New(cacheConfig)
+if err != nil {
+    // handle invalid configuration
+}
 
 ```
 
@@ -119,16 +141,16 @@ Cache keys determine how responses are stored and retrieved. Choose the right ke
 
 ```go
 // Default key generator (method + URL + vary headers)
-middleware.SetKeyGenerator(cache.DefaultKeyGenerator)
+middleware.SetKeyGenerator(httpcache.DefaultKeyGenerator)
 
 // User-specific keys
-middleware.SetKeyGenerator(cache.KeyWithUserID("X-User-ID"))
+middleware.SetKeyGenerator(httpcache.KeyWithUserID("X-User-ID"))
 
 // Custom vary headers
-middleware.SetKeyGenerator(cache.KeyWithVaryHeaders([]string{"Accept", "Authorization"}))
+middleware.SetKeyGenerator(httpcache.KeyWithVaryHeaders([]string{"Accept", "Authorization"}))
 
 // Ignore query parameters
-middleware.SetKeyGenerator(cache.KeyWithoutQuery())
+middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
 ```
 
 ## Eviction Policies
@@ -136,19 +158,19 @@ middleware.SetKeyGenerator(cache.KeyWithoutQuery())
 The middleware supports different eviction algorithms that can be configured based on different access patterns:
 
 ```go
-config := cache.DefaultMiddlewareConfig()
+config := httpcache.DefaultConfig()
 
 // FIFO (First In, First Out)
-config.EvictionPolicy = cache.FIFO
+config.EvictionPolicy = kioshun.FIFO
 
 // LRU (Least Recently Used)
-config.EvictionPolicy = cache.LRU
+config.EvictionPolicy = kioshun.LRU
 
 // LFU (Least Frequently Used)
-config.EvictionPolicy = cache.LFU
+config.EvictionPolicy = kioshun.LFU
 
 // SieveTinyLFU - Probation SIEVE with TinyLFU admission
-config.EvictionPolicy = cache.SieveTinyLFU
+config.EvictionPolicy = kioshun.SieveTinyLFU
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed information about eviction policies and their performance characteristics.
@@ -159,19 +181,19 @@ Control what gets cached and for how long with flexible cache policies:
 
 ```go
 // Always cache successful responses
-middleware.SetCachePolicy(cache.AlwaysCache(5 * time.Minute))
+middleware.SetCachePolicy(httpcache.AlwaysCache(5 * time.Minute))
 
 // Never cache
-middleware.SetCachePolicy(cache.NeverCache())
+middleware.SetCachePolicy(httpcache.NeverCache())
 
 // Content-type based caching
-middleware.SetCachePolicy(cache.CacheByContentType(map[string]time.Duration{
+middleware.SetCachePolicy(httpcache.ByContentType(map[string]time.Duration{
     "application/json": 5 * time.Minute,
     "text/html":       10 * time.Minute,
 }, 2*time.Minute))
 
 // Size-based caching
-middleware.SetCachePolicy(cache.CacheBySize(100, 1024*1024, 3*time.Minute))
+middleware.SetCachePolicy(httpcache.BySize(100, 1024*1024, 3*time.Minute))
 ```
 
 ## Monitoring
@@ -227,8 +249,11 @@ The default key generator uses MD5 hashing which makes pattern-based invalidatio
 
 ```go
 // DEFAULT SETUP - Invalidation won't work
-config := cache.DefaultMiddlewareConfig()
-middleware := cache.NewHTTPCacheMiddleware(config)
+config := httpcache.DefaultConfig()
+middleware, err := httpcache.New(config)
+if err != nil {
+    // handle invalid configuration
+}
 
 // This returns 0 removed entries because keys are hashed
 removed := middleware.Invalidate("/api/users/*") // Returns 0
@@ -245,12 +270,15 @@ Use a path-based key generator **and** teach the pattern index how to recover th
 
 ```go
 // CORRECT SETUP - Invalidation works
-config := cache.DefaultMiddlewareConfig()
-middleware := cache.NewHTTPCacheMiddleware(config)
+config := httpcache.DefaultConfig()
+middleware, err := httpcache.New(config)
+if err != nil {
+    // handle invalid configuration
+}
 
 // IMPORTANT: Set path-based key generator and path extractor
-middleware.SetKeyGenerator(cache.KeyWithoutQuery())
-middleware.SetPathExtractor(cache.PathExtractorFromKey)
+middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
+middleware.SetPathExtractor(httpcache.PathExtractorFromKey)
 
 // Now invalidation works
 removed := middleware.Invalidate("/api/users/*") // Returns actual count
@@ -268,9 +296,12 @@ removed := middleware.Invalidate("/api/users/*") // Returns actual count
 ### Minimal Pattern Invalidation Setup
 
 ```go
-middleware := cache.NewHTTPCacheMiddleware(cache.DefaultMiddlewareConfig())
-middleware.SetKeyGenerator(cache.KeyWithoutQuery())          // readable keys
-middleware.SetPathExtractor(cache.PathExtractorFromKey)      // map keys -> paths
+middleware, err := httpcache.New(httpcache.DefaultConfig())
+if err != nil {
+    // handle invalid configuration
+}
+middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())          // readable keys
+middleware.SetPathExtractor(httpcache.PathExtractorFromKey)      // map keys -> paths
 
 // later…
 removed := middleware.Invalidate("/api/users/*")
@@ -287,20 +318,23 @@ import (
     "net/http"
     "time"
 
-    "github.com/unkn0wn-root/kioshun"
+    "github.com/unkn0wn-root/kioshun/httpcache"
 )
 
 func main() {
     // Setup middleware
-    config := cache.DefaultMiddlewareConfig()
+    config := httpcache.DefaultConfig()
     config.DefaultTTL = 10 * time.Minute
 
-    middleware := cache.NewHTTPCacheMiddleware(config)
+    middleware, err := httpcache.New(config)
+    if err != nil {
+        panic(err)
+    }
     defer middleware.Close()
 
     // Enable invalidation
-    middleware.SetKeyGenerator(cache.KeyWithoutQuery())
-    middleware.SetPathExtractor(cache.PathExtractorFromKey)
+    middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
+    middleware.SetPathExtractor(httpcache.PathExtractorFromKey)
 
     // Setup handlers
     http.Handle("/api/users", middleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

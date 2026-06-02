@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"fmt"
@@ -22,7 +22,7 @@ func TestAllEvictionPolicies(t *testing.T) {
 				StatsEnabled:    true,
 			}
 
-			cache := New[string, int](config)
+			cache := newTestCache[string, int](t, config)
 			defer cache.Close()
 
 			// Fill cache beyond capacity to trigger eviction
@@ -79,7 +79,7 @@ func TestLFUSpecificBehavior(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Add items
@@ -124,7 +124,7 @@ func TestLRUSpecificBehavior(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Add items in order
@@ -161,7 +161,7 @@ func TestSieveTinyLFUSpecificBehavior(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity
@@ -226,7 +226,7 @@ func TestSieveTinyLFUAdmissionControl(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity with different frequency items
@@ -311,7 +311,7 @@ func TestSieveTinyLFUSampleSize(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity
@@ -380,7 +380,7 @@ func TestSieveTinyLFUStressEviction(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Establish a baseline with known access patterns
@@ -462,7 +462,7 @@ func TestFrequencyAdmissionFilter(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity first
@@ -530,7 +530,7 @@ func TestVictimFrequencyTracking(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Add initial items with different frequencies
@@ -578,7 +578,7 @@ func TestFrequencyBasedAdmissionDecisions(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache and establish frequency patterns
@@ -651,7 +651,7 @@ func TestDoorkeeperBehavior(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
@@ -687,7 +687,7 @@ func TestAdmissionFilterStats(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to trigger admission filter usage
@@ -736,7 +736,7 @@ func TestSieveTinyLFUWithFrequencyAdmission(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Establish baseline with known access patterns
@@ -824,7 +824,7 @@ func TestSieveTinyLFUFrequencyThreshold(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
@@ -880,7 +880,7 @@ func TestSieveTinyLFUScanDetection(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache with stable items
@@ -943,7 +943,7 @@ func TestSieveTinyLFURepeatedKeyBehavior(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
@@ -1011,7 +1011,7 @@ func TestSieveTinyLFUAdaptiveProbability(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
@@ -1070,7 +1070,7 @@ func TestSieveTinyLFURecencyTieBreaking(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache

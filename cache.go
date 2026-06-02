@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"runtime"
@@ -19,38 +19,32 @@ const (
 	defaultWriteBufferSize = 1024
 	defaultWriteBatchSize  = 64
 
-	// cap shard count, scale by CPUs, and round to 2^n for mask-based modulo.
+	// scale by CPUs and round to 2^n for mask-based modulo.
 	maxShardCount   = 256
 	shardMultiplier = 4
 )
 
+// EvictionPolicy selects the policy used when a bounded cache shard is full.
 type EvictionPolicy int
 
 const (
+	// LRU evicts the least recently used item.
 	LRU EvictionPolicy = iota
+	// LFU evicts the least frequently used item.
 	LFU
+	// FIFO evicts the oldest inserted item.
 	FIFO
-	SieveTinyLFU // probation SIEVE + TinyLFU admission
+	// SieveTinyLFU uses SIEVE queues with TinyLFU admission.
+	SieveTinyLFU
 )
 
-// Cache is the public API of the sharded in-memory cache.
-type Cache[K comparable, V any] interface {
+// Store is the narrow cache interface intended for application boundaries.
+type Store[K comparable, V any] interface {
 	Set(key K, value V, ttl time.Duration) error
 	Get(key K) (V, bool)
 	Delete(key K) bool
 	Clear()
-	Wait() error
-	Size() int64
-	Stats() Stats
-	PolicyStats() PolicyStats
 	Close() error
-}
-
-// CommittedCache extends Cache with a synchronous Set path for callers that need
-// read-after-write visibility for one key without paying for a global Wait.
-type CommittedCache[K comparable, V any] interface {
-	Cache[K, V]
-	SetSync(key K, value V, ttl time.Duration) error
 }
 
 type cacheItem[V any] struct {
@@ -122,20 +116,57 @@ type Config struct {
 	WriteBatchSize int
 }
 
+// DefaultConfig returns the default cache configuration.
 func DefaultConfig() Config {
 	return Config{
 		MaxSize:         defaultMaxSize,
 		ShardCount:      0,
 		CleanupInterval: defaultCleanupInterval,
-		DefaultTTL:      defaultTTL, EvictionPolicy: SieveTinyLFU, StatsEnabled: true, ProbationRatio: defaultProbationRatio, GhostRatio: defaultGhostRatio,
+		DefaultTTL:      defaultTTL,
+		EvictionPolicy:  SieveTinyLFU,
+		StatsEnabled:    true,
+		ProbationRatio:  defaultProbationRatio,
+		GhostRatio:      defaultGhostRatio,
 		Adapt:           true,
 		WriteBufferSize: defaultWriteBufferSize,
 		WriteBatchSize:  defaultWriteBatchSize,
 	}
 }
 
-// InMemoryCache is a sharded, lock-based cache with per-policy metadata.
-type InMemoryCache[K comparable, V any] struct {
+// Validate reports invalid cache configuration values.
+func (c Config) Validate() error {
+	if c.MaxSize < 0 {
+		return newConfigError("MaxSize", c.MaxSize, "must be >= 0")
+	}
+	if c.ShardCount < 0 {
+		return newConfigError("ShardCount", c.ShardCount, "must be >= 0")
+	}
+	if c.CleanupInterval < 0 {
+		return newConfigError("CleanupInterval", c.CleanupInterval, "must be >= 0")
+	}
+	if c.DefaultTTL < 0 && c.DefaultTTL != NoExpiration {
+		return newConfigError("DefaultTTL", c.DefaultTTL, "must be >= 0 or NoExpiration")
+	}
+	if c.EvictionPolicy < LRU || c.EvictionPolicy > SieveTinyLFU {
+		return newConfigError("EvictionPolicy", c.EvictionPolicy, "must be a known eviction policy")
+	}
+	if c.ProbationRatio > 100 {
+		return newConfigError("ProbationRatio", c.ProbationRatio, "must be <= 100")
+	}
+	if c.GhostRatio > 100 {
+		return newConfigError("GhostRatio", c.GhostRatio, "must be <= 100")
+	}
+	if c.WriteBufferSize < 0 {
+		return newConfigError("WriteBufferSize", c.WriteBufferSize, "must be >= 0")
+	}
+	if c.WriteBatchSize < 0 {
+		return newConfigError("WriteBatchSize", c.WriteBatchSize, "must be >= 0")
+	}
+	return nil
+}
+
+// Cache is a sharded, lock-based in-memory cache with per-policy metadata.
+type Cache[K comparable, V any] struct {
 	shards      []*shard[K, V] // shard-local maps + lists + counters
 	shardMask   uint64         // shards is 2^n; mask = shards-1
 	config      Config
@@ -160,11 +191,14 @@ type getResult[V any] struct {
 
 // New builds a cache, sizes shards/capacity, initializes policy data and
 // starts the cleaner when configured.
-func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
-	if config.WriteBufferSize <= 0 {
+func New[K comparable, V any](config Config) (*Cache[K, V], error) {
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	if config.WriteBufferSize == 0 {
 		config.WriteBufferSize = defaultWriteBufferSize
 	}
-	if config.WriteBatchSize <= 0 {
+	if config.WriteBatchSize == 0 {
 		config.WriteBatchSize = defaultWriteBatchSize
 	}
 
@@ -187,7 +221,7 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 	}
 	shardCount = mathutil.NextPowerOf2(shardCount)
 
-	cache := &InMemoryCache[K, V]{
+	cache := &Cache[K, V]{
 		shards:    make([]*shard[K, V], shardCount),
 		shardMask: uint64(shardCount - 1),
 		config:    config,
@@ -254,20 +288,24 @@ func New[K comparable, V any](config Config) *InMemoryCache[K, V] {
 		go cache.cleanupWorker()
 	}
 
+	return cache, nil
+}
+
+// NewDefault constructs a cache using DefaultConfig().
+func NewDefault[K comparable, V any]() *Cache[K, V] {
+	cache, err := New[K, V](DefaultConfig())
+	if err != nil {
+		panic(err)
+	}
 	return cache
 }
 
-// NewWithDefaults constructs a cache using DefaultConfig().
-func NewWithDefaults[K comparable, V any]() *InMemoryCache[K, V] {
-	return New[K, V](DefaultConfig())
-}
-
-func (c *InMemoryCache[K, V]) getShard(key K) *shard[K, V] {
+func (c *Cache[K, V]) getShard(key K) *shard[K, V] {
 	hash := c.hasher.hash(key)
 	return c.shards[hash&c.shardMask]
 }
 
-func (c *InMemoryCache[K, V]) get(key K) getResult[V] {
+func (c *Cache[K, V]) get(key K) getResult[V] {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return getResult[V]{}
 	}
@@ -367,7 +405,7 @@ func (c *InMemoryCache[K, V]) get(key K) getResult[V] {
 	}
 }
 
-func (c *InMemoryCache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V] {
+func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V] {
 	if !shard.mu.TryRLock() {
 		return c.getSieveContended(key, kh, shard)
 	}
@@ -424,7 +462,7 @@ func (c *InMemoryCache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) get
 	return res
 }
 
-func (c *InMemoryCache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K, V]) getResult[V] {
+func (c *Cache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K, V]) getResult[V] {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -469,7 +507,7 @@ func (c *InMemoryCache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K
 }
 
 // Get returns the value for key, if present and not expired.
-func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
+func (c *Cache[K, V]) Get(key K) (V, bool) {
 	var zero V
 	res := c.get(key)
 	if !res.ok {
@@ -479,7 +517,7 @@ func (c *InMemoryCache[K, V]) Get(key K) (V, bool) {
 }
 
 // GetWithTTL returns the value and the remaining TTL (-1 if never expires).
-func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
+func (c *Cache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 	var zero V
 	res := c.get(key)
 	if !res.ok {
@@ -494,30 +532,28 @@ func (c *InMemoryCache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 	return res.value, ttl, true
 }
 
-// Set accepts an async insert/update command for key with TTL.
-// A nil error means the command was enqueued.
-// Call Wait for committed read-after-write visibility.
-func (c *InMemoryCache[K, V]) Set(key K, value V, ttl time.Duration) error {
+// Set inserts or updates key and waits until the owning shard has committed
+// the write, giving immediate read-after-write visibility for that key.
+func (c *Cache[K, V]) Set(key K, value V, ttl time.Duration) error {
+	return c.setAndWait(key, value, ttl, nil)
+}
+
+// SetAsync accepts a queued insert/update command for key with TTL. A nil error
+// means the command was accepted; call Wait for committed visibility.
+func (c *Cache[K, V]) SetAsync(key K, value V, ttl time.Duration) error {
 	return c.set(key, value, ttl, nil)
 }
 
-// SetSync inserts or updates key and waits until the owning shard has processed
-// the write. It is the low-latency read-after-write path.
-// Use Wait only when a caller needs a global fence for writes across all shards.
-func (c *InMemoryCache[K, V]) SetSync(key K, value V, ttl time.Duration) error {
-	return c.setAndWait(key, value, ttl)
-}
-
-// SetWithCallback accepts an async Set and schedules the callback after the item is committed.
+// SetWithCallback sets key and schedules the callback after the item is committed.
 // The callback fires once the TTL elapses and re-validates the item under lock.
 // High-cardinality callback workloads should use an external scheduler or
 // periodic cleanup instead of one goroutine and timer per item.
-func (c *InMemoryCache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
-	return c.set(key, value, ttl, callback)
+func (c *Cache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
+	return c.setAndWait(key, value, ttl, callback)
 }
 
 // Delete removes a key (if present), unlinks it from lists and recycles the node.
-func (c *InMemoryCache[K, V]) Delete(key K) bool {
+func (c *Cache[K, V]) Delete(key K) bool {
 	kh := c.hasher.hash(key)
 	deleted, err := c.deleteSync(c.shardByHash(kh), key)
 	if err != nil {
@@ -527,12 +563,12 @@ func (c *InMemoryCache[K, V]) Delete(key K) bool {
 }
 
 // Clear empties all shards and reinitializes policy structures (resets SieveTinyLFU state).
-func (c *InMemoryCache[K, V]) Clear() {
+func (c *Cache[K, V]) Clear() {
 	_ = c.enqueueAllAndWait(writeClear)
 }
 
 // Exists checks membership without mutating recency/frequency (removes if expired).
-func (c *InMemoryCache[K, V]) Exists(key K) bool {
+func (c *Cache[K, V]) Exists(key K) bool {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return false
 	}
@@ -559,7 +595,7 @@ func (c *InMemoryCache[K, V]) Exists(key K) bool {
 }
 
 // Keys returns a point-in-time snapshot of non-expired keys across shards.
-func (c *InMemoryCache[K, V]) Keys() []K {
+func (c *Cache[K, V]) Keys() []K {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return nil
 	}
@@ -581,7 +617,7 @@ func (c *InMemoryCache[K, V]) Keys() []K {
 }
 
 // Size sums per-shard sizes (O(shards)).
-func (c *InMemoryCache[K, V]) Size() int64 {
+func (c *Cache[K, V]) Size() int64 {
 	var totalSize int64
 	for _, shard := range c.shards {
 		totalSize += atomic.LoadInt64(&shard.size)
@@ -590,7 +626,7 @@ func (c *InMemoryCache[K, V]) Size() int64 {
 }
 
 // Stats aggregates counters and computes hit ratio.
-func (c *InMemoryCache[K, V]) Stats() Stats {
+func (c *Cache[K, V]) Stats() Stats {
 	var stats Stats
 	stats.Size = c.Size()
 	stats.Capacity = c.config.MaxSize
@@ -613,7 +649,7 @@ func (c *InMemoryCache[K, V]) Stats() Stats {
 }
 
 // PolicyStats aggregates SieveTinyLFU policy counters across shards.
-func (c *InMemoryCache[K, V]) PolicyStats() PolicyStats {
+func (c *Cache[K, V]) PolicyStats() PolicyStats {
 	var ps PolicyStats
 	for _, shard := range c.shards {
 		shard.mu.RLock()
@@ -631,7 +667,7 @@ func (c *InMemoryCache[K, V]) PolicyStats() PolicyStats {
 }
 
 // Close shuts down background work (idempotently), clears shards and marks the cache closed.
-func (c *InMemoryCache[K, V]) Close() error {
+func (c *Cache[K, V]) Close() error {
 	c.closeOnce.Do(func() {
 		// stop accepting new producer writes (sequential Set-after-Close fails).
 		atomic.StoreInt32(&c.closed, 1)
@@ -647,7 +683,7 @@ func (c *InMemoryCache[K, V]) Close() error {
 }
 
 // TriggerCleanup requests a cleanup run (inline if ticker disabled; coalesced otherwise).
-func (c *InMemoryCache[K, V]) TriggerCleanup() {
+func (c *Cache[K, V]) TriggerCleanup() {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return
 	}
@@ -663,7 +699,7 @@ func (c *InMemoryCache[K, V]) TriggerCleanup() {
 	}
 }
 
-func (c *InMemoryCache[K, V]) cleanupWorker() {
+func (c *Cache[K, V]) cleanupWorker() {
 	ticker := time.NewTicker(c.config.CleanupInterval)
 	defer ticker.Stop()
 
@@ -680,7 +716,7 @@ func (c *InMemoryCache[K, V]) cleanupWorker() {
 }
 
 // remove expired items across shards using a single time anchor.
-func (c *InMemoryCache[K, V]) cleanup() {
+func (c *Cache[K, V]) cleanup() {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return
 	}
@@ -691,11 +727,11 @@ func (c *InMemoryCache[K, V]) cleanup() {
 	}
 }
 
-func (c *InMemoryCache[K, V]) shardByHash(hash uint64) *shard[K, V] {
+func (c *Cache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
 }
 
-func (c *InMemoryCache[K, V]) removeItem(s *shard[K, V], it *cacheItem[V], ev bool) {
+func (c *Cache[K, V]) removeItem(s *shard[K, V], it *cacheItem[V], ev bool) {
 	mode := dropLRU
 	switch c.config.EvictionPolicy {
 	case LFU:

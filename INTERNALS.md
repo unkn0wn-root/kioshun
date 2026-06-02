@@ -170,7 +170,7 @@ on set(new key):
 
 ## Async Write Event Loop
 
-`Set` is enqueue-only on the caller path. It computes the shard hash and absolute
+`SetAsync` is enqueue-only on the caller path. It computes the shard hash and absolute
 expiration, then pushes a command into the owning shard's bounded write queue.
 
 Each shard has one worker goroutine that drains up to `Config.WriteBatchSize`
@@ -180,7 +180,7 @@ Synchronous callers can also help drain their own shard behind the same drain
 mutex, preserving single-consumer queue semantics while avoiding a worker wakeup
 on the strict mutation path.
 
-`SetSync` and `Delete` wait for the affected shard commands to be
+`Set` and `Delete` wait for the affected shard commands to be
 processed. `Wait`, `Clear`, and `Close` use global shard barriers when they need
 committed state across the whole cache. `Wait` is the global fence: all writes
 accepted before the barriers are visible after it returns.

@@ -1,4 +1,4 @@
-package cache
+package httpcache
 
 import (
 	"bytes"
@@ -9,22 +9,29 @@ import (
 	"strings"
 	"time"
 
-	httpcache "github.com/unkn0wn-root/kioshun/internal/httpcache"
+	"github.com/unkn0wn-root/kioshun"
 )
 
-type CachedResponse struct {
+// Response is a cached HTTP response snapshot.
+type Response struct {
 	StatusCode int
 	Headers    http.Header
 	Body       []byte
 	CachedAt   time.Time
 }
 
+// KeyGenerator builds a cache key from a request.
 type KeyGenerator func(*http.Request) string
+
+// Policy decides whether a response should be cached and for how long.
 type Policy func(*http.Request, int, http.Header, []byte) (shouldCache bool, ttl time.Duration)
+
+// PathExtractor recovers a URL path from a cache key for pattern invalidation.
 type PathExtractor func(string) string
 
-type HTTPCacheMiddleware struct {
-	cache       *InMemoryCache[string, *CachedResponse]
+// Middleware caches eligible net/http responses.
+type Middleware struct {
+	cache       *kioshun.Cache[string, *Response]
 	keyGen      KeyGenerator
 	policy      Policy
 	onHit       func(string)
@@ -32,16 +39,17 @@ type HTTPCacheMiddleware struct {
 	onSet       func(string, time.Duration)
 	hitHeader   string
 	missHeader  string
-	patternIdx  *httpcache.PatternIndex
+	patternIdx  *patternIndex
 	pathExtract func(string) string
 }
 
-type MiddlewareConfig struct {
+// Config controls HTTP response caching behavior.
+type Config struct {
 	MaxSize         int64
 	ShardCount      int
 	CleanupInterval time.Duration
 	DefaultTTL      time.Duration
-	EvictionPolicy  EvictionPolicy
+	EvictionPolicy  kioshun.EvictionPolicy
 	ProbationRatio  uint8
 	GhostRatio      uint8
 	Adapt           bool
@@ -56,15 +64,14 @@ type MiddlewareConfig struct {
 	MissHeader string // Default: "X-Cache"
 }
 
-func DefaultMiddlewareConfig() MiddlewareConfig {
-	return MiddlewareConfig{
+// DefaultConfig returns the default HTTP middleware configuration.
+func DefaultConfig() Config {
+	return Config{
 		MaxSize:          100000,
 		ShardCount:       16,
 		CleanupInterval:  5 * time.Minute,
 		DefaultTTL:       5 * time.Minute,
-		EvictionPolicy:   FIFO,
-		ProbationRatio:   defaultProbationRatio,
-		GhostRatio:       defaultGhostRatio,
+		EvictionPolicy:   kioshun.FIFO,
 		Adapt:            true,
 		StatsEnabled:     true,
 		CacheableMethods: []string{"GET", "HEAD"},
@@ -76,12 +83,13 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 	}
 }
 
-func NewHTTPCacheMiddleware(config MiddlewareConfig) *HTTPCacheMiddleware {
+// New constructs response-caching middleware.
+func New(config Config) (*Middleware, error) {
 	if config.MaxSize == 0 {
-		config = DefaultMiddlewareConfig()
+		config = DefaultConfig()
 	}
 
-	cacheConfig := Config{
+	cacheConfig := kioshun.Config{
 		MaxSize:         config.MaxSize,
 		ShardCount:      config.ShardCount,
 		CleanupInterval: config.CleanupInterval,
@@ -93,14 +101,19 @@ func NewHTTPCacheMiddleware(config MiddlewareConfig) *HTTPCacheMiddleware {
 		StatsEnabled:    config.StatsEnabled,
 	}
 
-	m := &HTTPCacheMiddleware{
-		cache:       New[string, *CachedResponse](cacheConfig),
+	cache, err := kioshun.New[string, *Response](cacheConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	m := &Middleware{
+		cache:       cache,
 		keyGen:      DefaultKeyGenerator,
 		policy:      DefaultCachePolicy(config),
 		hitHeader:   config.HitHeader,
 		missHeader:  config.MissHeader,
-		patternIdx:  httpcache.NewPatternIndex(),
-		pathExtract: httpcache.DefaultPathExtractor,
+		patternIdx:  newPatternIndex(),
+		pathExtract: defaultPathExtractor,
 	}
 
 	if m.hitHeader == "" {
@@ -110,11 +123,11 @@ func NewHTTPCacheMiddleware(config MiddlewareConfig) *HTTPCacheMiddleware {
 		m.missHeader = "X-Cache"
 	}
 
-	return m
+	return m, nil
 }
 
 // Middleware wraps an HTTP handler with response caching.
-func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
+func (m *Middleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := m.keyGen(r)
 		if cached, found := m.cache.Get(key); found {
@@ -131,7 +144,7 @@ func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
 
 		body := rw.buf.Bytes()
 		if shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body); shouldCache {
-			cached := &CachedResponse{
+			cached := &Response{
 				StatusCode: rw.statusCode,
 				Headers:    rw.headers.Clone(),
 				Body:       make([]byte, len(body)),
@@ -139,14 +152,14 @@ func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
 			}
 			copy(cached.Body, body)
 
-			m.cache.Set(key, cached, ttl)
+			if err := m.cache.Set(key, cached, ttl); err == nil {
+				if path := m.pathExtract(key); path != "" {
+					m.patternIdx.addKey(path, key)
+				}
 
-			if path := m.pathExtract(key); path != "" {
-				m.patternIdx.AddKey(path, key)
-			}
-
-			if m.onSet != nil {
-				m.onSet(key, ttl)
+				if m.onSet != nil {
+					m.onSet(key, ttl)
+				}
 			}
 		}
 
@@ -155,7 +168,7 @@ func (m *HTTPCacheMiddleware) Middleware(next http.Handler) http.Handler {
 }
 
 // serveCached writes a cached response and emits cache-hit metadata.
-func (m *HTTPCacheMiddleware) serveCached(w http.ResponseWriter, cached *CachedResponse, key string) {
+func (m *Middleware) serveCached(w http.ResponseWriter, cached *Response, key string) {
 	if m.onHit != nil {
 		m.onHit(key)
 	}
@@ -173,23 +186,23 @@ func (m *HTTPCacheMiddleware) serveCached(w http.ResponseWriter, cached *CachedR
 }
 
 // Stats returns cache statistics.
-func (m *HTTPCacheMiddleware) Stats() Stats { return m.cache.Stats() }
+func (m *Middleware) Stats() kioshun.Stats { return m.cache.Stats() }
 
 // Clear removes all cached entries.
-func (m *HTTPCacheMiddleware) Clear() {
+func (m *Middleware) Clear() {
 	m.cache.Clear()
-	m.patternIdx.Clear()
+	m.patternIdx.clear()
 }
 
 // Invalidate removes cached entries matching a URL pattern.
-func (m *HTTPCacheMiddleware) Invalidate(urlPattern string) int {
+func (m *Middleware) Invalidate(urlPattern string) int {
 	removed := 0
 
-	matchingKeys := m.patternIdx.GetMatchingKeys(urlPattern)
+	matchingKeys := m.patternIdx.getMatchingKeys(urlPattern)
 	for _, key := range matchingKeys {
 		if m.cache.Delete(key) {
 			if path := m.pathExtract(key); path != "" {
-				m.patternIdx.RemoveKey(path, key)
+				m.patternIdx.removeKey(path, key)
 			}
 			removed++
 		}
@@ -199,7 +212,7 @@ func (m *HTTPCacheMiddleware) Invalidate(urlPattern string) int {
 }
 
 // InvalidateByFunc removes cached entries matching a custom predicate.
-func (m *HTTPCacheMiddleware) InvalidateByFunc(fn func(string) bool) int {
+func (m *Middleware) InvalidateByFunc(fn func(string) bool) int {
 	removed := 0
 	keys := m.cache.Keys()
 
@@ -213,16 +226,16 @@ func (m *HTTPCacheMiddleware) InvalidateByFunc(fn func(string) bool) int {
 }
 
 // Close releases middleware resources.
-func (m *HTTPCacheMiddleware) Close() error {
+func (m *Middleware) Close() error {
 	return m.cache.Close()
 }
 
-func (m *HTTPCacheMiddleware) SetKeyGenerator(keyGen KeyGenerator)        { m.keyGen = keyGen }
-func (m *HTTPCacheMiddleware) SetCachePolicy(policy Policy)               { m.policy = policy }
-func (m *HTTPCacheMiddleware) SetPathExtractor(extractor PathExtractor)   { m.pathExtract = extractor }
-func (m *HTTPCacheMiddleware) OnHit(callback func(string))                { m.onHit = callback }
-func (m *HTTPCacheMiddleware) OnMiss(callback func(string))               { m.onMiss = callback }
-func (m *HTTPCacheMiddleware) OnSet(callback func(string, time.Duration)) { m.onSet = callback }
+func (m *Middleware) SetKeyGenerator(keyGen KeyGenerator)        { m.keyGen = keyGen }
+func (m *Middleware) SetCachePolicy(policy Policy)               { m.policy = policy }
+func (m *Middleware) SetPathExtractor(extractor PathExtractor)   { m.pathExtract = extractor }
+func (m *Middleware) OnHit(callback func(string))                { m.onHit = callback }
+func (m *Middleware) OnMiss(callback func(string))               { m.onMiss = callback }
+func (m *Middleware) OnSet(callback func(string, time.Duration)) { m.onSet = callback }
 
 // DefaultKeyGenerator hashes the method, full URL, and common vary headers.
 func DefaultKeyGenerator(r *http.Request) string {
@@ -241,7 +254,7 @@ func DefaultKeyGenerator(r *http.Request) string {
 }
 
 // DefaultCachePolicy builds a policy that respects HTTP cache headers.
-func DefaultCachePolicy(config MiddlewareConfig) Policy {
+func DefaultCachePolicy(config Config) Policy {
 	cacheableMethods := make(map[string]bool, len(config.CacheableMethods))
 	for _, method := range config.CacheableMethods {
 		cacheableMethods[method] = true

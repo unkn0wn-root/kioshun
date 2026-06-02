@@ -38,7 +38,7 @@ func BenchmarkCacheHeavyLoad(b *testing.B) {
 				EvictionPolicy:  cache.SieveTinyLFU,
 				StatsEnabled:    true,
 			}
-			c := cache.New[string, []byte](config)
+			c := newKioshunCache[string, []byte](b, config)
 			defer c.Close()
 
 			// Pre-populate cache
@@ -71,7 +71,7 @@ func BenchmarkCacheHeavyLoad(b *testing.B) {
 
 // BenchmarkCacheContentionStress tests high contention scenarios
 func BenchmarkCacheContentionStress(b *testing.B) {
-	c := cache.NewWithDefaults[string, []byte]()
+	c := cache.NewDefault[string, []byte]()
 	defer c.Close()
 
 	// Create large value to stress memory allocation
@@ -122,7 +122,7 @@ func BenchmarkCacheEvictionStress(b *testing.B) {
 				EvictionPolicy:  policy,
 				StatsEnabled:    true,
 			}
-			c := cache.New[string, []byte](config)
+			c := newKioshunCache[string, []byte](b, config)
 			defer c.Close()
 
 			value := make([]byte, 1024)
@@ -150,7 +150,7 @@ func BenchmarkCacheMemoryPressure(b *testing.B) {
 
 	for _, size := range valueSizes {
 		b.Run(fmt.Sprintf("ValueSize_%dKB", size/1024), func(b *testing.B) {
-			c := cache.NewWithDefaults[string, []byte]()
+			c := cache.NewDefault[string, []byte]()
 			defer c.Close()
 
 			value := make([]byte, size)
@@ -177,7 +177,7 @@ func BenchmarkCacheMemoryPressure(b *testing.B) {
 
 // BenchmarkCacheExpirationStress tests heavy expiration scenarios
 func BenchmarkCacheExpirationStress(b *testing.B) {
-	c := cache.NewWithDefaults[string, []byte]()
+	c := cache.NewDefault[string, []byte]()
 	defer c.Close()
 
 	value := make([]byte, 512)
@@ -224,7 +224,7 @@ func BenchmarkCacheShardingEfficiency(b *testing.B) {
 				EvictionPolicy:  cache.SieveTinyLFU,
 				StatsEnabled:    true,
 			}
-			c := cache.New[string, []byte](config)
+			c := newKioshunCache[string, []byte](b, config)
 			defer c.Close()
 
 			value := make([]byte, 256)
@@ -253,7 +253,7 @@ func BenchmarkCacheShardingEfficiency(b *testing.B) {
 // BenchmarkCacheHashingPerformance tests different key types and hashing
 func BenchmarkCacheHashingPerformance(b *testing.B) {
 	b.Run("StringKeys", func(b *testing.B) {
-		c := cache.NewWithDefaults[string, int]()
+		c := cache.NewDefault[string, int]()
 		defer c.Close()
 
 		b.ResetTimer()
@@ -268,7 +268,7 @@ func BenchmarkCacheHashingPerformance(b *testing.B) {
 	})
 
 	b.Run("IntKeys", func(b *testing.B) {
-		c := cache.NewWithDefaults[int, int]()
+		c := cache.NewDefault[int, int]()
 		defer c.Close()
 
 		b.ResetTimer()
@@ -282,7 +282,7 @@ func BenchmarkCacheHashingPerformance(b *testing.B) {
 	})
 
 	b.Run("Int64Keys", func(b *testing.B) {
-		c := cache.NewWithDefaults[int64, int]()
+		c := cache.NewDefault[int64, int]()
 		defer c.Close()
 
 		b.ResetTimer()
@@ -298,7 +298,7 @@ func BenchmarkCacheHashingPerformance(b *testing.B) {
 
 // BenchmarkCacheStressTest combines multiple stress factors
 func BenchmarkCacheStressTest(b *testing.B) {
-	c := cache.NewWithDefaults[string, []byte]()
+	c := cache.NewDefault[string, []byte]()
 	defer c.Close()
 
 	// Create different sized values
@@ -344,7 +344,7 @@ func BenchmarkCacheHighThroughput(b *testing.B) {
 
 	for _, goroutineCount := range goroutineCounts {
 		b.Run(fmt.Sprintf("Goroutines_%d", goroutineCount), func(b *testing.B) {
-			c := cache.NewWithDefaults[string, []byte]()
+			c := cache.NewDefault[string, []byte]()
 			defer c.Close()
 
 			value := make([]byte, 1024)
@@ -389,7 +389,7 @@ func BenchmarkCacheCleanupStress(b *testing.B) {
 		EvictionPolicy:  cache.SieveTinyLFU,
 		StatsEnabled:    true,
 	}
-	c := cache.New[string, []byte](config)
+	c := newKioshunCache[string, []byte](b, config)
 	defer c.Close()
 
 	value := make([]byte, 512)
@@ -423,7 +423,7 @@ func BenchmarkCacheCleanupStress(b *testing.B) {
 
 // BenchmarkCacheAdvancedOperations tests advanced cache operations
 func BenchmarkCacheAdvancedOperations(b *testing.B) {
-	c := cache.NewWithDefaults[string, []byte]()
+	c := cache.NewDefault[string, []byte]()
 	defer c.Close()
 
 	value := make([]byte, 1024)

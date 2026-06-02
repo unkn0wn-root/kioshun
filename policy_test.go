@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"math/rand"
@@ -14,8 +14,8 @@ type polRun struct {
 	size int64
 }
 
-func newPolCache(pol EvictionPolicy, cap int64) *InMemoryCache[int, int] {
-	return New[int, int](Config{
+func newPolCache(pol EvictionPolicy, cap int64) *Cache[int, int] {
+	c, err := New[int, int](Config{
 		MaxSize:         cap,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -23,6 +23,10 @@ func newPolCache(pol EvictionPolicy, cap int64) *InMemoryCache[int, int] {
 		EvictionPolicy:  pol,
 		StatsEnabled:    true,
 	})
+	if err != nil {
+		panic(err)
+	}
+	return c
 }
 
 func runTrace(pol EvictionPolicy, cap int64, tr []int) polRun {
@@ -35,7 +39,7 @@ func runTrace(pol EvictionPolicy, cap int64, tr []int) polRun {
 	return r
 }
 
-func runTraceInto(c *InMemoryCache[int, int], tr []int) (hit, miss int) {
+func runTraceInto(c *Cache[int, int], tr []int) (hit, miss int) {
 	for _, k := range tr {
 		if _, ok := c.Get(k); ok {
 			hit++
@@ -52,7 +56,7 @@ func runTraceInto(c *InMemoryCache[int, int], tr []int) (hit, miss int) {
 	return hit, miss
 }
 
-func countFound(c *InMemoryCache[int, int], from, n int) int {
+func countFound(c *Cache[int, int], from, n int) int {
 	var hit int
 	for k := from; k < from+n; k++ {
 		if _, ok := c.Get(k); ok {

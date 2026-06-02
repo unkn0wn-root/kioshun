@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"fmt"
@@ -22,9 +22,13 @@ func NewManager() *Manager {
 	}
 }
 
-// RegisterCache registers a configuration for a named cache.
+// Register registers a configuration for a named cache.
 // Returns an error if a configuration with the same name already exists.
-func (m *Manager) RegisterCache(name string, config Config) error {
+func (m *Manager) Register(name string, config Config) error {
+	if err := config.Validate(); err != nil {
+		return newCacheError("register", name, err)
+	}
+
 	m.configMu.Lock()
 	defer m.configMu.Unlock()
 
@@ -38,9 +42,9 @@ func (m *Manager) RegisterCache(name string, config Config) error {
 
 // GetCache returns the named typed cache, creating it from the registered
 // configuration or DefaultConfig when none is registered.
-func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V], error) {
+func GetCache[K comparable, V any](m *Manager, name string) (*Cache[K, V], error) {
 	if cached, ok := m.caches.Load(name); ok {
-		if cache, ok := cached.(*InMemoryCache[K, V]); ok {
+		if cache, ok := cached.(*Cache[K, V]); ok {
 			return cache, nil
 		}
 		return nil, newCacheError("get", name, ErrTypeMismatch)
@@ -54,11 +58,14 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 		config = DefaultConfig()
 	}
 
-	cache := New[K, V](config)
+	cache, err := New[K, V](config)
+	if err != nil {
+		return nil, newCacheError("get", name, err)
+	}
 	// LoadOrStore closes the loser so concurrent creators do not leak workers.
 	if actual, loaded := m.caches.LoadOrStore(name, cache); loaded {
 		cache.Close()
-		if existingCache, ok := actual.(*InMemoryCache[K, V]); ok {
+		if existingCache, ok := actual.(*Cache[K, V]); ok {
 			return existingCache, nil
 		}
 		return nil, newCacheError("get", name, ErrTypeMismatch)
@@ -67,8 +74,8 @@ func GetCache[K comparable, V any](m *Manager, name string) (*InMemoryCache[K, V
 	return cache, nil
 }
 
-// GetCacheStats returns performance statistics for all managed caches.
-func (m *Manager) GetCacheStats() map[string]Stats {
+// Stats returns performance statistics for all managed caches.
+func (m *Manager) Stats() map[string]Stats {
 	stats := make(map[string]Stats)
 
 	m.caches.Range(func(key, value any) bool {
@@ -112,8 +119,8 @@ func (m *Manager) CloseAll() error {
 	return nil
 }
 
-// RemoveCache removes and closes the named cache instance.
-func (m *Manager) RemoveCache(name string) error {
+// Remove removes and closes the named cache instance.
+func (m *Manager) Remove(name string) error {
 	if cached, ok := m.caches.LoadAndDelete(name); ok {
 		if cache, ok := cached.(interface{ Close() error }); ok {
 			return cache.Close()
@@ -129,17 +136,17 @@ func (m *Manager) RemoveCache(name string) error {
 
 // RegisterGlobalCache registers a configuration in the global manager.
 func RegisterGlobalCache(name string, config Config) error {
-	return GlobalManager.RegisterCache(name, config)
+	return GlobalManager.Register(name, config)
 }
 
 // GetGlobalCache retrieves or creates a cache from the global manager.
-func GetGlobalCache[K comparable, V any](name string) (*InMemoryCache[K, V], error) {
+func GetGlobalCache[K comparable, V any](name string) (*Cache[K, V], error) {
 	return GetCache[K, V](GlobalManager, name)
 }
 
 // GetGlobalCacheStats returns stats for all caches in the global manager.
 func GetGlobalCacheStats() map[string]Stats {
-	return GlobalManager.GetCacheStats()
+	return GlobalManager.Stats()
 }
 
 // CloseAllGlobalCaches closes all caches in the global manager.

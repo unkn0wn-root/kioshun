@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"strconv"
@@ -191,7 +191,7 @@ func TestNewSieveTinyLFUAdaptiveBounds(t *testing.T) {
 }
 
 func TestSieveTinyLFUInitializesState(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         16,
 		ShardCount:      4,
 		CleanupInterval: 0,
@@ -220,7 +220,7 @@ func TestSieveTinyLFUInitializesState(t *testing.T) {
 }
 
 func TestShardCapacityRemainderDistributed(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         10,
 		ShardCount:      4,
 		CleanupInterval: 0,
@@ -245,7 +245,7 @@ func TestShardCapacityRemainderDistributed(t *testing.T) {
 }
 
 func TestNonAdmissionPolicyDoesNotInitializeAdmissionState(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         16,
 		ShardCount:      4,
 		CleanupInterval: 0,
@@ -294,7 +294,7 @@ func TestSieveTinyLFUBoundedVictimNeedsForce(t *testing.T) {
 }
 
 func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         2,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -372,7 +372,7 @@ func TestSieveTinyLFUMaintainForcesCapacityAfterBoundedScan(t *testing.T) {
 }
 
 func TestSieveTinyLFUSetKeepsShardWithinCapacity(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         4,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -407,7 +407,7 @@ func TestSieveTinyLFUSetKeepsShardWithinCapacity(t *testing.T) {
 }
 
 func TestSieveTinyLFUPolicyStats(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         2,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -444,7 +444,7 @@ func TestSieveTinyLFUPolicyStats(t *testing.T) {
 }
 
 func TestSieveTinyLFUExistingUpdatePromotesProbation(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         4,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -481,7 +481,7 @@ func TestSieveTinyLFUExistingUpdatePromotesProbation(t *testing.T) {
 }
 
 func TestSieveTinyLFUDeleteUnlinksQueue(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         4,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -513,7 +513,7 @@ func TestSieveTinyLFUDeleteUnlinksQueue(t *testing.T) {
 }
 
 func TestSieveTinyLFUClearResetsPolicyState(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         4,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -538,7 +538,7 @@ func TestSieveTinyLFUClearResetsPolicyState(t *testing.T) {
 }
 
 func TestSieveTinyLFUCleanupRemovesExpiredQueueItem(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         4,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -641,7 +641,7 @@ func TestSieveTinyLFUEqualFrequencyTieRejection(t *testing.T) {
 }
 
 func TestSieveTinyLFUQueueSizeMatchesShardSizeAfterMixedOps(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         8,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -678,7 +678,7 @@ func TestSieveTinyLFUQueueSizeMatchesShardSizeAfterMixedOps(t *testing.T) {
 }
 
 func TestSieveTinyLFUParallelRepeatedWritesKeepQueuesConsistent(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         32,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -728,7 +728,7 @@ func TestSieveTinyLFUParallelRepeatedWritesKeepQueuesConsistent(t *testing.T) {
 }
 
 func TestSieveTinyLFUParallelRepeatedStringWritesAcrossShards(t *testing.T) {
-	c := New[string, []byte](Config{
+	c := newTestCache[string, []byte](t, Config{
 		MaxSize:         1024,
 		ShardCount:      32,
 		CleanupInterval: 0,
@@ -778,7 +778,7 @@ func TestSieveTinyLFUParallelRepeatedStringWritesAcrossShards(t *testing.T) {
 }
 
 func TestSieveTinyLFUPooledItemsResetAfterClear(t *testing.T) {
-	c := New[int, int](Config{
+	c := newTestCache[int, int](t, Config{
 		MaxSize:         16,
 		ShardCount:      1,
 		CleanupInterval: 0,

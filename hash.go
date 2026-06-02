@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"encoding/binary"

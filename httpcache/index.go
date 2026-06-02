@@ -11,31 +11,28 @@ const (
 	wildcardChar  = "*"
 )
 
-// PatternNode represents a single node in the path tree.
-type PatternNode struct {
-	children map[string]*PatternNode
+type patternNode struct {
+	children map[string]*patternNode
 	keys     map[string]bool
 }
 
-// PatternIndex maintains a tree structure that maps URL paths to cache keys.
-type PatternIndex struct {
+type patternIndex struct {
 	mu   sync.RWMutex
-	root *PatternNode
+	root *patternNode
 }
 
-func NewPatternIndex() *PatternIndex {
-	return &PatternIndex{root: newPatternNode()}
+func newPatternIndex() *patternIndex {
+	return &patternIndex{root: newPatternNode()}
 }
 
-func newPatternNode() *PatternNode {
-	return &PatternNode{
-		children: make(map[string]*PatternNode),
+func newPatternNode() *patternNode {
+	return &patternNode{
+		children: make(map[string]*patternNode),
 		keys:     make(map[string]bool),
 	}
 }
 
-// DefaultPathExtractor returns an empty string; override to map keys to paths.
-func DefaultPathExtractor(key string) string { return "" }
+func defaultPathExtractor(key string) string { return "" }
 
 // NormalizePath converts a URL path into a normalized slice of path segments
 // Empty path handling:
@@ -77,8 +74,7 @@ func normalizePath(path string) []string {
 	return result
 }
 
-// AddKey associates a cache key with a specific path in the trie.
-func (pi *PatternIndex) AddKey(path, key string) {
+func (pi *patternIndex) addKey(path, key string) {
 	pi.mu.Lock()
 	defer pi.mu.Unlock()
 
@@ -93,8 +89,7 @@ func (pi *PatternIndex) AddKey(path, key string) {
 	node.keys[key] = true
 }
 
-// RemoveKey removes a cache key from the specified path.
-func (pi *PatternIndex) RemoveKey(path, key string) {
+func (pi *patternIndex) removeKey(path, key string) {
 	pi.mu.Lock()
 	defer pi.mu.Unlock()
 
@@ -105,7 +100,7 @@ func (pi *PatternIndex) RemoveKey(path, key string) {
 	}
 }
 
-// GetMatchingKeys returns all cache keys that match the given pattern
+// getMatchingKeys returns all cache keys that match the given pattern
 //
 // Exact path matching:
 // - Pattern without '*' suffix matches only keys stored at that exact path
@@ -118,7 +113,7 @@ func (pi *PatternIndex) RemoveKey(path, key string) {
 // - Strips the '*' suffix and finds the base path node
 // - Recursively collects keys from the base node and all descendant nodes
 // - Example: "/api/*" matches keys at "/api", "/api/users", "/api/users/123", etc.
-func (pi *PatternIndex) GetMatchingKeys(pattern string) []string {
+func (pi *patternIndex) getMatchingKeys(pattern string) []string {
 	pi.mu.RLock()
 	defer pi.mu.RUnlock()
 
@@ -142,7 +137,7 @@ func (pi *PatternIndex) GetMatchingKeys(pattern string) []string {
 	return pi.collectDirectKeys(node)
 }
 
-func (pi *PatternIndex) findNode(segments []string) *PatternNode {
+func (pi *patternIndex) findNode(segments []string) *patternNode {
 	node := pi.root
 	for _, s := range segments {
 		next := node.children[s]
@@ -154,7 +149,7 @@ func (pi *PatternIndex) findNode(segments []string) *PatternNode {
 	return node
 }
 
-func (pi *PatternIndex) collectDirectKeys(node *PatternNode) []string {
+func (pi *patternIndex) collectDirectKeys(node *patternNode) []string {
 	if len(node.keys) == 0 {
 		return nil
 	}
@@ -166,7 +161,7 @@ func (pi *PatternIndex) collectDirectKeys(node *PatternNode) []string {
 	return keys
 }
 
-func (pi *PatternIndex) collectAllKeys(node *PatternNode) []string {
+func (pi *patternIndex) collectAllKeys(node *patternNode) []string {
 	var keys []string
 	for k := range node.keys {
 		keys = append(keys, k)
@@ -177,7 +172,7 @@ func (pi *PatternIndex) collectAllKeys(node *PatternNode) []string {
 	return keys
 }
 
-func (pi *PatternIndex) Clear() {
+func (pi *patternIndex) clear() {
 	pi.mu.Lock()
 	pi.root = newPatternNode()
 	pi.mu.Unlock()

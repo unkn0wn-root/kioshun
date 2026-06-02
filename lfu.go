@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 // freqNode buckets items by exact frequency.
 // Empty non-sentinel buckets are removed eagerly,

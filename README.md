@@ -45,22 +45,23 @@ import (
     "fmt"
     "time"
 
-    cache "github.com/unkn0wn-root/kioshun"
+    "github.com/unkn0wn-root/kioshun"
 )
 
 func main() {
     // Create cache with default configuration
-    c := cache.NewWithDefaults[string, string]()
+    c := kioshun.NewDefault[string, string]()
     defer c.Close()
 
     // Set with default TTL (30 min)
-    c.Set("user:123", "David Nice 1", cache.DefaultExpiration)
+    c.Set("user:123", "David Nice 1", kioshun.DefaultExpiration)
 
     // Set with no expiration
-    c.Set("user:123", "David Nice 2", cache.NoExpiration)
+    c.Set("user:123", "David Nice 2", kioshun.NoExpiration)
 
-    // Set value with custom TTL and immediate read-after-write visibility
-    c.SetSync("user:123", "David Nice 3", 5*time.Minute)
+    // Queue a write for high-throughput paths
+    c.SetAsync("user:456", "David Nice 3", 5*time.Minute)
+    c.Wait()
 
     // Get value
     if value, found := c.Get("user:123"); found {
@@ -78,43 +79,49 @@ func main() {
 ### Basic Configuration
 
 ```go
-config := cache.Config{
+config := kioshun.Config{
     MaxSize:         100000,             // Maximum number of items
     ShardCount:      16,                 // Number of shards (0 = auto-detect)
     CleanupInterval: 5 * time.Minute,    // Cleanup frequency
     DefaultTTL:      30 * time.Minute,   // Default expiration time
-    EvictionPolicy:  cache.SieveTinyLFU, // Eviction algorithm (default)
+    EvictionPolicy:  kioshun.SieveTinyLFU, // Eviction algorithm (default)
     StatsEnabled:    true,               // Enable statistics collection
     WriteBufferSize: 1024,               // Per-shard async write queue
     WriteBatchSize:  64,                 // Max commands applied per worker batch
 }
 
-cache := cache.New[string, any](config)
+c, err := kioshun.New[string, any](config)
+if err != nil {
+    // handle invalid configuration
+}
 ```
 
 ## API
 
 ```go
-cache.Set(key, value, ttl time.Duration) error
-cache.SetSync(key, value, ttl time.Duration) error
-cache.SetWithCallback(key, value, ttl, callback func(key, value)) error
-cache.Get(key) (value, found bool)
-cache.GetWithTTL(key) (value, ttl time.Duration, found bool)
-cache.Keys() []K
-cache.Clear()
-cache.Wait() error
-cache.Delete(key) bool
-cache.Exists(key) bool
-cache.Size() int64
-cache.Stats() Stats
-cache.PolicyStats() PolicyStats
-cache.TriggerCleanup()
-cache.Close() error
+c.Set(key, value, ttl time.Duration) error
+c.SetAsync(key, value, ttl time.Duration) error
+c.SetWithCallback(key, value, ttl, callback func(key, value)) error
+c.Get(key) (value, found bool)
+c.GetWithTTL(key) (value, ttl time.Duration, found bool)
+c.Keys() []K
+c.Clear()
+c.Wait() error
+c.Delete(key) bool
+c.Exists(key) bool
+c.Size() int64
+c.Stats() Stats
+c.PolicyStats() PolicyStats
+c.TriggerCleanup()
+c.Close() error
 ```
 
-`Set` is asynchronous: it returns after the write is accepted into the owning shard's queue.
-Use `SetSync` when a caller needs read-after-write visibility for one key. Call `Wait`
-only when a caller needs a global fence for writes across all shards.
+`Set` is synchronous and gives immediate read-after-write visibility for the key.
+Use `SetAsync` for queued high-throughput writes, and call `Wait` when a caller
+needs a global fence for queued writes across all shards.
+
+Invalid configurations return `ConfigError` and match `ErrInvalidConfig` with
+`errors.Is`.
 
 ### Statistics
 
@@ -145,11 +152,16 @@ type PolicyStats struct {
 Kioshun provides HTTP middleware out-of-the-box.
 
 ```go
-config := cache.DefaultMiddlewareConfig()
+import "github.com/unkn0wn-root/kioshun/httpcache"
+
+config := httpcache.DefaultConfig()
 config.DefaultTTL = 5 * time.Minute
 config.MaxSize = 100000
 
-middleware := cache.NewHTTPCacheMiddleware(config)
+middleware, err := httpcache.New(config)
+if err != nil {
+    // handle invalid configuration
+}
 defer middleware.Close()
 
 http.Handle("/api/users", middleware.Middleware(usersHandler))
@@ -163,4 +175,4 @@ Latest benchmark run (Apple M4 Max, Go 1.24.7):
 - `GET`: 231,967,180 ops/sec · 25.87 ns/op · 31 B/op · 2 allocs/op
 - `Real-World`: 52,742,550 ops/sec · 65.25 ns/op · 48 B/op · 3 allocs/op
 
-Full suite: [_benchmarks/README.md](_benchmarks/README.md)
+Full suite: [benchmarks/README.md](benchmarks/README.md)

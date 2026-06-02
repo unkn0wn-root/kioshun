@@ -1,16 +1,27 @@
 // cache_test.go - Comprehensive unit tests
-package cache
+package kioshun
 
 import (
+	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
+func newTestCache[K comparable, V any](t testing.TB, config Config) *Cache[K, V] {
+	t.Helper()
+	cache, err := New[K, V](config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return cache
+}
+
 func TestCacheBasicOperations(t *testing.T) {
-	cache := NewWithDefaults[string, string]()
+	cache := NewDefault[string, string]()
 	defer cache.Close()
 
 	// Test Set and Get
@@ -37,7 +48,7 @@ func TestCacheBasicOperations(t *testing.T) {
 }
 
 func TestCacheExpiration(t *testing.T) {
-	cache := NewWithDefaults[string, string]()
+	cache := NewDefault[string, string]()
 	defer cache.Close()
 
 	// Set value with short TTL
@@ -59,7 +70,7 @@ func TestCacheExpiration(t *testing.T) {
 }
 
 func TestCacheTTL(t *testing.T) {
-	cache := NewWithDefaults[string, string]()
+	cache := NewDefault[string, string]()
 	defer cache.Close()
 
 	cache.Set("ttl_key", "value", 1*time.Minute)
@@ -85,7 +96,7 @@ func TestCacheLRUEviction(t *testing.T) {
 		DefaultTTL:      1 * time.Hour,
 		EvictionPolicy:  LRU,
 	}
-	cache := New[string, string](config)
+	cache := newTestCache[string, string](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity
@@ -113,7 +124,7 @@ func TestCacheLRUEviction(t *testing.T) {
 }
 
 func TestCacheStats(t *testing.T) {
-	cache := NewWithDefaults[string, string]()
+	cache := NewDefault[string, string]()
 	defer cache.Close()
 
 	// Initial stats
@@ -142,7 +153,7 @@ func TestCacheStats(t *testing.T) {
 }
 
 func TestCacheExists(t *testing.T) {
-	cache := NewWithDefaults[string, string]()
+	cache := NewDefault[string, string]()
 	defer cache.Close()
 
 	cache.Set("key1", "value1", 1*time.Minute)
@@ -158,7 +169,7 @@ func TestCacheExists(t *testing.T) {
 }
 
 func TestCacheKeys(t *testing.T) {
-	cache := NewWithDefaults[string, string]()
+	cache := NewDefault[string, string]()
 	defer cache.Close()
 
 	cache.Set("key1", "value1", 1*time.Minute)
@@ -180,7 +191,7 @@ func TestCacheKeys(t *testing.T) {
 }
 
 func TestCacheConcurrency(t *testing.T) {
-	cache := NewWithDefaults[string, int]()
+	cache := NewDefault[string, int]()
 	defer cache.Close()
 
 	var wg sync.WaitGroup
@@ -228,7 +239,7 @@ func TestCacheCleanup(t *testing.T) {
 		DefaultTTL:      100 * time.Millisecond,
 		StatsEnabled:    true,
 	}
-	cache := New[string, string](config)
+	cache := newTestCache[string, string](t, config)
 	defer cache.Close()
 
 	// Add items that will expire
@@ -255,7 +266,7 @@ func TestCacheCleanup(t *testing.T) {
 }
 
 func TestCacheCallback(t *testing.T) {
-	cache := NewWithDefaults[string, string]()
+	cache := NewDefault[string, string]()
 	defer cache.Close()
 
 	var callbackCalled int32
@@ -292,7 +303,7 @@ func TestCacheManager(t *testing.T) {
 
 	// Register cache
 	config := DefaultConfig()
-	err := manager.RegisterCache("test", config)
+	err := manager.Register("test", config)
 	if err != nil {
 		t.Errorf("Expected no error registering cache, got %v", err)
 	}
@@ -311,7 +322,7 @@ func TestCacheManager(t *testing.T) {
 	}
 
 	// Get stats
-	stats := manager.GetCacheStats()
+	stats := manager.Stats()
 	if len(stats) != 1 {
 		t.Errorf("Expected 1 cache in stats, got %d", len(stats))
 	}
@@ -319,13 +330,13 @@ func TestCacheManager(t *testing.T) {
 
 func TestCacheGenerics(t *testing.T) {
 	// Test with different types
-	stringCache := NewWithDefaults[string, string]()
+	stringCache := NewDefault[string, string]()
 	defer stringCache.Close()
 
-	intCache := NewWithDefaults[int, string]()
+	intCache := NewDefault[int, string]()
 	defer intCache.Close()
 
-	structCache := NewWithDefaults[string, User]()
+	structCache := NewDefault[string, User]()
 	defer structCache.Close()
 
 	// Test string cache
@@ -351,8 +362,140 @@ func TestCacheGenerics(t *testing.T) {
 	}
 }
 
+func TestNewValidatesConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+		field  string
+		value  any
+		reason string
+	}{
+		{
+			name: "negative max size",
+			config: Config{
+				MaxSize: -1,
+			},
+			field:  "MaxSize",
+			value:  int64(-1),
+			reason: "must be >= 0",
+		},
+		{
+			name: "negative shard count",
+			config: Config{
+				ShardCount: -1,
+			},
+			field:  "ShardCount",
+			value:  -1,
+			reason: "must be >= 0",
+		},
+		{
+			name: "negative cleanup interval",
+			config: Config{
+				CleanupInterval: -time.Second,
+			},
+			field:  "CleanupInterval",
+			value:  -time.Second,
+			reason: "must be >= 0",
+		},
+		{
+			name: "invalid default ttl",
+			config: Config{
+				DefaultTTL: -2,
+			},
+			field:  "DefaultTTL",
+			value:  time.Duration(-2),
+			reason: "must be >= 0 or NoExpiration",
+		},
+		{
+			name: "unknown policy",
+			config: Config{
+				EvictionPolicy: SieveTinyLFU + 1,
+			},
+			field:  "EvictionPolicy",
+			value:  SieveTinyLFU + 1,
+			reason: "must be a known eviction policy",
+		},
+		{
+			name: "invalid probation ratio",
+			config: Config{
+				ProbationRatio: 101,
+			},
+			field:  "ProbationRatio",
+			value:  uint8(101),
+			reason: "must be <= 100",
+		},
+		{
+			name: "invalid ghost ratio",
+			config: Config{
+				GhostRatio: 101,
+			},
+			field:  "GhostRatio",
+			value:  uint8(101),
+			reason: "must be <= 100",
+		},
+		{
+			name: "negative write buffer",
+			config: Config{
+				WriteBufferSize: -1,
+			},
+			field:  "WriteBufferSize",
+			value:  -1,
+			reason: "must be >= 0",
+		},
+		{
+			name: "negative write batch",
+			config: Config{
+				WriteBatchSize: -1,
+			},
+			field:  "WriteBatchSize",
+			value:  -1,
+			reason: "must be >= 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := New[string, string](tt.config)
+			if c != nil {
+				t.Fatal("expected nil cache for invalid config")
+			}
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("New() error = %v, want ErrInvalidConfig", err)
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("New() error = %T, want *ConfigError", err)
+			}
+			if configErr.Field != tt.field {
+				t.Fatalf("ConfigError.Field = %q, want %q", configErr.Field, tt.field)
+			}
+			if !reflect.DeepEqual(configErr.Value, tt.value) {
+				t.Fatalf("ConfigError.Value = %#v, want %#v", configErr.Value, tt.value)
+			}
+			if configErr.Reason != tt.reason {
+				t.Fatalf("ConfigError.Reason = %q, want %q", configErr.Reason, tt.reason)
+			}
+		})
+	}
+}
+
+func TestManagerRegisterValidatesConfig(t *testing.T) {
+	manager := NewManager()
+	err := manager.Register("bad", Config{MaxSize: -1})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Register() error = %v, want ErrInvalidConfig", err)
+	}
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("Register() error = %T, want wrapped *ConfigError", err)
+	}
+	if configErr.Field != "MaxSize" {
+		t.Fatalf("ConfigError.Field = %q, want MaxSize", configErr.Field)
+	}
+}
+
 func TestCacheCloseBehavior(t *testing.T) {
-	cache := NewWithDefaults[string, string]()
+	cache := NewDefault[string, string]()
 
 	// Set a value
 	cache.Set("key1", "value1", 1*time.Minute)
@@ -380,8 +523,56 @@ func TestCacheCloseBehavior(t *testing.T) {
 	}
 }
 
-func TestSetReturnsAfterEnqueueBeforeCommit(t *testing.T) {
-	cache := New[string, string](Config{
+func TestSetAsyncReturnsAfterEnqueueBeforeCommit(t *testing.T) {
+	cache := newTestCache[string, string](t, Config{
+		MaxSize:         10,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  LRU,
+		WriteBufferSize: 1,
+		WriteBatchSize:  1,
+	})
+	defer cache.Close()
+
+	shard := cache.shards[0]
+	shard.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			shard.mu.Unlock()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cache.SetAsync("key", "value", time.Hour)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SetAsync returned error: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("set blocked until commit; expected enqueue-only return")
+	}
+
+	if _, ok := shard.data["key"]; ok {
+		t.Fatal("set committed while shard lock was held")
+	}
+
+	shard.mu.Unlock()
+	locked = false
+	waitForWrites(t, cache)
+
+	if value, found := cache.Get("key"); !found || value != "value" {
+		t.Fatalf("expected value after Wait, got %q found=%v", value, found)
+	}
+}
+
+func TestSetWaitsForCommit(t *testing.T) {
+	cache := newTestCache[string, string](t, Config{
 		MaxSize:         10,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -408,55 +599,7 @@ func TestSetReturnsAfterEnqueueBeforeCommit(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("set returned error: %v", err)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("set blocked until commit; expected enqueue-only return")
-	}
-
-	if _, ok := shard.data["key"]; ok {
-		t.Fatal("set committed while shard lock was held")
-	}
-
-	shard.mu.Unlock()
-	locked = false
-	waitForWrites(t, cache)
-
-	if value, found := cache.Get("key"); !found || value != "value" {
-		t.Fatalf("expected value after Wait, got %q found=%v", value, found)
-	}
-}
-
-func TestSetSyncWaitsForCommit(t *testing.T) {
-	cache := New[string, string](Config{
-		MaxSize:         10,
-		ShardCount:      1,
-		CleanupInterval: 0,
-		DefaultTTL:      time.Hour,
-		EvictionPolicy:  LRU,
-		WriteBufferSize: 1,
-		WriteBatchSize:  1,
-	})
-	defer cache.Close()
-
-	shard := cache.shards[0]
-	shard.mu.Lock()
-	locked := true
-	defer func() {
-		if locked {
-			shard.mu.Unlock()
-		}
-	}()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- cache.SetSync("key", "value", time.Hour)
-	}()
-
-	select {
-	case err := <-done:
-		t.Fatalf("SetSync returned before commit; err=%v", err)
+		t.Fatalf("Set returned before commit; err=%v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
 
@@ -468,15 +611,15 @@ func TestSetSyncWaitsForCommit(t *testing.T) {
 	locked = false
 
 	if err := <-done; err != nil {
-		t.Fatalf("SetSync returned error: %v", err)
+		t.Fatalf("Set returned error: %v", err)
 	}
 	if value, found := cache.Get("key"); !found || value != "value" {
-		t.Fatalf("expected value after SetSync, got %q found=%v", value, found)
+		t.Fatalf("expected value after Set, got %q found=%v", value, found)
 	}
 }
 
 func TestDeleteOrdersAfterPendingSet(t *testing.T) {
-	cache := New[string, string](Config{
+	cache := newTestCache[string, string](t, Config{
 		MaxSize:         10,
 		ShardCount:      1,
 		CleanupInterval: 0,
@@ -496,7 +639,7 @@ func TestDeleteOrdersAfterPendingSet(t *testing.T) {
 		}
 	}()
 
-	if err := cache.Set("key", "value", time.Hour); err != nil {
+	if err := cache.SetAsync("key", "value", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 
@@ -543,7 +686,7 @@ func TestSetInPlaceUpdate(t *testing.T) {
 		EvictionPolicy:  LRU,
 		StatsEnabled:    true,
 	}
-	cache := New[string, string](config)
+	cache := newTestCache[string, string](t, config)
 	defer cache.Close()
 
 	// Set initial value
@@ -596,7 +739,7 @@ func TestSetLFUFrequencyReset(t *testing.T) {
 		EvictionPolicy:  LFU,
 		StatsEnabled:    true,
 	}
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Add items

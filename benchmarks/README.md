@@ -13,9 +13,9 @@ use `b.RunParallel` to measure concurrent cache access.
 
 Async and strict write semantics are reported separately:
 
-- **Async**: Kioshun uses `Set`; Ristretto uses `SetWithTTL`; async caches are
+- **Async**: Kioshun uses `SetAsync`; Ristretto uses `SetWithTTL`; async caches are
   flushed outside the timed section.
-- **Strict**: Kioshun uses `SetSync`; Ristretto calls `Wait` after each write;
+- **Strict**: Kioshun uses `Set`; Ristretto calls `Wait` after each write;
   synchronous caches use their normal `Set`.
 
 ### Cache Configuration

@@ -63,16 +63,16 @@ type cacheOptions struct {
 var cacheOrder = []string{"kioshun", "ristretto", "bigcache", "freecache", "go-cache"}
 
 type KioshunWrapper struct {
-	cache *kioshun.InMemoryCache[string, []byte]
+	cache *kioshun.Cache[string, []byte]
 	ttl   time.Duration
 }
 
 func (c *KioshunWrapper) Set(key string, value []byte) error {
-	return c.cache.Set(key, value, c.ttl)
+	return c.cache.SetAsync(key, value, c.ttl)
 }
 
 func (c *KioshunWrapper) SetStrict(key string, value []byte) error {
-	return c.cache.SetSync(key, value, c.ttl)
+	return c.cache.Set(key, value, c.ttl)
 }
 
 func (c *KioshunWrapper) Get(key string) ([]byte, bool) {
@@ -247,7 +247,7 @@ func newBenchCache(b *testing.B, name string, opts cacheOptions) cacheBench {
 	switch name {
 	case "kioshun":
 		return &KioshunWrapper{
-			cache: kioshun.New[string, []byte](kioshunConfig),
+			cache: newKioshunCache[string, []byte](b, kioshunConfig),
 			ttl:   kioshunTTL,
 		}
 	case "ristretto":
@@ -298,7 +298,10 @@ func forEachCache(b *testing.B, opts cacheOptions, fn func(*testing.B, cacheBenc
 	for _, name := range cacheOrder {
 		b.Run(name, func(b *testing.B) {
 			c := newBenchCache(b, name, opts)
-			defer c.Close()
+			defer func() {
+				b.StopTimer()
+				_ = c.Close()
+			}()
 			fn(b, c)
 		})
 	}

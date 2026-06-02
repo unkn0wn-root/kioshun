@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 const (
 	fnvOffset64 = 14695981039346656037

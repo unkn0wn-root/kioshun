@@ -7,10 +7,10 @@ import (
 )
 
 func TestNewPatternIndex(t *testing.T) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 
 	if pi == nil {
-		t.Fatal("NewPatternIndex() returned nil")
+		t.Fatal("newPatternIndex() returned nil")
 	}
 
 	if pi.root == nil {
@@ -52,16 +52,16 @@ func TestNormalizePath(t *testing.T) {
 }
 
 func TestPatternIndex_AddKey(t *testing.T) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 
 	// Test adding keys to different paths
-	pi.AddKey("/api/v1", "key1")
-	pi.AddKey("/api/v1", "key2")
-	pi.AddKey("/api/v2", "key3")
-	pi.AddKey("/", "rootkey")
+	pi.addKey("/api/v1", "key1")
+	pi.addKey("/api/v1", "key2")
+	pi.addKey("/api/v2", "key3")
+	pi.addKey("/", "rootkey")
 
 	// Verify keys were added correctly
-	keys := pi.GetMatchingKeys("/api/v1")
+	keys := pi.getMatchingKeys("/api/v1")
 	sort.Strings(keys)
 	expected := []string{"key1", "key2"}
 	sort.Strings(expected)
@@ -71,46 +71,46 @@ func TestPatternIndex_AddKey(t *testing.T) {
 	}
 
 	// Test root path
-	rootKeys := pi.GetMatchingKeys("/")
+	rootKeys := pi.getMatchingKeys("/")
 	if len(rootKeys) != 1 || rootKeys[0] != "rootkey" {
 		t.Errorf("Expected root key [rootkey], got %v", rootKeys)
 	}
 }
 
 func TestPatternIndex_RemoveKey(t *testing.T) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 
 	// Add some keys
-	pi.AddKey("/api/v1", "key1")
-	pi.AddKey("/api/v1", "key2")
-	pi.AddKey("/api/v2", "key3")
+	pi.addKey("/api/v1", "key1")
+	pi.addKey("/api/v1", "key2")
+	pi.addKey("/api/v2", "key3")
 
 	// Remove one key
-	pi.RemoveKey("/api/v1", "key1")
+	pi.removeKey("/api/v1", "key1")
 
 	// Verify key was removed
-	keys := pi.GetMatchingKeys("/api/v1")
+	keys := pi.getMatchingKeys("/api/v1")
 	if len(keys) != 1 || keys[0] != "key2" {
 		t.Errorf("Expected [key2], got %v", keys)
 	}
 
 	// Remove non-existent key (should not panic)
-	pi.RemoveKey("/api/v1", "nonexistent")
+	pi.removeKey("/api/v1", "nonexistent")
 
 	// Remove from non-existent path (should not panic)
-	pi.RemoveKey("/nonexistent", "key1")
+	pi.removeKey("/nonexistent", "key1")
 }
 
 func TestPatternIndex_GetMatchingKeys(t *testing.T) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 
 	// Add test data
-	pi.AddKey("/api/v1/users", "users-key1")
-	pi.AddKey("/api/v1/users", "users-key2")
-	pi.AddKey("/api/v1/posts", "posts-key1")
-	pi.AddKey("/api/v2/users", "v2-users-key1")
-	pi.AddKey("/static/css", "css-key1")
-	pi.AddKey("/", "root-key")
+	pi.addKey("/api/v1/users", "users-key1")
+	pi.addKey("/api/v1/users", "users-key2")
+	pi.addKey("/api/v1/posts", "posts-key1")
+	pi.addKey("/api/v2/users", "v2-users-key1")
+	pi.addKey("/static/css", "css-key1")
+	pi.addKey("/", "root-key")
 
 	tests := []struct {
 		name     string
@@ -128,7 +128,7 @@ func TestPatternIndex_GetMatchingKeys(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := pi.GetMatchingKeys(tt.pattern)
+			result := pi.getMatchingKeys(tt.pattern)
 			sort.Strings(result)
 			sort.Strings(tt.expected)
 			if !reflect.DeepEqual(result, tt.expected) {
@@ -139,37 +139,37 @@ func TestPatternIndex_GetMatchingKeys(t *testing.T) {
 }
 
 func TestPatternIndex_Clear(t *testing.T) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 
 	// Add some data
-	pi.AddKey("/api/v1", "key1")
-	pi.AddKey("/api/v2", "key2")
+	pi.addKey("/api/v1", "key1")
+	pi.addKey("/api/v2", "key2")
 
 	// Verify data exists
-	keys := pi.GetMatchingKeys("/*")
+	keys := pi.getMatchingKeys("/*")
 	if len(keys) == 0 {
 		t.Fatal("Expected keys before clear")
 	}
 
 	// Clear the index
-	pi.Clear()
+	pi.clear()
 
 	// Verify everything is cleared
-	keys = pi.GetMatchingKeys("/*")
+	keys = pi.getMatchingKeys("/*")
 	if len(keys) != 0 {
 		t.Errorf("Expected no keys after clear, got %v", keys)
 	}
 
 	// Verify we can still add keys after clear
-	pi.AddKey("/test", "test-key")
-	keys = pi.GetMatchingKeys("/test")
+	pi.addKey("/test", "test-key")
+	keys = pi.getMatchingKeys("/test")
 	if len(keys) != 1 || keys[0] != "test-key" {
 		t.Errorf("Expected [test-key] after clear and add, got %v", keys)
 	}
 }
 
 func TestPatternIndex_ConcurrentAccess(t *testing.T) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 
 	// Test concurrent reads and writes
 	done := make(chan bool)
@@ -177,7 +177,7 @@ func TestPatternIndex_ConcurrentAccess(t *testing.T) {
 	// Writer goroutine
 	go func() {
 		for i := 0; i < 100; i++ {
-			pi.AddKey("/api/test", "key"+string(rune(i)))
+			pi.addKey("/api/test", "key"+string(rune(i)))
 		}
 		done <- true
 	}()
@@ -185,7 +185,7 @@ func TestPatternIndex_ConcurrentAccess(t *testing.T) {
 	// Reader goroutine
 	go func() {
 		for i := 0; i < 100; i++ {
-			pi.GetMatchingKeys("/api/*")
+			pi.getMatchingKeys("/api/*")
 		}
 		done <- true
 	}()
@@ -194,7 +194,7 @@ func TestPatternIndex_ConcurrentAccess(t *testing.T) {
 	<-done
 
 	// Verify final state
-	keys := pi.GetMatchingKeys("/api/test")
+	keys := pi.getMatchingKeys("/api/test")
 	if len(keys) != 100 {
 		t.Errorf("Expected 100 keys, got %d", len(keys))
 	}
@@ -220,33 +220,33 @@ func TestPatternNode_Creation(t *testing.T) {
 }
 
 func BenchmarkPatternIndex_AddKey(b *testing.B) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pi.AddKey("/api/v1/users", "key"+string(rune(i)))
+		pi.addKey("/api/v1/users", "key"+string(rune(i)))
 	}
 }
 
 func BenchmarkPatternIndex_GetMatchingKeys(b *testing.B) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 	for i := 0; i < 1000; i++ {
-		pi.AddKey("/api/v1/users", "key"+string(rune(i)))
+		pi.addKey("/api/v1/users", "key"+string(rune(i)))
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pi.GetMatchingKeys("/api/v1/users")
+		pi.getMatchingKeys("/api/v1/users")
 	}
 }
 
 func BenchmarkPatternIndex_WildcardMatch(b *testing.B) {
-	pi := NewPatternIndex()
+	pi := newPatternIndex()
 	for i := 0; i < 100; i++ {
-		pi.AddKey("/api/v1/users", "users-key"+string(rune(i)))
-		pi.AddKey("/api/v1/posts", "posts-key"+string(rune(i)))
-		pi.AddKey("/api/v2/users", "v2-users-key"+string(rune(i)))
+		pi.addKey("/api/v1/users", "users-key"+string(rune(i)))
+		pi.addKey("/api/v1/posts", "posts-key"+string(rune(i)))
+		pi.addKey("/api/v2/users", "v2-users-key"+string(rune(i)))
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pi.GetMatchingKeys("/api/*")
+		pi.getMatchingKeys("/api/*")
 	}
 }

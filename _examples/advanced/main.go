@@ -18,16 +18,19 @@ type User struct {
 func main() {
 	fmt.Println("=== Advanced Cache Usage Example ===")
 
-	config := cache.Config{
+	config := kioshun.Config{
 		MaxSize:         10000,
 		ShardCount:      16,
 		CleanupInterval: 1 * time.Minute,
 		DefaultTTL:      30 * time.Minute,
-		EvictionPolicy:  cache.LRU,
+		EvictionPolicy:  kioshun.LRU,
 		StatsEnabled:    true,
 	}
 
-	userCache := cache.New[string, User](config)
+	userCache, err := kioshun.New[string, User](config)
+	if err != nil {
+		panic(err)
+	}
 	defer userCache.Close()
 
 	fmt.Println("\n1. Operations with complex data types:")
@@ -87,16 +90,40 @@ func main() {
 
 	fmt.Println("\n3. Cache manager for multiple cache instances:")
 
-	manager := cache.NewManager()
+	manager := kioshun.NewManager()
 	defer manager.CloseAll()
 
-	manager.RegisterCache("users", cache.UserCacheConfig())
-	manager.RegisterCache("sessions", cache.SessionCacheConfig())
-	manager.RegisterCache("api_responses", cache.APICacheConfig())
+	userConfig := kioshun.DefaultConfig()
+	userConfig.MaxSize = 10000
+	sessionConfig := kioshun.DefaultConfig()
+	sessionConfig.MaxSize = 50000
+	sessionConfig.DefaultTTL = 2 * time.Hour
+	apiConfig := kioshun.DefaultConfig()
+	apiConfig.MaxSize = 100000
+	apiConfig.DefaultTTL = 15 * time.Minute
 
-	userManagedCache, _ := cache.GetCache[string, User](manager, "users")
-	sessionCache, _ := cache.GetCache[string, string](manager, "sessions")
-	apiCache, _ := cache.GetCache[string, []byte](manager, "api_responses")
+	if err := manager.Register("users", userConfig); err != nil {
+		panic(err)
+	}
+	if err := manager.Register("sessions", sessionConfig); err != nil {
+		panic(err)
+	}
+	if err := manager.Register("api_responses", apiConfig); err != nil {
+		panic(err)
+	}
+
+	userManagedCache, err := kioshun.GetCache[string, User](manager, "users")
+	if err != nil {
+		panic(err)
+	}
+	sessionCache, err := kioshun.GetCache[string, string](manager, "sessions")
+	if err != nil {
+		panic(err)
+	}
+	apiCache, err := kioshun.GetCache[string, []byte](manager, "api_responses")
+	if err != nil {
+		panic(err)
+	}
 
 	userManagedCache.Set("managed_user", users[0], 1*time.Hour)
 	sessionCache.Set("session_123", "user_session_token", 2*time.Hour)
@@ -104,11 +131,21 @@ func main() {
 
 	fmt.Println("\n4. Global cache usage:")
 
-	cache.RegisterGlobalCache("global_users", cache.UserCacheConfig())
-	cache.RegisterGlobalCache("global_sessions", cache.SessionCacheConfig())
+	if err := kioshun.RegisterGlobalCache("global_users", userConfig); err != nil {
+		panic(err)
+	}
+	if err := kioshun.RegisterGlobalCache("global_sessions", sessionConfig); err != nil {
+		panic(err)
+	}
 
-	globalUserCache, _ := cache.GetGlobalCache[string, User]("global_users")
-	globalSessionCache, _ := cache.GetGlobalCache[string, string]("global_sessions")
+	globalUserCache, err := kioshun.GetGlobalCache[string, User]("global_users")
+	if err != nil {
+		panic(err)
+	}
+	globalSessionCache, err := kioshun.GetGlobalCache[string, string]("global_sessions")
+	if err != nil {
+		panic(err)
+	}
 
 	globalUserCache.Set("global_user_1", users[0], 1*time.Hour)
 	globalSessionCache.Set("global_session_1", "global_token", 2*time.Hour)
@@ -142,7 +179,7 @@ func main() {
 	fmt.Println("\n6. TTL and expiration handling:")
 
 	// short TTL
-	shortTTLCache := cache.NewWithDefaults[string, string]()
+	shortTTLCache := kioshun.NewDefault[string, string]()
 	defer shortTTLCache.Close()
 
 	shortTTLCache.Set("short_lived_1", "expires_soon", 1*time.Second)
@@ -168,7 +205,7 @@ func main() {
 
 	fmt.Println("\n8. Batch operations:")
 
-	batchCache := cache.NewWithDefaults[string, string]()
+	batchCache := kioshun.NewDefault[string, string]()
 	defer batchCache.Close()
 
 	// simulate batch insert
