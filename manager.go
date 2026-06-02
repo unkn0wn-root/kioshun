@@ -50,7 +50,6 @@ func (m *Manager) Register(name string, config Config) error {
 
 // GetCache returns the named typed cache, creating it from the registered
 // configuration (or DefaultConfig when none is registered) on first use.
-// Note to myself: Go 1.27 should have generic methods (yeah)
 func GetCache[K comparable, V any](m *Manager, name string) (*Cache[K, V], error) {
 	if cached, ok := m.caches.Load(name); ok {
 		return assertCache[K, V](name, cached)
