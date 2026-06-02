@@ -96,6 +96,12 @@ if err != nil {
 }
 ```
 
+> **Goroutines:** each cache runs one write-worker goroutine per shard (plus a
+> cleanup goroutine when `CleanupInterval > 0`), so `ShardCount` sets the number
+> of background goroutines — default `min(NumCPU*4, 256)`. If you create many
+> caches (e.g. via the cache `Manager`), set `ShardCount` explicitly to bound the
+> total.
+
 ## API
 
 ```go
