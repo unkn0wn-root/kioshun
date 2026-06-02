@@ -6,7 +6,7 @@
   *"kee-oh-shoon" /kiːoʊʃuːn/*
 
   [![Go Version](https://img.shields.io/badge/Go-1.24+-blue.svg)](https://golang.org)
-  [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+  [![License](https://img.shields.io/badge/license-Apache%20License%202.0-green)](LICENSE)
   [![CI](https://github.com/unkn0wn-root/kioshun/actions/workflows/test.yml/badge.svg)](https://github.com/unkn0wn-root/kioshun/actions)
 
 
@@ -14,11 +14,12 @@
 </div>
 
 > [!WARNING]
-> v1 is a breaking redesign, not a drop-in upgrade from earlier releases!
-> The biggest change is that clustering has been removed: the old peer-to-peer features are no longer part of the project. The focus is now on continuously improving cache performance and correctness.
-> The cache core was also rebuilt: the previous `AdmissionLFU` default has been replaced by `SieveTinyLFU` with probation/main queues, ghost entries, TinyLFU sketching, adaptive segment sizing and queued/batched writes.
+> <b>v1</b> is a complete redesign, not a drop-in upgrade from earlier releases!
+>
+> The biggest change is that clustering has been removed - the old peer-to-peer features are no longer part of the project. The focus is now on continuously improving cache performance and correctness.
+> The cache core was also rebuilt - `AdmissionLFU` default has been replaced by `SieveTinyLFU` with probation/main queues, ghost entries, TinyLFU sketching, adaptive segment sizing and queued/batched writes.
+>
 > Public APIs changed as part of the redesign, including `New` and `NewDefault` replacing `NewWithDefaults`, cache policy/config names changing and HTTP middleware moving to the `httpcache` package.
-> Review the v1 docs and examples before upgrading.
 
 ## Index
 
@@ -68,6 +69,8 @@ func main() {
 
     // Queue a write for high-throughput paths
     c.SetAsync("user:456", "David Nice 3", 5*time.Minute)
+
+    // Optional: wait when later code must observe queued writes
     c.Sync()
 
     // Get value
@@ -87,14 +90,14 @@ func main() {
 
 ```go
 config := kioshun.Config{
-    MaxSize:         100000,             // Maximum number of items
-    ShardCount:      16,                 // Number of shards (0 = auto-detect)
-    CleanupInterval: 5 * time.Minute,    // Cleanup frequency
-    DefaultTTL:      30 * time.Minute,   // Default expiration time
+    MaxSize:         100000,               // Maximum number of items
+    ShardCount:      16,                   // Number of shards (0 = auto-detect)
+    CleanupInterval: 5 * time.Minute,      // Cleanup frequency
+    DefaultTTL:      30 * time.Minute,     // Default expiration time
     EvictionPolicy:  kioshun.SieveTinyLFU, // Eviction algorithm (default)
-    StatsEnabled:    true,               // Enable statistics collection
-    WriteBufferSize: 1024,               // Per-shard async write queue
-    WriteBatchSize:  64,                 // Max commands applied per worker batch
+    StatsEnabled:    true,                 // Enable statistics collection
+    WriteBufferSize: 1024,                 // Per-shard async write queue
+    WriteBatchSize:  64,                   // Max commands applied per worker batch
 }
 
 c, err := kioshun.New[string, any](config)
@@ -129,9 +132,16 @@ c.Cleanup()
 c.Close() error
 ```
 
-`Set` is synchronous and gives immediate read-after-write visibility for the key.
-Use `SetAsync` for queued high-throughput writes, and call `Sync` when a caller
-needs a global fence for queued writes across all shards.
+> `Set` is synchronous and gives immediate read-after-write visibility for the key.
+> `SetAsync` is optional and only accepts the write into the shard queue meaning that the value
+> becomes visible after a background worker commits it.
+
+> Skip `Sync` for fire-and-forget or high throughput write paths where immediate
+> read-after-write visibility is not required. Call `Sync` at boundaries where
+> queued writes must be committed before continuing, such as tests, cache warmup,
+> shutdown handoff or reads that must observe previous async writes. `Sync` blocks
+> and reduces the throughput benefit of async writes so prefer `Set` for single
+> writes that need immediate visibility.
 
 ### Statistics
 
