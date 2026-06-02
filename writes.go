@@ -363,7 +363,7 @@ func (c *Cache[K, V]) applySetLocked(
 			shard.sieve.recordAccess(kh)
 		}
 
-		item := acquireCacheItem[V](&c.itemPool)
+		item := acquireCacheItem[K, V](&c.itemPool)
 		item.value = value
 		item.lastAccess = now
 		item.lfuFreq = 0
@@ -393,7 +393,7 @@ func (c *Cache[K, V]) applySetLocked(
 		c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
 	}
 
-	item := acquireCacheItem[V](&c.itemPool)
+	item := acquireCacheItem[K, V](&c.itemPool)
 	item.value = value
 	item.lastAccess = now
 	item.lfuFreq = 0
@@ -426,7 +426,7 @@ func (c *Cache[K, V]) clearShardLocked(shard *shard[K, V]) {
 	for _, item := range shard.data {
 		releaseCacheItem(&c.itemPool, item)
 	}
-	shard.data = make(map[K]*cacheItem[V])
+	shard.data = make(map[K]*cacheItem[K, V])
 	shard.initLRU()
 	if c.config.EvictionPolicy == LFU {
 		shard.lfuList = newLFUList[K, V]()

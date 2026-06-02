@@ -47,15 +47,18 @@ type Store[K comparable, V any] interface {
 	Close() error
 }
 
-type cacheItem[V any] struct {
+// Cache implements Store; this assertion keeps the boundary interface honest.
+var _ Store[string, int] = (*Cache[string, int])(nil)
+
+type cacheItem[K comparable, V any] struct {
 	value      V
 	expireTime int64 // absolute ns; 0 => no expiration
 	lastAccess int64 // last touch time (ns) for policies that use it
 	lfuFreq    int64 // exact LFU counter
-	prev       *cacheItem[V]
-	next       *cacheItem[V]
-	sieveQ     *sieveQueue[V]
-	key        any // original key for deletions
+	prev       *cacheItem[K, V]
+	next       *cacheItem[K, V]
+	sieveQ     *sieveQueue[K, V]
+	key        K // original key for deletions
 	hash       uint64
 	tag        uint16
 	queue      sieveQueueID
@@ -63,17 +66,17 @@ type cacheItem[V any] struct {
 	visited    uint32
 }
 
-func acquireCacheItem[V any](pool *sync.Pool) *cacheItem[V] {
-	it := pool.Get().(*cacheItem[V])
-	*it = cacheItem[V]{}
+func acquireCacheItem[K comparable, V any](pool *sync.Pool) *cacheItem[K, V] {
+	it := pool.Get().(*cacheItem[K, V])
+	*it = cacheItem[K, V]{}
 	return it
 }
 
-func releaseCacheItem[V any](pool *sync.Pool, it *cacheItem[V]) {
+func releaseCacheItem[K comparable, V any](pool *sync.Pool, it *cacheItem[K, V]) {
 	if it == nil {
 		return
 	}
-	*it = cacheItem[V]{}
+	*it = cacheItem[K, V]{}
 	pool.Put(it)
 }
 
@@ -176,7 +179,7 @@ type Cache[K comparable, V any] struct {
 	closeOnce   sync.Once
 	closed      int32 // 1 => cache closed; hot-path check
 	workers     sync.WaitGroup
-	itemPool    sync.Pool // *cacheItem[V] reuse to lower GC pressure
+	itemPool    sync.Pool // *cacheItem[K, V] reuse to lower GC pressure
 	waiterPool  sync.Pool // write ack waiters for synchronous mutation paths
 	hasher      hasher[K]
 	evictor     evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
@@ -228,7 +231,7 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 		cleanupCh: make(chan struct{}, 1),
 		closeCh:   make(chan struct{}),
 		itemPool: sync.Pool{
-			New: func() any { return &cacheItem[V]{} },
+			New: func() any { return &cacheItem[K, V]{} },
 		},
 		waiterPool: sync.Pool{
 			New: func() any { return &writeWaiter{ch: make(chan struct{}, 1)} },
@@ -260,7 +263,7 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 		}
 
 		s := &shard[K, V]{
-			data:       make(map[K]*cacheItem[V], capHint),
+			data:       make(map[K]*cacheItem[K, V], capHint),
 			cap:        sc,
 			wake:       make(chan struct{}, 1),
 			writeBatch: make([]writeCommand[K, V], config.WriteBatchSize),
@@ -272,7 +275,7 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 			s.lfuList = newLFUList[K, V]() // O(1) freq buckets
 		}
 		if config.EvictionPolicy == SieveTinyLFU && s.cap > 0 {
-			s.sieve = newSieveTinyLFU[V](s.cap, config.ProbationRatio, config.GhostRatio)
+			s.sieve = newSieveTinyLFU[K, V](s.cap, config.ProbationRatio, config.GhostRatio)
 			s.sieve.adaptive = config.Adapt
 			s.readBuf = newReadBuffer() // per-shard read sampling for the sketch
 		}
@@ -721,7 +724,7 @@ func (c *Cache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
 }
 
-func (c *Cache[K, V]) removeItem(s *shard[K, V], it *cacheItem[V], ev bool) {
+func (c *Cache[K, V]) removeItem(s *shard[K, V], it *cacheItem[K, V], ev bool) {
 	mode := dropLRU
 	switch c.config.EvictionPolicy {
 	case LFU:

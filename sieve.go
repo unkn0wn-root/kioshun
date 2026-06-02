@@ -26,30 +26,30 @@ const (
 
 const sieveVisited = uint32(1)
 
-func sieveItemVisited[V any](it *cacheItem[V]) bool {
+func sieveItemVisited[K comparable, V any](it *cacheItem[K, V]) bool {
 	return it != nil && atomic.LoadUint32(&it.visited) != 0
 }
 
-func markSieveItemVisited[V any](it *cacheItem[V]) {
+func markSieveItemVisited[K comparable, V any](it *cacheItem[K, V]) {
 	if it != nil && atomic.LoadUint32(&it.visited) == 0 {
 		atomic.StoreUint32(&it.visited, sieveVisited)
 	}
 }
 
-func clearSieveItemVisited[V any](it *cacheItem[V]) {
+func clearSieveItemVisited[K comparable, V any](it *cacheItem[K, V]) {
 	if it != nil {
 		atomic.StoreUint32(&it.visited, 0)
 	}
 }
 
 // sieveQueue is an intrusive FIFO queue backed by cacheItem links.
-type sieveQueue[V any] struct {
-	head cacheItem[V]
-	tail cacheItem[V]
+type sieveQueue[K comparable, V any] struct {
+	head cacheItem[K, V]
+	tail cacheItem[K, V]
 	size int64
 }
 
-func (q *sieveQueue[V]) init() {
+func (q *sieveQueue[K, V]) init() {
 	q.head.prev = nil
 	q.head.next = &q.tail
 	q.head.sieveQ = nil
@@ -59,7 +59,7 @@ func (q *sieveQueue[V]) init() {
 	q.size = 0
 }
 
-func (q *sieveQueue[V]) pushFront(it *cacheItem[V]) {
+func (q *sieveQueue[K, V]) pushFront(it *cacheItem[K, V]) {
 	n := q.head.next
 	q.head.next = it
 	it.prev = &q.head
@@ -69,7 +69,7 @@ func (q *sieveQueue[V]) pushFront(it *cacheItem[V]) {
 	q.size++
 }
 
-func (q *sieveQueue[V]) popBack() *cacheItem[V] {
+func (q *sieveQueue[K, V]) popBack() *cacheItem[K, V] {
 	if q.empty() {
 		return nil
 	}
@@ -79,7 +79,7 @@ func (q *sieveQueue[V]) popBack() *cacheItem[V] {
 	return it
 }
 
-func (q *sieveQueue[V]) remove(it *cacheItem[V]) bool {
+func (q *sieveQueue[K, V]) remove(it *cacheItem[K, V]) bool {
 	if it == nil || it.sieveQ != q || it.prev == nil || it.next == nil {
 		return false
 	}
@@ -98,11 +98,11 @@ func (q *sieveQueue[V]) remove(it *cacheItem[V]) bool {
 	return true
 }
 
-func (q *sieveQueue[V]) empty() bool {
+func (q *sieveQueue[K, V]) empty() bool {
 	return q.size == 0
 }
 
-func (q *sieveQueue[V]) isSentinel(it *cacheItem[V]) bool {
+func (q *sieveQueue[K, V]) isSentinel(it *cacheItem[K, V]) bool {
 	return it == &q.head || it == &q.tail
 }
 
@@ -110,7 +110,7 @@ func (q *sieveQueue[V]) isSentinel(it *cacheItem[V]) bool {
 // remove clears sieveQ on eviction and the head/tail guards never carry a queue
 // pointer, so this one check subsumes the nil/guard/ownership tests the policy
 // would otherwise spell out at each call site.
-func (q *sieveQueue[V]) holds(it *cacheItem[V]) bool {
+func (q *sieveQueue[K, V]) holds(it *cacheItem[K, V]) bool {
 	return it != nil && it.sieveQ == q && it != &q.head && it != &q.tail
 }
 
@@ -122,16 +122,16 @@ type adaptiveController struct {
 	observationsInCycle uint64
 }
 
-type sieveTinyLFU[V any] struct {
-	probation sieveQueue[V]
-	main      sieveQueue[V]
+type sieveTinyLFU[K comparable, V any] struct {
+	probation sieveQueue[K, V]
+	main      sieveQueue[K, V]
 	ghost     ghostQueue
 	sketch    countMinSketch
 	door      doorkeeper
 
 	controller adaptiveController
 	stats      PolicyStats
-	hand       *cacheItem[V]
+	hand       *cacheItem[K, V]
 
 	capacity        int64
 	probationCap    int64
@@ -143,8 +143,8 @@ type sieveTinyLFU[V any] struct {
 	adaptive        bool
 }
 
-func newSieveTinyLFU[V any](c int64, pr, gr uint8) *sieveTinyLFU[V] {
-	p := &sieveTinyLFU[V]{capacity: c}
+func newSieveTinyLFU[K comparable, V any](c int64, pr, gr uint8) *sieveTinyLFU[K, V] {
+	p := &sieveTinyLFU[K, V]{capacity: c}
 	p.probation.init()
 	p.main.init()
 
@@ -182,11 +182,11 @@ func newSieveTinyLFU[V any](c int64, pr, gr uint8) *sieveTinyLFU[V] {
 	return p
 }
 
-func (p *sieveTinyLFU[V]) recordAccess(h uint64) {
+func (p *sieveTinyLFU[K, V]) recordAccess(h uint64) {
 	p.incrementFrequency(h)
 }
 
-func (p *sieveTinyLFU[V]) incrementFrequency(h uint64) {
+func (p *sieveTinyLFU[K, V]) incrementFrequency(h uint64) {
 	if p.door.add(h) {
 		p.sketch.add(h)
 	}
@@ -198,7 +198,7 @@ func (p *sieveTinyLFU[V]) incrementFrequency(h uint64) {
 	p.tick()
 }
 
-func (p *sieveTinyLFU[V]) estimate(h uint64) uint8 {
+func (p *sieveTinyLFU[K, V]) estimate(h uint64) uint8 {
 	e := p.sketch.estimate(h)
 	if p.door.contains(h) && e < sketchMaxCounter {
 		e++
@@ -207,11 +207,11 @@ func (p *sieveTinyLFU[V]) estimate(h uint64) uint8 {
 }
 
 // owns reports whether it currently resides in either SIEVE queue (probation or main).
-func (p *sieveTinyLFU[V]) owns(it *cacheItem[V]) bool {
+func (p *sieveTinyLFU[K, V]) owns(it *cacheItem[K, V]) bool {
 	return p.probation.holds(it) || p.main.holds(it)
 }
 
-func (p *sieveTinyLFU[V]) recordReadHit(it *cacheItem[V]) {
+func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
 	// reads only set the visited bit.
 	// queue ownership is maintained by the write.
 	if p.owns(it) {
@@ -219,7 +219,7 @@ func (p *sieveTinyLFU[V]) recordReadHit(it *cacheItem[V]) {
 	}
 }
 
-func (p *sieveTinyLFU[V]) recordUpdate(it *cacheItem[V]) {
+func (p *sieveTinyLFU[K, V]) recordUpdate(it *cacheItem[K, V]) {
 	switch it.sieveQ {
 	case &p.main:
 		it.queue = mainQueue
@@ -241,7 +241,7 @@ func (p *sieveTinyLFU[V]) recordUpdate(it *cacheItem[V]) {
 	}
 }
 
-func (p *sieveTinyLFU[V]) insert(it *cacheItem[V], gh bool) {
+func (p *sieveTinyLFU[K, V]) insert(it *cacheItem[K, V], gh bool) {
 	if gh && p.mainCap > 0 {
 		p.ghost.remove(it.hash, it.tag)
 		p.controller.ghostHits++
@@ -260,7 +260,7 @@ func (p *sieveTinyLFU[V]) insert(it *cacheItem[V], gh bool) {
 }
 
 // insertMain creates a visited main queue resident and seeds the SIEVE hand.
-func (p *sieveTinyLFU[V]) insertMain(it *cacheItem[V]) {
+func (p *sieveTinyLFU[K, V]) insertMain(it *cacheItem[K, V]) {
 	it.queue = mainQueue
 	it.reuse = 1
 	markSieveItemVisited(it)
@@ -270,7 +270,7 @@ func (p *sieveTinyLFU[V]) insertMain(it *cacheItem[V]) {
 	}
 }
 
-func (p *sieveTinyLFU[V]) remove(it *cacheItem[V]) bool {
+func (p *sieveTinyLFU[K, V]) remove(it *cacheItem[K, V]) bool {
 	if it == nil {
 		return false
 	}
@@ -300,7 +300,7 @@ func (p *sieveTinyLFU[V]) remove(it *cacheItem[V]) bool {
 	return true
 }
 
-func (p *sieveTinyLFU[V]) reset() {
+func (p *sieveTinyLFU[K, V]) reset() {
 	p.probation.init()
 	p.main.init()
 	p.ghost.clear()
@@ -311,7 +311,7 @@ func (p *sieveTinyLFU[V]) reset() {
 	p.hand = nil
 }
 
-func (p *sieveTinyLFU[V]) promote(it *cacheItem[V]) {
+func (p *sieveTinyLFU[K, V]) promote(it *cacheItem[K, V]) {
 	if it == nil || it.sieveQ == &p.main || p.mainCap <= 0 {
 		return
 	}
@@ -327,7 +327,7 @@ func (p *sieveTinyLFU[V]) promote(it *cacheItem[V]) {
 
 // dropProbationVictim records a probation eviction and remembers the key for
 // possible ghost-hit readmission.
-func (s *shard[K, V]) dropProbationVictim(it *cacheItem[V], pool *sync.Pool, stats bool) bool {
+func (s *shard[K, V]) dropProbationVictim(it *cacheItem[K, V], pool *sync.Pool, stats bool) bool {
 	p := s.sieve
 	h, tag := it.hash, it.tag
 	if !s.dropSieveItem(it, pool, stats, true) {
@@ -339,7 +339,7 @@ func (s *shard[K, V]) dropProbationVictim(it *cacheItem[V], pool *sync.Pool, sta
 	return true
 }
 
-func (s *shard[K, V]) evictProbation(pool *sync.Pool, stats bool) *cacheItem[V] {
+func (s *shard[K, V]) evictProbation(pool *sync.Pool, stats bool) *cacheItem[K, V] {
 	p := s.sieve
 	if p.probation.empty() {
 		return nil
@@ -361,7 +361,7 @@ func (s *shard[K, V]) evictProbation(pool *sync.Pool, stats bool) *cacheItem[V] 
 func (s *shard[K, V]) evictMain(
 	pool *sync.Pool,
 	stats bool,
-	in *cacheItem[V],
+	in *cacheItem[K, V],
 	tie bool,
 	scan int64,
 	force bool,
@@ -395,7 +395,7 @@ func (s *shard[K, V]) evictMain(
 func (s *shard[K, V]) enforceSieveCapacity(
 	pool *sync.Pool,
 	stats bool,
-	in *cacheItem[V],
+	in *cacheItem[K, V],
 	tie bool,
 ) {
 	p := s.sieve
@@ -451,7 +451,7 @@ func (s *shard[K, V]) overCapacity() bool {
 // mainCandidate normalizes a traversal cursor to a live main node: it falls back
 // to the main tail when the cursor has drifted off the queue and reports false
 // when main has no real (non-sentinel) node left to consider.
-func (p *sieveTinyLFU[V]) mainCandidate(it *cacheItem[V]) (*cacheItem[V], bool) {
+func (p *sieveTinyLFU[K, V]) mainCandidate(it *cacheItem[K, V]) (*cacheItem[K, V], bool) {
 	if !p.main.holds(it) {
 		it = p.main.tail.prev
 	}
@@ -461,7 +461,7 @@ func (p *sieveTinyLFU[V]) mainCandidate(it *cacheItem[V]) (*cacheItem[V], bool) 
 	return it, true
 }
 
-func (p *sieveTinyLFU[V]) findMainVictim(scan int64, force bool) *cacheItem[V] {
+func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K, V] {
 	if p.main.empty() {
 		return nil
 	}
@@ -503,7 +503,7 @@ func (p *sieveTinyLFU[V]) findMainVictim(scan int64, force bool) *cacheItem[V] {
 	return nil
 }
 
-func (p *sieveTinyLFU[V]) previousMainItem(it *cacheItem[V]) *cacheItem[V] {
+func (p *sieveTinyLFU[K, V]) previousMainItem(it *cacheItem[K, V]) *cacheItem[K, V] {
 	if it == nil {
 		return nil
 	}
@@ -518,7 +518,7 @@ func (p *sieveTinyLFU[V]) previousMainItem(it *cacheItem[V]) *cacheItem[V] {
 	return prev
 }
 
-func (p *sieveTinyLFU[V]) shouldAdmit(in, v *cacheItem[V], tie bool) bool {
+func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool {
 	// ghost hit or probation promotion has already proven short-term reuse.
 	// Once SIEVE finds an unvisited victim, that recency proof should beat stale
 	// sketch history.
@@ -540,7 +540,7 @@ func (p *sieveTinyLFU[V]) shouldAdmit(in, v *cacheItem[V], tie bool) bool {
 	return tie || (!sieveItemVisited(v) && v.reuse == 0)
 }
 
-func (p *sieveTinyLFU[V]) tick() {
+func (p *sieveTinyLFU[K, V]) tick() {
 	if !p.adaptive {
 		return
 	}
@@ -570,7 +570,7 @@ func (p *sieveTinyLFU[V]) tick() {
 	p.controller.observationsInCycle = 0
 }
 
-func (p *sieveTinyLFU[V]) setProbationCap(n int64) {
+func (p *sieveTinyLFU[K, V]) setProbationCap(n int64) {
 	n = min(max(n, p.minProbationCap), p.maxProbationCap)
 	p.probationCap = n
 	p.mainCap = p.capacity - n
@@ -598,6 +598,6 @@ func (s *shard[K, V]) forceDropSieveItem(pool *sync.Pool, stats bool) bool {
 	return false
 }
 
-func (s *shard[K, V]) dropSieveItem(it *cacheItem[V], pool *sync.Pool, stats bool, evicted bool) bool {
+func (s *shard[K, V]) dropSieveItem(it *cacheItem[K, V], pool *sync.Pool, stats bool, evicted bool) bool {
 	return s.dropItem(it, pool, stats, evicted, dropSieve)
 }

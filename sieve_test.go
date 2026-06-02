@@ -9,15 +9,15 @@ import (
 )
 
 func TestSieveQueuePushPopRemove(t *testing.T) {
-	var q sieveQueue[int]
+	var q sieveQueue[int, int]
 	q.init()
 	if !q.empty() {
 		t.Fatal("new segment should be empty")
 	}
 
-	a := &cacheItem[int]{value: 1}
-	b := &cacheItem[int]{value: 2}
-	c := &cacheItem[int]{value: 3}
+	a := &cacheItem[int, int]{value: 1}
+	b := &cacheItem[int, int]{value: 2}
+	c := &cacheItem[int, int]{value: 3}
 	q.pushFront(a)
 	q.pushFront(b)
 	q.pushFront(c)
@@ -128,7 +128,7 @@ func TestCountMinSketchIncrementEstimateAgeClear(t *testing.T) {
 }
 
 func TestDoorkeeperFiltersFirstFrequencyIncrement(t *testing.T) {
-	a := newSieveTinyLFU[int](32, 10, 100)
+	a := newSieveTinyLFU[int, int](32, 10, 100)
 	h := uint64(12345)
 
 	a.recordAccess(h)
@@ -155,7 +155,7 @@ func TestDoorkeeperFiltersFirstFrequencyIncrement(t *testing.T) {
 }
 
 func TestNewSieveTinyLFUDefaults(t *testing.T) {
-	a := newSieveTinyLFU[int](100, 0, 0)
+	a := newSieveTinyLFU[int, int](100, 0, 0)
 	if a.probationCap != 10 || a.mainCap != 90 || a.ghostCap != 90 {
 		t.Fatalf("caps pc=%d mc=%d gc=%d, want 10/90/90", a.probationCap, a.mainCap, a.ghostCap)
 	}
@@ -174,7 +174,7 @@ func TestNewSieveTinyLFUDefaults(t *testing.T) {
 }
 
 func TestNewSieveTinyLFUAdaptiveBounds(t *testing.T) {
-	a := newSieveTinyLFU[int](100, 10, 100)
+	a := newSieveTinyLFU[int, int](100, 10, 100)
 	if a.minProbationCap != 1 || a.maxProbationCap != 60 || a.adaptStep != 1 {
 		t.Fatalf("bounds lo=%d hi=%d st=%d, want 1/60/1", a.minProbationCap, a.maxProbationCap, a.adaptStep)
 	}
@@ -262,9 +262,9 @@ func TestNonAdmissionPolicyDoesNotInitializeAdmissionState(t *testing.T) {
 }
 
 func TestSieveTinyLFUBoundedVictimNeedsForce(t *testing.T) {
-	a := newSieveTinyLFU[int](8, 25, 100)
+	a := newSieveTinyLFU[int, int](8, 25, 100)
 	for k := 1; k <= 4; k++ {
-		a.insertMain(&cacheItem[int]{
+		a.insertMain(&cacheItem[int, int]{
 			key:     k,
 			hash:    uint64(k),
 			visited: sieveVisited,
@@ -338,15 +338,15 @@ func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
 }
 
 func TestSieveTinyLFUMaintainForcesCapacityAfterBoundedScan(t *testing.T) {
-	s := &shard[int, int]{data: make(map[int]*cacheItem[int]), cap: 3}
+	s := &shard[int, int]{data: make(map[int]*cacheItem[int, int]), cap: 3}
 	s.initLRU()
-	s.sieve = newSieveTinyLFU[int](3, 25, 100)
+	s.sieve = newSieveTinyLFU[int, int](3, 25, 100)
 	var p sync.Pool
-	p.New = func() any { return &cacheItem[int]{} }
+	p.New = func() any { return &cacheItem[int, int]{} }
 
-	var in *cacheItem[int]
+	var in *cacheItem[int, int]
 	for k := 1; k <= 4; k++ {
-		it := &cacheItem[int]{
+		it := &cacheItem[int, int]{
 			value:   k,
 			key:     k,
 			hash:    uint64(k),
@@ -571,14 +571,14 @@ func TestSieveTinyLFUCleanupRemovesExpiredQueueItem(t *testing.T) {
 }
 
 func TestSieveTinyLFUMainSieveEvictionClearsVisited(t *testing.T) {
-	s := &shard[int, int]{data: make(map[int]*cacheItem[int])}
+	s := &shard[int, int]{data: make(map[int]*cacheItem[int, int])}
 	s.initLRU()
-	s.sieve = newSieveTinyLFU[int](4, 25, 100)
+	s.sieve = newSieveTinyLFU[int, int](4, 25, 100)
 	var p sync.Pool
-	p.New = func() any { return &cacheItem[int]{} }
+	p.New = func() any { return &cacheItem[int, int]{} }
 
 	for k := 1; k <= 3; k++ {
-		it := &cacheItem[int]{
+		it := &cacheItem[int, int]{
 			value:   k,
 			key:     k,
 			hash:    uint64(k),
@@ -617,9 +617,9 @@ func TestSieveTinyLFUMainSieveEvictionClearsVisited(t *testing.T) {
 }
 
 func TestSieveTinyLFUEqualFrequencyTieRejection(t *testing.T) {
-	a := newSieveTinyLFU[int](4, 25, 100)
-	in := &cacheItem[int]{hash: 11}
-	v := &cacheItem[int]{hash: 22, queue: mainQueue, reuse: 1}
+	a := newSieveTinyLFU[int, int](4, 25, 100)
+	in := &cacheItem[int, int]{hash: 11}
+	v := &cacheItem[int, int]{hash: 22, queue: mainQueue, reuse: 1}
 
 	for i := 0; i < 3; i++ {
 		a.sketch.increment(in.hash)
@@ -821,7 +821,7 @@ func assertSieveShardConsistent[K comparable, V any](t *testing.T, s *shard[K, V
 		t.Fatalf("map size=%d, shard size=%d", len(s.data), atomic.LoadInt64(&s.size))
 	}
 
-	seen := make(map[*cacheItem[V]]struct{}, len(s.data))
+	seen := make(map[*cacheItem[K, V]]struct{}, len(s.data))
 	pn := assertSieveQueueConsistent(t, &s.sieve.probation, probationQueue, len(s.data), seen)
 	mn := assertSieveQueueConsistent(t, &s.sieve.main, mainQueue, len(s.data), seen)
 	total := pn + mn
@@ -839,12 +839,12 @@ func assertSieveShardConsistent[K comparable, V any](t *testing.T, s *shard[K, V
 	}
 }
 
-func assertSieveQueueConsistent[V any](
+func assertSieveQueueConsistent[K comparable, V any](
 	t *testing.T,
-	q *sieveQueue[V],
+	q *sieveQueue[K, V],
 	id sieveQueueID,
 	residents int,
-	seen map[*cacheItem[V]]struct{},
+	seen map[*cacheItem[K, V]]struct{},
 ) int64 {
 	t.Helper()
 

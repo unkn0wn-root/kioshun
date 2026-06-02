@@ -7,7 +7,7 @@ import (
 
 type shard[K comparable, V any] struct {
 	mu   sync.RWMutex
-	data map[K]*cacheItem[V]
+	data map[K]*cacheItem[K, V]
 	cap  int64 // resident item limit for this shard; 0 => unlimited
 
 	queue writeQueue[K, V] // async mutation transport consumed by this shard's worker
@@ -29,8 +29,8 @@ type shard[K comparable, V any] struct {
 
 	// LRU list sentinels (head.next = MRU, tail.prev = LRU).
 	// head.prev == nil, tail.next == nil, and the head-to-tail chain is linked.
-	head *cacheItem[V]
-	tail *cacheItem[V]
+	head *cacheItem[K, V]
+	tail *cacheItem[K, V]
 
 	lfuList *lfuList[K, V] // Allocated only for pure LFU policy.
 
@@ -40,7 +40,7 @@ type shard[K comparable, V any] struct {
 	evictions   int64 // per-shard evictions
 	expirations int64 // per-shard TTL expirations
 
-	sieve *sieveTinyLFU[V]
+	sieve *sieveTinyLFU[K, V]
 }
 
 type itemDropMode uint8
@@ -52,7 +52,7 @@ const (
 )
 
 func (s *shard[K, V]) dropItem(
-	item *cacheItem[V],
+	item *cacheItem[K, V],
 	itemPool *sync.Pool,
 	statsEnabled bool,
 	evicted bool,
@@ -95,20 +95,15 @@ func (s *shard[K, V]) dropItem(
 	return true
 }
 
-func (s *shard[K, V]) itemKey(item *cacheItem[V]) (K, bool) {
+func (s *shard[K, V]) itemKey(item *cacheItem[K, V]) (K, bool) {
 	if item == nil {
 		var zero K
 		return zero, false
 	}
-	key, ok := item.key.(K)
-	if !ok {
-		var zero K
-		return zero, false
-	}
-	return key, true
+	return item.key, true
 }
 
-func (s *shard[K, V]) ownsItem(item *cacheItem[V]) bool {
+func (s *shard[K, V]) ownsItem(item *cacheItem[K, V]) bool {
 	key, ok := s.itemKey(item)
 	return ok && s.data[key] == item
 }
@@ -154,13 +149,13 @@ func (s *shard[K, V]) drainReadSamples() {
 }
 
 func (s *shard[K, V]) initLRU() {
-	s.head = &cacheItem[V]{}
-	s.tail = &cacheItem[V]{}
+	s.head = &cacheItem[K, V]{}
+	s.tail = &cacheItem[K, V]{}
 	s.head.next = s.tail
 	s.tail.prev = s.head
 }
 
-func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
+func (s *shard[K, V]) addToLRUHead(item *cacheItem[K, V]) {
 	oldNext := s.head.next
 	s.head.next = item
 	item.next = oldNext
@@ -168,7 +163,7 @@ func (s *shard[K, V]) addToLRUHead(item *cacheItem[V]) {
 	oldNext.prev = item
 }
 
-func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
+func (s *shard[K, V]) removeFromLRU(item *cacheItem[K, V]) {
 	if item.prev != nil {
 		item.prev.next = item.next
 	}
@@ -179,7 +174,7 @@ func (s *shard[K, V]) removeFromLRU(item *cacheItem[V]) {
 	item.next = nil
 }
 
-func (s *shard[K, V]) moveToLRUHead(item *cacheItem[V]) {
+func (s *shard[K, V]) moveToLRUHead(item *cacheItem[K, V]) {
 	if s.head.next == item {
 		return
 	}

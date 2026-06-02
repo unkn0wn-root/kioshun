@@ -12,12 +12,12 @@ import (
 func newReadTestShard(t *testing.T, cap int64) *shard[int, int] {
 	t.Helper()
 	s := &shard[int, int]{
-		data: make(map[int]*cacheItem[int]),
+		data: make(map[int]*cacheItem[int, int]),
 		cap:  cap,
 		wake: make(chan struct{}, 1),
 	}
 	s.initLRU()
-	s.sieve = newSieveTinyLFU[int](cap, 10, 100)
+	s.sieve = newSieveTinyLFU[int, int](cap, 10, 100)
 	s.readBuf = newReadBuffer()
 	return s
 }
