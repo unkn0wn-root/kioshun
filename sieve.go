@@ -114,12 +114,33 @@ func (q *sieveQueue[K, V]) holds(it *cacheItem[K, V]) bool {
 	return it != nil && it.sieveQ == q && it != &q.head && it != &q.tail
 }
 
+// adaptiveController accumulates the per-cycle signals that drive probation/main
+// resizing. Every counter is maintained exclusively on the single-consumer
+// maintenance path (the write worker, or a caller holding the shard write lock),
+// so all increments, reads, and resets are plain — none of these fields is
+// touched from the concurrent read path.
+//
+// mainSurvivals counts main-queue residents the SIEVE hand spared during
+// eviction sweeps (a set visited bit buys a second chance). It is the
+// maintenance-path proxy for "the main cache is earning its capacity", and
+// replaces a per-read main-hit counter whose atomic increment contended on the
+// read hot path. Counting survivors instead of raw hits also tracks how many
+// distinct main items reads keep alive, rather than being skewed by a single
+// hammered key.
 type adaptiveController struct {
 	ghostHits           uint64
 	probationEvictions  uint64
 	promotions          uint64
-	mainHits            uint64
+	mainSurvivals       uint64
 	observationsInCycle uint64
+}
+
+func (c *adaptiveController) resetCycle() {
+	c.ghostHits = 0
+	c.probationEvictions = 0
+	c.promotions = 0
+	c.mainSurvivals = 0
+	c.observationsInCycle = 0
 }
 
 type sieveTinyLFU[K comparable, V any] struct {
@@ -212,8 +233,11 @@ func (p *sieveTinyLFU[K, V]) owns(it *cacheItem[K, V]) bool {
 }
 
 func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
-	// reads only set the visited bit.
-	// queue ownership is maintained by the write.
+	// Reads only set the visited bit; queue ownership is maintained by the write.
+	// markSieveItemVisited is a conditional atomic store (skipped once the bit is
+	// set), so a hot item costs at most one shared-state load here. The adaptive
+	// controller's "main is useful" signal is gathered on the maintenance path
+	// (see findMainVictim), so the read path stays free of contended writes.
 	if p.owns(it) {
 		markSieveItemVisited(it)
 	}
@@ -306,7 +330,7 @@ func (p *sieveTinyLFU[K, V]) reset() {
 	p.ghost.clear()
 	p.sketch.clear()
 	p.door.clear()
-	p.controller = adaptiveController{}
+	p.controller.resetCycle()
 	p.stats = PolicyStats{}
 	p.hand = nil
 }
@@ -478,6 +502,13 @@ func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K
 		}
 		if sieveItemVisited(it) {
 			clearSieveItemVisited(it)
+			if p.adaptive {
+				// The hand spared a visited main resident: a maintenance-path
+				// observation that reads are keeping main entries alive. This is
+				// the signal the adaptive shrink decision consumes, gathered here
+				// instead of via a contended counter on every main read hit.
+				p.controller.mainSurvivals++
+			}
 			if it.reuse > 0 {
 				it.reuse--
 			}
@@ -557,17 +588,13 @@ func (p *sieveTinyLFU[K, V]) tick() {
 			p.setProbationCap(p.probationCap + p.adaptStep)
 		}
 	case p.controller.probationEvictions > p.controller.promotions*2 &&
-		p.controller.mainHits > p.controller.promotions:
+		p.controller.mainSurvivals > p.controller.promotions:
 		if p.probationCap > p.minProbationCap {
 			p.setProbationCap(p.probationCap - p.adaptStep)
 		}
 	}
 
-	p.controller.ghostHits = 0
-	p.controller.probationEvictions = 0
-	p.controller.promotions = 0
-	p.controller.mainHits = 0
-	p.controller.observationsInCycle = 0
+	p.controller.resetCycle()
 }
 
 func (p *sieveTinyLFU[K, V]) setProbationCap(n int64) {

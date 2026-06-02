@@ -615,6 +615,13 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 	}
 	shard.mu.RUnlock()
 
+	// Resolve expiry only after releasing the read lock. time.Now() is a vDSO
+	// call which means that holding the shared lock across it lengthens every reader's
+	// section, which under load makes TryRLock fail more often and pushes readers
+	// onto the exclusive getSieveContended path. RecordReadHit above only sets the visited
+	// bit, so recording a read on an entry we then find expired is harmless: the
+	// entry is removed (and its bit cleared) below and the adaptive controller is
+	// never touched on the read path.
 	if res.expireTime > 0 {
 		res.now = time.Now().UnixNano()
 		if res.now > res.expireTime {

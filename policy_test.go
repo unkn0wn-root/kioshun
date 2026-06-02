@@ -280,3 +280,58 @@ func TestPolicyWriteHeavy(t *testing.T) {
 		t.Fatalf("SieveTinyLFU regressed too far on write-heavy trace: admission=%d lru=%d", ad.hit, lru.hit)
 	}
 }
+
+// runTraceAdaptive replays a trace through an adaptive single-shard SieveTinyLFU
+// cache and reports the run plus the probation cap before/after so the test can
+// confirm the adaptive controller actually moved the split.
+func runTraceAdaptive(cap int64, tr []int) (r polRun, pcStart, pcEnd int64) {
+	c, err := New[int, int](Config{
+		MaxSize:         cap,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  SieveTinyLFU,
+		StatsEnabled:    true,
+		Adapt:           true,
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close()
+
+	pcStart = c.shards[0].sieve.probationCap
+	r = polRun{name: "SieveTinyLFU+Adapt", pol: SieveTinyLFU}
+	r.hit, r.miss = runTraceInto(c, tr)
+	r.size = c.Size()
+	pcEnd = c.shards[0].sieve.probationCap
+	return r, pcStart, pcEnd
+}
+
+// TestPolicyAdaptiveHitRatio exercises the Adapt=true control path end to end
+// (the rest of the policy suite runs with adaptation off). The maintenance-path
+// mainSurvivals signal feeds the shrink decision here; the assertions guard that
+// bidirectional resizing keeps the cache at least as good as the cheap baselines.
+func TestPolicyAdaptiveHitRatio(t *testing.T) {
+	cap := int64(128)
+
+	// Stationary Zipf: the adaptive split must still beat plain FIFO.
+	zipf := zipfTrace(11, 30_000, 2_000, 1.12)
+	ad, pc0, pc1 := runTraceAdaptive(cap, zipf)
+	fi := runTrace(FIFO, cap, zipf)
+	t.Logf("zipf adaptive=%.2f%% fifo=%.2f%% probationCap %d->%d",
+		hitPct(ad)*100, hitPct(fi)*100, pc0, pc1)
+	assertCap(t, ad, cap)
+	if ad.hit < fi.hit {
+		t.Fatalf("adaptive SieveTinyLFU below FIFO on zipf: adaptive=%d fifo=%d", ad.hit, fi.hit)
+	}
+
+	// Shifting hotset: adaptation must not collapse the hit rate (same floor the
+	// static TestPolicyShiftingHotset enforces).
+	shift := shiftingTrace(23, 8, 4_000, 96, 8_000)
+	sad, spc0, spc1 := runTraceAdaptive(cap, shift)
+	t.Logf("shifting adaptive=%.2f%% probationCap %d->%d", hitPct(sad)*100, spc0, spc1)
+	assertCap(t, sad, cap)
+	if hitPct(sad) < 0.45 {
+		t.Fatalf("adaptive SieveTinyLFU collapsed on shifting hotset: %.2f%%", hitPct(sad)*100)
+	}
+}

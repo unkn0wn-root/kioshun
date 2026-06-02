@@ -190,6 +190,178 @@ func TestNewSieveTinyLFUAdaptiveBounds(t *testing.T) {
 	}
 }
 
+func TestSieveTinyLFURecordReadHitMarksVisitedOnly(t *testing.T) {
+	a := newSieveTinyLFU[int, int](16, 10, 100)
+	a.adaptive = true
+	probationItem := &cacheItem[int, int]{key: 1}
+	mainItem := &cacheItem[int, int]{key: 2}
+
+	a.insert(probationItem, false)
+	a.insertMain(mainItem)
+
+	// A read hit only sets the visited bit for items the policy owns; it must
+	// never touch the adaptive controller. The "main is useful" signal is
+	// gathered on the eviction sweep (findMainVictim), not on the read path.
+	clearSieveItemVisited(probationItem)
+	a.recordReadHit(probationItem)
+	if !sieveItemVisited(probationItem) {
+		t.Fatal("probation read did not mark item visited")
+	}
+
+	clearSieveItemVisited(mainItem)
+	a.recordReadHit(mainItem)
+	if !sieveItemVisited(mainItem) {
+		t.Fatal("main read did not mark item visited")
+	}
+
+	if got := a.controller.mainSurvivals; got != 0 {
+		t.Fatalf("recordReadHit touched mainSurvivals=%d, want 0", got)
+	}
+}
+
+func TestSieveTinyLFUAdaptiveResetCycleClearsCounters(t *testing.T) {
+	a := newSieveTinyLFU[int, int](100, 10, 100)
+
+	// Every adaptive signal lives on the single-consumer maintenance path now,
+	// so resetCycle clears them all with plain assignment, mainSurvivals included.
+	a.controller.ghostHits = 3
+	a.controller.probationEvictions = 5
+	a.controller.promotions = 2
+	a.controller.mainSurvivals = 7
+	a.controller.observationsInCycle = 11
+
+	a.controller.resetCycle()
+
+	if c := a.controller; c.ghostHits != 0 || c.probationEvictions != 0 ||
+		c.promotions != 0 || c.mainSurvivals != 0 || c.observationsInCycle != 0 {
+		t.Fatalf("resetCycle left non-zero counters: %+v", c)
+	}
+}
+
+func TestSieveTinyLFUAdaptiveShrinkUsesMainSurvivals(t *testing.T) {
+	a := newSieveTinyLFU[int, int](100, 10, 100)
+	a.adaptive = true
+	start := a.probationCap
+
+	// Probation churns (evictions > 2x promotions) and main is warm
+	// (survivals > promotions): shrink probation to give main more room.
+	a.controller.probationEvictions = 3
+	a.controller.promotions = 1
+	a.controller.mainSurvivals = 2
+	a.controller.observationsInCycle = uint64(a.capacity*10 - 1)
+
+	a.tick()
+
+	if want := start - a.adaptStep; a.probationCap != want {
+		t.Fatalf("probationCap=%d, want %d", a.probationCap, want)
+	}
+	if a.mainCap != a.capacity-a.probationCap {
+		t.Fatalf("mainCap=%d, want %d", a.mainCap, a.capacity-a.probationCap)
+	}
+	if got := a.controller.mainSurvivals; got != 0 {
+		t.Fatalf("mainSurvivals after tick=%d, want 0", got)
+	}
+	if a.controller.observationsInCycle != 0 {
+		t.Fatalf("observationsInCycle=%d, want 0", a.controller.observationsInCycle)
+	}
+}
+
+func TestSieveTinyLFUAdaptiveShrinkBlockedWhenMainCold(t *testing.T) {
+	a := newSieveTinyLFU[int, int](100, 10, 100)
+	a.adaptive = true
+	start := a.probationCap
+
+	// Probation churns, but main earns nothing (survivals <= promotions): the
+	// guard must stop the controller from shrinking probation to feed a cold main.
+	a.controller.probationEvictions = 3
+	a.controller.promotions = 1
+	a.controller.mainSurvivals = 1
+	a.controller.observationsInCycle = uint64(a.capacity*10 - 1)
+
+	a.tick()
+
+	if a.probationCap != start {
+		t.Fatalf("probationCap=%d, want unchanged %d when main is cold", a.probationCap, start)
+	}
+}
+
+func TestSieveTinyLFUMainSweepCountsSurvivals(t *testing.T) {
+	a := newSieveTinyLFU[int, int](16, 10, 100)
+	a.adaptive = true
+
+	spared := &cacheItem[int, int]{key: 1}
+	victim := &cacheItem[int, int]{key: 2}
+	a.insertMain(spared)
+	a.insertMain(victim) // queue: head -> victim -> spared -> tail; both visited
+
+	// Leave spared visited (it earns a second chance and should be counted), and
+	// make victim the unvisited tail-ward node the hand evicts.
+	clearSieveItemVisited(victim)
+	a.hand = spared
+
+	got := a.findMainVictim(defaultMainVictimScan, false)
+	if got != victim {
+		gotKey := -1
+		if got != nil {
+			gotKey = got.key
+		}
+		t.Fatalf("findMainVictim returned key=%d, want victim key=2", gotKey)
+	}
+	if a.controller.mainSurvivals != 1 {
+		t.Fatalf("mainSurvivals=%d, want 1 (one visited resident spared)", a.controller.mainSurvivals)
+	}
+	if sieveItemVisited(spared) {
+		t.Fatal("sweep should have cleared the spared resident's visited bit")
+	}
+}
+
+func TestSieveTinyLFUExpiredFastPathDoesNotCountMainSurvival(t *testing.T) {
+	c := newTestCache[int, int](t, Config{
+		MaxSize:         2,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  SieveTinyLFU,
+		Adapt:           true,
+	})
+	defer c.Close()
+
+	shard := c.shards[0]
+	now := time.Now().UnixNano()
+	expiredHash := c.hasher.hash(1)
+	otherHash := c.hasher.hash(2)
+
+	expired := &cacheItem[int, int]{
+		key:        1,
+		value:      1,
+		expireTime: now - int64(time.Second),
+		hash:       expiredHash,
+		tag:        tagFromHash(expiredHash),
+	}
+	other := &cacheItem[int, int]{
+		key:        2,
+		value:      2,
+		expireTime: now + int64(time.Hour),
+		hash:       otherHash,
+		tag:        tagFromHash(otherHash),
+	}
+
+	shard.mu.Lock()
+	shard.data[1] = expired
+	shard.data[2] = other
+	atomic.StoreInt64(&shard.size, 2)
+	shard.sieve.insertMain(expired)
+	shard.sieve.insert(other, false)
+	shard.mu.Unlock()
+
+	if _, ok := c.Get(1); ok {
+		t.Fatal("expired item was returned as a hit")
+	}
+	if got := shard.sieve.controller.mainSurvivals; got != 0 {
+		t.Fatalf("mainSurvivals after expired read=%d, want 0", got)
+	}
+}
+
 func TestSieveTinyLFUInitializesState(t *testing.T) {
 	c := newTestCache[int, int](t, Config{
 		MaxSize:         16,
