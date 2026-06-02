@@ -162,7 +162,10 @@ For bounded SieveTinyLFU, `Get` first tries `TryRLock`. If the shard is
 contended, it falls back to the write lock path. A hit records the key hash into
 the read buffer. After the shard has warmed past the warmup threshold, a hit also
 marks the item as visited. A miss records the hash only after warmup. Expired
-items are removed under the write lock.
+items are removed under the write lock. On the fast path, SieveTinyLFU copies
+the value and marks the item visited before resolving TTL outside the read lock;
+expired entries are revalidated and removed under the write lock before the read
+returns a miss.
 
 The SieveTinyLFU warmup threshold is `size*2 < cap`. Before that threshold, new
 writes skip admission/frequency work and segment pressure is not enforced; new
