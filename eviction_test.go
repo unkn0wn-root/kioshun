@@ -1,4 +1,4 @@
-package cache
+package kioshun
 
 import (
 	"fmt"
@@ -8,8 +8,8 @@ import (
 
 // TestAllEvictionPolicies verifies that all eviction policies work correctly
 func TestAllEvictionPolicies(t *testing.T) {
-	policies := []EvictionPolicy{LRU, LFU, FIFO, AdmissionLFU}
-	policyNames := []string{"LRU", "LFU", "FIFO", "AdmissionLFU"}
+	policies := []EvictionPolicy{LRU, LFU, FIFO, SieveTinyLFU}
+	policyNames := []string{"LRU", "LFU", "FIFO", "SieveTinyLFU"}
 
 	for i, policy := range policies {
 		t.Run(policyNames[i], func(t *testing.T) {
@@ -22,13 +22,14 @@ func TestAllEvictionPolicies(t *testing.T) {
 				StatsEnabled:    true,
 			}
 
-			cache := New[string, int](config)
+			cache := newTestCache[string, int](t, config)
 			defer cache.Close()
 
 			// Fill cache beyond capacity to trigger eviction
 			for j := 0; j < 10; j++ {
 				cache.Set(string(rune('a'+j)), j, time.Hour)
 			}
+			waitForWrites(t, cache)
 
 			// Verify cache doesn't exceed capacity
 			stats := cache.Stats()
@@ -36,29 +37,31 @@ func TestAllEvictionPolicies(t *testing.T) {
 				t.Errorf("Cache size %d exceeds max capacity 5 for policy %s", stats.Size, policyNames[i])
 			}
 
-			// Verify evictions occurred (except for AdmissionLFU which may prevent them)
-			if stats.Evictions == 0 && policies[i] != AdmissionLFU {
+			// Verify evictions occurred (except for SieveTinyLFU which may prevent them)
+			if stats.Evictions == 0 && policies[i] != SieveTinyLFU {
 				t.Errorf("Expected evictions for policy %s, got 0", policyNames[i])
 			}
 
-			// For AdmissionLFU, low evictions are expected due to admission control
-			if policies[i] == AdmissionLFU && stats.Evictions == 0 {
-				t.Logf("AdmissionLFU prevented evictions through admission control - this is correct behavior")
+			// For SieveTinyLFU, low evictions are expected due to admission control
+			if policies[i] == SieveTinyLFU && stats.Evictions == 0 {
+				t.Logf("SieveTinyLFU prevented evictions through admission control - this is correct behavior")
 			}
 
 			// Test that cache still works
 			cache.Set("test", 999, time.Hour)
+			waitForWrites(t, cache)
 
-			// For AdmissionLFU, the test item might be rejected by admission control
-			if policies[i] == AdmissionLFU {
+			// For SieveTinyLFU, the test item might be rejected by admission control
+			if policies[i] == SieveTinyLFU {
 				// Try accessing the item to build frequency for admission
 				cache.Get("test")
 				cache.Set("test", 999, time.Hour) // Try again with higher chance
+				waitForWrites(t, cache)
 			}
 
 			if val, found := cache.Get("test"); !found || val != 999 {
-				if policies[i] == AdmissionLFU {
-					t.Logf("Test item was rejected by AdmissionLFU admission control - expected behavior")
+				if policies[i] == SieveTinyLFU {
+					t.Logf("Test item was rejected by SieveTinyLFU admission control - expected behavior")
 				} else {
 					t.Errorf("Cache not working for policy %s", policyNames[i])
 				}
@@ -76,13 +79,14 @@ func TestLFUSpecificBehavior(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Add items
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
+	waitForWrites(t, cache)
 
 	// Access "a" multiple times to increase frequency
 	for i := 0; i < 5; i++ {
@@ -97,6 +101,7 @@ func TestLFUSpecificBehavior(t *testing.T) {
 
 	// Add new item to trigger eviction - "c" should be evicted (lowest frequency)
 	cache.Set("d", 4, time.Hour)
+	waitForWrites(t, cache)
 
 	// "c" should be gone, "a" and "b" should remain
 	if _, found := cache.Get("c"); found {
@@ -119,19 +124,21 @@ func TestLRUSpecificBehavior(t *testing.T) {
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Add items in order
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
+	waitForWrites(t, cache)
 
 	// Access "a" to make it most recently used
 	cache.Get("a")
 
 	// Add new item to trigger eviction - "b" should be evicted (least recently used)
 	cache.Set("d", 4, time.Hour)
+	waitForWrites(t, cache)
 
 	// "b" should be gone, others should remain
 	if _, found := cache.Get("b"); found {
@@ -145,16 +152,16 @@ func TestLRUSpecificBehavior(t *testing.T) {
 	}
 }
 
-// TestAdmissionLFUSpecificBehavior tests AdmissionLFU with new adaptive admission filter
-func TestAdmissionLFUSpecificBehavior(t *testing.T) {
+// TestSieveTinyLFUSpecificBehavior tests SieveTinyLFU with new adaptive admission filter
+func TestSieveTinyLFUSpecificBehavior(t *testing.T) {
 	config := Config{
 		MaxSize:        6,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity
@@ -164,9 +171,10 @@ func TestAdmissionLFUSpecificBehavior(t *testing.T) {
 	cache.Set("d", 4, time.Hour)
 	cache.Set("e", 5, time.Hour)
 	cache.Set("f", 6, time.Hour)
+	waitForWrites(t, cache)
 
-	// Build frequency through doorkeeper (recent access)
-	// High frequency: "a" - should get guaranteed admission (≥3 accesses)
+	// Build TinyLFU frequency through repeated access.
+	// High frequency: "a" should get strong SieveTinyLFU admission priority.
 	for i := 0; i < 5; i++ {
 		cache.Get("a")
 	}
@@ -182,14 +190,16 @@ func TestAdmissionLFUSpecificBehavior(t *testing.T) {
 	// Test frequency-based admission: high-frequency items should be more likely to be admitted
 	statsBefore := cache.Stats()
 
-	// Try to add a new high-frequency item (should be admitted due to doorkeeper)
+	// Try to add a new high-frequency item.
 	cache.Set("high_freq", 100, time.Hour)
+	waitForWrites(t, cache)
 	for i := 0; i < 4; i++ {
-		cache.Get("high_freq") // Build up frequency in doorkeeper
+		cache.Get("high_freq") // Build TinyLFU frequency.
 	}
 
 	// Force eviction with another item - high frequency item should be more likely to stay
 	cache.Set("new_item", 200, time.Hour)
+	waitForWrites(t, cache)
 
 	statsAfter := cache.Stats()
 	if statsAfter.Evictions <= statsBefore.Evictions {
@@ -207,17 +217,16 @@ func TestAdmissionLFUSpecificBehavior(t *testing.T) {
 	}
 }
 
-// TestAdmissionLFUAdmissionControl tests that AdmissionLFU uses new adaptive admission control
-func TestAdmissionLFUAdmissionControl(t *testing.T) {
+// TestSieveTinyLFUAdmissionControl tests that SieveTinyLFU uses new adaptive admission control
+func TestSieveTinyLFUAdmissionControl(t *testing.T) {
 	config := Config{
-		MaxSize:                4,
-		ShardCount:             1,
-		EvictionPolicy:         AdmissionLFU,
-		StatsEnabled:           true,
-		AdmissionResetInterval: 100 * time.Millisecond,
+		MaxSize:        4,
+		ShardCount:     1,
+		EvictionPolicy: SieveTinyLFU,
+		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity with different frequency items
@@ -225,6 +234,7 @@ func TestAdmissionLFUAdmissionControl(t *testing.T) {
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
 	cache.Set("d", 4, time.Hour)
+	waitForWrites(t, cache)
 
 	// Build frequency profiles:
 	// High frequency: "a" (should get guaranteed admission ≥ threshold=3)
@@ -251,6 +261,7 @@ func TestAdmissionLFUAdmissionControl(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		key := fmt.Sprintf("candidate%d", i)
 		cache.Set(key, 100+i, time.Hour)
+		waitForWrites(t, cache)
 
 		// Check if item was actually added (not rejected by admission control)
 		if _, exists := cache.Get(key); exists {
@@ -266,9 +277,11 @@ func TestAdmissionLFUAdmissionControl(t *testing.T) {
 		t.Error("Expected some evictions to occur")
 	}
 
-	// Should reject some items (admission control working)
-	if rejected == 0 {
-		t.Error("Expected some items to be rejected by admission control")
+	// SieveTinyLFU admits through probation/main queues and may keep the just-written item
+	// while evicting older cold residents. The important invariant here is that
+	// capacity is held while eviction pressure is applied.
+	if admitted == 0 {
+		t.Error("Expected some items to be admitted through SieveTinyLFU admission")
 	}
 
 	// Cache should maintain size constraint
@@ -282,25 +295,30 @@ func TestAdmissionLFUAdmissionControl(t *testing.T) {
 		t.Log("High frequency item 'a' was evicted - unexpected but possible")
 	}
 
-	t.Logf("Admitted %d, Rejected %d out of 12 items with adaptive admission control", admitted, rejected)
+	if cache.shards[0].sieve == nil {
+		t.Fatal("SieveTinyLFU should use admission state")
+	}
+
+	t.Logf("Admitted %d, Rejected %d out of 12 items with SieveTinyLFU admission control", admitted, rejected)
 }
 
-// TestAdmissionLFUSampleSize tests AdmissionLFU with different scenarios
-func TestAdmissionLFUSampleSize(t *testing.T) {
+// TestSieveTinyLFUSampleSize tests SieveTinyLFU with different scenarios
+func TestSieveTinyLFUSampleSize(t *testing.T) {
 	config := Config{
 		MaxSize:        10,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity
 	for i := 0; i < 10; i++ {
 		cache.Set(string(rune('a'+i)), i, time.Hour)
 	}
+	waitForWrites(t, cache)
 
 	// Create frequency gradient: 'a' most frequent, 'j' least frequent
 	for freq := 10; freq > 0; freq-- {
@@ -317,6 +335,7 @@ func TestAdmissionLFUSampleSize(t *testing.T) {
 	for i := 0; i < 20; i++ { // Try more items to overcome admission control
 		evictionsBefore := cache.Stats().Evictions
 		cache.Set(string(rune('x'+i)), 100+i, time.Hour)
+		waitForWrites(t, cache)
 		evictionsAfter := cache.Stats().Evictions
 
 		if evictionsAfter > evictionsBefore {
@@ -352,16 +371,16 @@ func TestAdmissionLFUSampleSize(t *testing.T) {
 		highFreqRemaining, lowFreqRemaining)
 }
 
-// TestAdmissionLFUStressEviction tests AdmissionLFU under heavy eviction pressure
-func TestAdmissionLFUStressEviction(t *testing.T) {
+// TestSieveTinyLFUStressEviction tests SieveTinyLFU under heavy eviction pressure
+func TestSieveTinyLFUStressEviction(t *testing.T) {
 	config := Config{
 		MaxSize:        5,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Establish a baseline with known access patterns
@@ -370,6 +389,7 @@ func TestAdmissionLFUStressEviction(t *testing.T) {
 	cache.Set("low1", 3, time.Hour)
 	cache.Set("low2", 4, time.Hour)
 	cache.Set("low3", 5, time.Hour)
+	waitForWrites(t, cache)
 
 	// Create clear frequency distinction
 	for i := 0; i < 20; i++ {
@@ -388,6 +408,7 @@ func TestAdmissionLFUStressEviction(t *testing.T) {
 		evictionsBefore := cache.Stats().Evictions
 		sizeBefore := cache.Stats().Size
 		cache.Set(string(rune('z'+i%26)), 1000+i, time.Hour)
+		waitForWrites(t, cache)
 		evictionsAfter := cache.Stats().Evictions
 		sizeAfter := cache.Stats().Size
 
@@ -437,17 +458,18 @@ func TestFrequencyAdmissionFilter(t *testing.T) {
 	config := Config{
 		MaxSize:        3,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to capacity first
 	cache.Set("victim1", 1, time.Hour) // Low frequency victim
 	cache.Set("victim2", 2, time.Hour) // Low frequency victim
 	cache.Set("victim3", 3, time.Hour) // Low frequency victim
+	waitForWrites(t, cache)
 
 	// Create frequency gradient - access some items more than others
 	for i := 0; i < 5; i++ {
@@ -468,6 +490,7 @@ func TestFrequencyAdmissionFilter(t *testing.T) {
 		// Pre-populate this key in the frequency filter by simulating access
 		// This simulates a key that has been seen before and has frequency
 		cache.Set(key, 100+i, time.Hour)
+		waitForWrites(t, cache)
 
 		evictionsAfter := cache.Stats().Evictions
 		if evictionsAfter > evictionsBefore {
@@ -503,16 +526,17 @@ func TestVictimFrequencyTracking(t *testing.T) {
 	config := Config{
 		MaxSize:        2,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Add initial items with different frequencies
 	cache.Set("low_freq", 1, time.Hour)
 	cache.Set("high_freq", 2, time.Hour)
+	waitForWrites(t, cache)
 
 	// Create clear frequency difference
 	for i := 0; i < 10; i++ {
@@ -522,10 +546,11 @@ func TestVictimFrequencyTracking(t *testing.T) {
 
 	initialEvictions := cache.Stats().Evictions
 
-	// AdmissionLFU is probabilistic. Retry with distinct keys to trigger an eviction.
+	// SieveTinyLFU is probabilistic. Retry with distinct keys to trigger an eviction.
 	// With ~50% fallback admit probability here, 20 attempts fail with prob ~9.5e-7.
 	for i := 0; i < 20 && cache.Stats().Evictions == initialEvictions; i++ {
 		cache.Set(fmt.Sprintf("new_item_%d", i), 3, time.Hour)
+		waitForWrites(t, cache)
 	}
 
 	finalEvictions := cache.Stats().Evictions
@@ -549,11 +574,11 @@ func TestFrequencyBasedAdmissionDecisions(t *testing.T) {
 	config := Config{
 		MaxSize:        4,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache and establish frequency patterns
@@ -561,6 +586,7 @@ func TestFrequencyBasedAdmissionDecisions(t *testing.T) {
 	cache.Set("freq_3", 2, time.Hour)
 	cache.Set("freq_1", 3, time.Hour)
 	cache.Set("freq_0", 4, time.Hour)
+	waitForWrites(t, cache)
 
 	// Create frequency gradient
 	for i := 0; i < 5; i++ {
@@ -583,6 +609,7 @@ func TestFrequencyBasedAdmissionDecisions(t *testing.T) {
 		evictionsBefore := cache.Stats().Evictions
 
 		cache.Set(key, 100+i, time.Hour)
+		waitForWrites(t, cache)
 
 		evictionsAfter := cache.Stats().Evictions
 		admitted := evictionsAfter > evictionsBefore
@@ -620,26 +647,28 @@ func TestDoorkeeperBehavior(t *testing.T) {
 	config := Config{
 		MaxSize:        2,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
 	cache.Set("old1", 1, time.Hour)
 	cache.Set("old2", 2, time.Hour)
+	waitForWrites(t, cache)
 
-	// Add and immediately re-add same item - should be admitted due to doorkeeper
-	cache.Set("doorkeeper_test", 3, time.Hour) // First time - may or may not be admitted
+	// Add and immediately re-add same item to exercise repeated-key priority.
+	cache.Set("history_test", 3, time.Hour) // First time - may or may not be admitted
+	waitForWrites(t, cache)
 
 	evictionsBefore := cache.Stats().Evictions
-	cache.Set("doorkeeper_test", 4, time.Hour) // Second time - should be admitted (doorkeeper)
+	cache.Set("history_test", 4, time.Hour) // Second time should have a stronger history signal.
+	waitForWrites(t, cache)
 	evictionsAfter := cache.Stats().Evictions
 
-	// The second set should likely cause eviction since item is in doorkeeper
-	// This tests the doorkeeper logic - recently seen items get priority
+	// The second set should likely cause eviction since repeated keys get priority.
 
 	t.Logf("Evictions before: %d, after: %d", evictionsBefore, evictionsAfter)
 
@@ -654,17 +683,18 @@ func TestAdmissionFilterStats(t *testing.T) {
 	config := Config{
 		MaxSize:        3,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache to trigger admission filter usage
 	cache.Set("item1", 1, time.Hour)
 	cache.Set("item2", 2, time.Hour)
 	cache.Set("item3", 3, time.Hour)
+	waitForWrites(t, cache)
 
 	initialEvictions := cache.Stats().Evictions
 
@@ -673,6 +703,7 @@ func TestAdmissionFilterStats(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		evictionsBefore := cache.Stats().Evictions
 		cache.Set(fmt.Sprintf("new_%d", i), 100+i, time.Hour)
+		waitForWrites(t, cache)
 		evictionsAfter := cache.Stats().Evictions
 
 		if evictionsAfter > evictionsBefore {
@@ -696,16 +727,16 @@ func TestAdmissionFilterStats(t *testing.T) {
 	}
 }
 
-// TestAdmissionLFUWithFrequencyAdmission tests integration between eviction and admission
-func TestAdmissionLFUWithFrequencyAdmission(t *testing.T) {
+// TestSieveTinyLFUWithFrequencyAdmission tests integration between eviction and admission
+func TestSieveTinyLFUWithFrequencyAdmission(t *testing.T) {
 	config := Config{
 		MaxSize:        5,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Establish baseline with known access patterns
@@ -714,6 +745,7 @@ func TestAdmissionLFUWithFrequencyAdmission(t *testing.T) {
 	cache.Set("med1", 3, time.Hour)
 	cache.Set("low1", 4, time.Hour)
 	cache.Set("low2", 5, time.Hour)
+	waitForWrites(t, cache)
 
 	// Create clear frequency differences
 	for i := 0; i < 15; i++ {
@@ -741,6 +773,7 @@ func TestAdmissionLFUWithFrequencyAdmission(t *testing.T) {
 		sizeBefore := cache.Stats().Size
 
 		cache.Set(fmt.Sprintf("candidate_%d", i), 1000+i, time.Hour)
+		waitForWrites(t, cache)
 		admissionAttempts++
 
 		evictionsAfter := cache.Stats().Evictions
@@ -782,27 +815,28 @@ func TestAdmissionLFUWithFrequencyAdmission(t *testing.T) {
 	t.Logf("High frequency items surviving: %d/2", highFreqSurvival)
 }
 
-// TestAdmissionLFUFrequencyThreshold tests frequency-based guaranteed admission
-func TestAdmissionLFUFrequencyThreshold(t *testing.T) {
+// TestSieveTinyLFUFrequencyThreshold tests frequency-based guaranteed admission
+func TestSieveTinyLFUFrequencyThreshold(t *testing.T) {
 	config := Config{
 		MaxSize:        3,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
+	waitForWrites(t, cache)
 
-	// Create a high-frequency item that should get guaranteed admission
-	// According to admission.go, frequencyThreshold = 3
+	// Create a high-frequency item that should get strong SieveTinyLFU admission priority.
 	cache.Set("high_freq", 100, time.Hour)
-	for i := 0; i < 4; i++ { // 4 accesses should build frequency ≥ 3
+	waitForWrites(t, cache)
+	for i := 0; i < 4; i++ { // Build TinyLFU frequency.
 		cache.Get("high_freq")
 	}
 
@@ -810,12 +844,14 @@ func TestAdmissionLFUFrequencyThreshold(t *testing.T) {
 
 	// Try to add another high-frequency item
 	cache.Set("guaranteed", 200, time.Hour)
-	for i := 0; i < 4; i++ { // Build frequency ≥ 3
+	waitForWrites(t, cache)
+	for i := 0; i < 4; i++ { // Build TinyLFU frequency.
 		cache.Get("guaranteed")
 	}
 
 	// Add competing item - high frequency items should survive
 	cache.Set("competitor", 300, time.Hour)
+	waitForWrites(t, cache)
 
 	finalEvictions := cache.Stats().Evictions
 	t.Logf("Evictions: %d", finalEvictions-initialEvictions)
@@ -835,16 +871,16 @@ func TestAdmissionLFUFrequencyThreshold(t *testing.T) {
 	}
 }
 
-// TestAdmissionLFUScanDetection tests scan resistance functionality
-func TestAdmissionLFUScanDetection(t *testing.T) {
+// TestSieveTinyLFUScanDetection tests scan resistance functionality.
+func TestSieveTinyLFUScanDetection(t *testing.T) {
 	config := Config{
 		MaxSize:        4,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache with stable items
@@ -852,6 +888,7 @@ func TestAdmissionLFUScanDetection(t *testing.T) {
 	cache.Set("stable2", 2, time.Hour)
 	cache.Set("stable3", 3, time.Hour)
 	cache.Set("stable4", 4, time.Hour)
+	waitForWrites(t, cache)
 
 	// Build frequency for stable items
 	for i := 0; i < 3; i++ {
@@ -863,13 +900,13 @@ func TestAdmissionLFUScanDetection(t *testing.T) {
 
 	initialEvictions := cache.Stats().Evictions
 
-	// Simulate scanning pattern - sequential access
-	// According to admission.go, scanSequenceThreshold = 8
+	// Simulate scanning pattern with sequential cold keys.
 	scanRejections := 0
 	for i := 0; i < 15; i++ {
 		key := fmt.Sprintf("scan_%010d", i) // Sequential keys
 		sizeBefore := cache.Size()
 		cache.Set(key, 1000+i, time.Hour)
+		waitForWrites(t, cache)
 
 		// Check if item was rejected (size didn't change)
 		if cache.Size() == sizeBefore {
@@ -897,39 +934,43 @@ func TestAdmissionLFUScanDetection(t *testing.T) {
 	t.Logf("Surviving stable items: %d/4", survivingStable)
 }
 
-// TestAdmissionLFUDoorkeeperBehavior tests doorkeeper bloom filter functionality
-func TestAdmissionLFUDoorkeeperBehavior(t *testing.T) {
+// TestSieveTinyLFURepeatedKeyBehavior tests repeated-key admission behavior.
+func TestSieveTinyLFURepeatedKeyBehavior(t *testing.T) {
 	config := Config{
-		MaxSize:                5,
-		ShardCount:             1,
-		EvictionPolicy:         AdmissionLFU,
-		StatsEnabled:           true,
-		AdmissionResetInterval: 50 * time.Millisecond,
+		MaxSize:        5,
+		ShardCount:     1,
+		EvictionPolicy: SieveTinyLFU,
+		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
 	for i := 0; i < 5; i++ {
 		cache.Set(fmt.Sprintf("init%d", i), i, time.Hour)
 	}
+	waitForWrites(t, cache)
 
-	// Create items that will be in doorkeeper
-	cache.Set("doorkeeper1", 100, time.Hour)
-	cache.Get("doorkeeper1") // This should add it to doorkeeper
+	// Create repeated items with history.
+	cache.Set("history1", 100, time.Hour)
+	waitForWrites(t, cache)
+	cache.Get("history1") // Build TinyLFU frequency.
 
-	cache.Set("doorkeeper2", 200, time.Hour)
-	cache.Get("doorkeeper2") // This should add it to doorkeeper
+	cache.Set("history2", 200, time.Hour)
+	waitForWrites(t, cache)
+	cache.Get("history2") // Build TinyLFU frequency.
 
 	initialEvictions := cache.Stats().Evictions
 
-	// Items already in doorkeeper should have higher admission probability
+	// Items with history should have higher admission priority.
 	cache.Set("test1", 300, time.Hour)
-	cache.Get("test1") // Add to doorkeeper
+	waitForWrites(t, cache)
+	cache.Get("test1") // Build TinyLFU frequency.
 
 	// Force eviction
 	cache.Set("competitor", 400, time.Hour)
+	waitForWrites(t, cache)
 
 	finalEvictions := cache.Stats().Evictions
 	t.Logf("Evictions: %d", finalEvictions-initialEvictions)
@@ -939,43 +980,45 @@ func TestAdmissionLFUDoorkeeperBehavior(t *testing.T) {
 		t.Log("No evictions occurred - admission control working effectively")
 	}
 
-	// Items in doorkeeper should be more likely to survive
-	doorkeeperSurvival := 0
-	if _, found := cache.Get("doorkeeper1"); found {
-		doorkeeperSurvival++
+	// Items with history should be more likely to survive.
+	historySurvival := 0
+	if _, found := cache.Get("history1"); found {
+		historySurvival++
 	}
-	if _, found := cache.Get("doorkeeper2"); found {
-		doorkeeperSurvival++
+	if _, found := cache.Get("history2"); found {
+		historySurvival++
 	}
 	if _, found := cache.Get("test1"); found {
-		doorkeeperSurvival++
+		historySurvival++
 	}
 
-	t.Logf("Doorkeeper items surviving: %d/3", doorkeeperSurvival)
+	t.Logf("History-bearing items surviving: %d/3", historySurvival)
 
-	// Wait for potential doorkeeper reset
+	// Wait to make sure time-based code paths do not affect policy state.
 	time.Sleep(60 * time.Millisecond)
 
-	// Test that reset works (new pattern should emerge)
+	// Test that a new pattern can still be admitted.
 	cache.Set("post_reset", 500, time.Hour)
+	waitForWrites(t, cache)
 }
 
-// TestAdmissionLFUAdaptiveProbability tests dynamic probability adjustment
-func TestAdmissionLFUAdaptiveProbability(t *testing.T) {
+// TestSieveTinyLFUAdaptiveProbability tests dynamic probability adjustment
+func TestSieveTinyLFUAdaptiveProbability(t *testing.T) {
 	config := Config{
 		MaxSize:        3,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
+	waitForWrites(t, cache)
 
 	// Build initial frequency
 	cache.Get("a")
@@ -989,6 +1032,7 @@ func TestAdmissionLFUAdaptiveProbability(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("pressure%d", i)
 		cache.Set(key, 1000+i, time.Hour)
+		waitForWrites(t, cache)
 
 		// Check admission success
 		if _, exists := cache.Get(key); exists {
@@ -1017,22 +1061,23 @@ func TestAdmissionLFUAdaptiveProbability(t *testing.T) {
 	}
 }
 
-// TestAdmissionLFURecencyTieBreaking tests recency-based tie breaking
-func TestAdmissionLFURecencyTieBreaking(t *testing.T) {
+// TestSieveTinyLFURecencyTieBreaking tests recency-based tie breaking
+func TestSieveTinyLFURecencyTieBreaking(t *testing.T) {
 	config := Config{
 		MaxSize:        3,
 		ShardCount:     1,
-		EvictionPolicy: AdmissionLFU,
+		EvictionPolicy: SieveTinyLFU,
 		StatsEnabled:   true,
 	}
 
-	cache := New[string, int](config)
+	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
 	// Fill cache
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
+	waitForWrites(t, cache)
 
 	// Create equal frequency scenario
 	cache.Get("a")
@@ -1047,9 +1092,11 @@ func TestAdmissionLFURecencyTieBreaking(t *testing.T) {
 
 	// Force eviction with new item
 	cache.Set("new_recent", 100, time.Hour)
+	waitForWrites(t, cache)
 	cache.Get("new_recent") // Make it recent
 
 	cache.Set("trigger_eviction", 200, time.Hour)
+	waitForWrites(t, cache)
 
 	// More recent items should be more likely to survive
 	recentSurvival := 0

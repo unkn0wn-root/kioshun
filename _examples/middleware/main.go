@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	cache "github.com/unkn0wn-root/kioshun"
+	"github.com/unkn0wn-root/kioshun/httpcache"
 )
 
 type APIResponse struct {
@@ -23,31 +23,39 @@ type User struct {
 	Email string `json:"email"`
 }
 
+func mustMiddleware(config httpcache.Config) *httpcache.Middleware {
+	middleware, err := httpcache.New(config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return middleware
+}
+
 func main() {
 	fmt.Println("=== HTTP Cache Middleware Example ===")
 
-	basicConfig := cache.DefaultMiddlewareConfig()
+	basicConfig := httpcache.DefaultConfig()
 	basicConfig.DefaultTTL = 2 * time.Minute
-	basicMiddleware := cache.NewHTTPCacheMiddleware(basicConfig)
+	basicMiddleware := mustMiddleware(basicConfig)
 	defer basicMiddleware.Close()
 
-	apiConfig := cache.DefaultMiddlewareConfig()
+	apiConfig := httpcache.DefaultConfig()
 	apiConfig.MaxSize = 50000
 	apiConfig.ShardCount = 32
 	apiConfig.DefaultTTL = 5 * time.Minute
 	apiConfig.MaxBodySize = 5 * 1024 * 1024 // 5MB
-	apiMiddleware := cache.NewHTTPCacheMiddleware(apiConfig)
+	apiMiddleware := mustMiddleware(apiConfig)
 	defer apiMiddleware.Close()
 
-	userConfig := cache.DefaultMiddlewareConfig()
+	userConfig := httpcache.DefaultConfig()
 	userConfig.DefaultTTL = 10 * time.Minute
-	userMiddleware := cache.NewHTTPCacheMiddleware(userConfig)
-	userMiddleware.SetKeyGenerator(cache.KeyWithUserID("X-User-ID"))
+	userMiddleware := mustMiddleware(userConfig)
+	userMiddleware.SetKeyGenerator(httpcache.KeyWithUserID("X-User-ID"))
 	defer userMiddleware.Close()
 
-	contentConfig := cache.DefaultMiddlewareConfig()
-	contentMiddleware := cache.NewHTTPCacheMiddleware(contentConfig)
-	contentMiddleware.SetCachePolicy(cache.ByContentType(map[string]time.Duration{
+	contentConfig := httpcache.DefaultConfig()
+	contentMiddleware := mustMiddleware(contentConfig)
+	contentMiddleware.SetCachePolicy(httpcache.ByContentType(map[string]time.Duration{
 		"application/json": 5 * time.Minute,
 		"text/html":        10 * time.Minute,
 		"image/":           1 * time.Hour,
@@ -55,9 +63,9 @@ func main() {
 	defer contentMiddleware.Close()
 
 	// size-based conditional caching
-	conditionalConfig := cache.DefaultMiddlewareConfig()
-	conditionalMiddleware := cache.NewHTTPCacheMiddleware(conditionalConfig)
-	conditionalMiddleware.SetCachePolicy(cache.BySize(100, 1024*1024, 3*time.Minute))
+	conditionalConfig := httpcache.DefaultConfig()
+	conditionalMiddleware := mustMiddleware(conditionalConfig)
+	conditionalMiddleware.SetCachePolicy(httpcache.BySize(100, 1024*1024, 3*time.Minute))
 	defer conditionalMiddleware.Close()
 
 	basicMiddleware.OnHit(func(key string) {
@@ -82,7 +90,7 @@ func main() {
 	}
 
 	// CACHING ENDPOINTS
-	http.Handle("/basic/users", basicMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/basic/users", basicMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond) // simulate database query
 
 		w.Header().Set("Content-Type", "application/json")
@@ -95,7 +103,7 @@ func main() {
 		})
 	})))
 
-	http.Handle("/basic/user/", basicMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/basic/user/", basicMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		userID := strings.TrimPrefix(r.URL.Path, "/basic/user/")
 		time.Sleep(50 * time.Millisecond)
 
@@ -120,7 +128,7 @@ func main() {
 	})))
 
 	// API ENDPOINTS
-	http.Handle("/api/products", apiMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/api/products", apiMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond) // simulate complex database query
 
 		products := []map[string]any{
@@ -139,7 +147,7 @@ func main() {
 		})
 	})))
 
-	http.Handle("/api/search", apiMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/api/search", apiMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
 		if query == "" {
 			query = "all"
@@ -162,7 +170,7 @@ func main() {
 	})))
 
 	// USER-SPECIFIC CACHING
-	http.Handle("/user/profile", userMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/user/profile", userMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		userID := r.Header.Get("X-User-ID")
 		if userID == "" {
 			userID = "anonymous"
@@ -184,7 +192,7 @@ func main() {
 	})))
 
 	// CONTENT-TYPE BASED CACHING
-	http.Handle("/content/json", contentMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/content/json", contentMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -194,27 +202,27 @@ func main() {
 		})
 	})))
 
-	http.Handle("/content/html", contentMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/content/html", contentMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
 		w.Header().Set("Content-Type", "text/html")
 		html := fmt.Sprintf(`<html><body><h1>HTML Content</h1><p>TTL: 10 minutes</p><p>Time: %s</p></body></html>`, time.Now().Format(time.RFC3339))
 		w.Write([]byte(html))
 	})))
 
-	http.Handle("/content/image", contentMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/content/image", contentMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte("fake-png-data-cached-for-1-hour-" + time.Now().Format("15:04:05")))
 	})))
 
 	// SIZE-BASED CONDITIONAL CACHING
-	http.Handle("/conditional/small", conditionalMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/conditional/small", conditionalMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"size":"small"}`)) // too small - won't be cached
 	})))
 
-	http.Handle("/conditional/large", conditionalMiddleware.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/conditional/large", conditionalMiddleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 

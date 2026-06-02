@@ -20,46 +20,82 @@ func main() {
 		benchtime   string
 	}{
 		{
-			name:        "Comparison - Set Operations",
-			pattern:     "BenchmarkCacheComparison_Set",
-			description: "Pure write performance comparison",
+			name:        "Comparison - Set Async",
+			pattern:     "BenchmarkCacheComparison_Set_Async",
+			description: "High-throughput writes; async caches flush outside timed work",
 			benchtime:   "5s",
 		},
 		{
-			name:        "Comparison - Get Operations",
-			pattern:     "BenchmarkCacheComparison_Get",
-			description: "Pure read performance comparison",
+			name:        "Comparison - Set Strict",
+			pattern:     "BenchmarkCacheComparison_Set_Strict",
+			description: "Committed writes; async caches wait per mutation",
+			benchtime:   "2s",
+		},
+		{
+			name:        "Comparison - Get With TTL",
+			pattern:     "BenchmarkCacheComparison_Get_TTL",
+			description: "Pre-generated-key lookup comparison with one-hour expiration",
 			benchtime:   "5s",
 		},
 		{
-			name:        "Comparison - Mixed Operations",
-			pattern:     "BenchmarkCacheComparison_Mixed",
-			description: "Mixed read/write workload comparison",
+			name:        "Comparison - Get Without TTL",
+			pattern:     "BenchmarkCacheComparison_Get_NoTTL",
+			description: "Pre-generated-key lookup comparison without effective expiration",
 			benchtime:   "5s",
 		},
 		{
-			name:        "Comparison - High Contention",
-			pattern:     "BenchmarkCacheComparison_HighContention",
-			description: "High contention scenario comparison",
+			name:        "Comparison - Mixed Async",
+			pattern:     "BenchmarkCacheComparison_Mixed_Async",
+			description: "70/30 read/write workload; async caches flush outside timed work",
 			benchtime:   "5s",
 		},
 		{
-			name:        "Comparison - Read Heavy",
-			pattern:     "BenchmarkCacheComparison_ReadHeavy",
-			description: "Read-heavy workload comparison",
+			name:        "Comparison - Mixed Strict",
+			pattern:     "BenchmarkCacheComparison_Mixed_Strict",
+			description: "70/30 read/write workload with committed writes",
+			benchtime:   "2s",
+		},
+		{
+			name:        "Comparison - Read Heavy Async",
+			pattern:     "BenchmarkCacheComparison_ReadHeavy_Async",
+			description: "90/10 read/write workload",
 			benchtime:   "3s",
 		},
 		{
-			name:        "Comparison - Write Heavy",
-			pattern:     "BenchmarkCacheComparison_WriteHeavy",
-			description: "Write-heavy workload comparison",
+			name:        "Comparison - Write Heavy Async",
+			pattern:     "BenchmarkCacheComparison_WriteHeavy_Async",
+			description: "10/90 read/write workload",
 			benchtime:   "3s",
 		},
 		{
-			name:        "Comparison - Close to Real World",
-			pattern:     "BenchmarkCacheComparison_RealWorldWorkload",
-			description: "Realistic workload patterns",
+			name:        "Comparison - High Contention Async",
+			pattern:     "BenchmarkCacheComparison_HighContention_Async",
+			description: "Hot-key mixed workload",
 			benchtime:   "3s",
+		},
+		{
+			name:        "Comparison - Real World Async",
+			pattern:     "BenchmarkCacheComparison_RealWorld_Async",
+			description: "60/35/5 read/write/delete workload; async caches flush outside timed work",
+			benchtime:   "3s",
+		},
+		{
+			name:        "Comparison - Real World Strict",
+			pattern:     "BenchmarkCacheComparison_RealWorld_Strict",
+			description: "60/35/5 read/write/delete workload with committed writes",
+			benchtime:   "2s",
+		},
+		{
+			name:        "Comparison - Large Values Async",
+			pattern:     "BenchmarkCacheComparison_LargeValues_Async",
+			description: "1-64KB value workload; async caches flush outside timed work",
+			benchtime:   "3s",
+		},
+		{
+			name:        "Comparison - Large Values Strict",
+			pattern:     "BenchmarkCacheComparison_LargeValues_Strict",
+			description: "1-64KB value workload with committed writes",
+			benchtime:   "2s",
 		},
 		{
 			name:        "Heavy Load Tests",
@@ -121,7 +157,7 @@ func main() {
 	}
 
 	totalDuration := time.Since(totalStart)
-	fmt.Printf("🏁 All benchmarks completed in %v\n", totalDuration)
+	fmt.Printf("All benchmarks completed in %v\n", totalDuration)
 	fmt.Println()
 	fmt.Println("=== Summary ===")
 	fmt.Println("The benchmarks compare kioshun cache against:")
@@ -131,10 +167,10 @@ func main() {
 	fmt.Println("- Go-cache (by PatrickMN)")
 	fmt.Println()
 	fmt.Println("Key performance areas tested:")
-	fmt.Println("- Pure read/write performance")
+	fmt.Println("- Async and strict read/write performance")
 	fmt.Println("- Mixed workload scenarios")
 	fmt.Println("- High contention handling")
-	fmt.Println("- Memory efficiency")
+	fmt.Println("- Large value handling")
 	fmt.Println("- Eviction policy performance")
 	fmt.Println("- Sharding effectiveness")
 	fmt.Println("- Scalability under load")

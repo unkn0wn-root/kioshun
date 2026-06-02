@@ -10,13 +10,19 @@
   [![CI](https://github.com/unkn0wn-root/kioshun/actions/workflows/test.yml/badge.svg)](https://github.com/unkn0wn-root/kioshun/actions)
 
 
-  *Thread-safe, sharded in-memory cache for Go - with an optional peer-to-peer cluster backend*
+  *Thread-safe, sharded in-memory cache for Go*
 </div>
+
+> [!WARNING]
+> v1 is a breaking redesign, not a drop-in upgrade from earlier releases!
+> The biggest change is that clustering has been removed: the old peer-to-peer features are no longer part of the project. The focus is now on continuously improving cache performance and correctness.
+> The cache core was also rebuilt: the previous `AdmissionLFU` default has been replaced by `SieveTinyLFU` with probation/main queues, ghost entries, TinyLFU sketching, adaptive segment sizing and queued/batched writes.
+> Public APIs changed as part of the redesign, including `New` and `NewDefault` replacing `NewWithDefaults`, cache policy/config names changing and HTTP middleware moving to the `httpcache` package.
+> Review the v1 docs and examples before upgrading.
 
 ## Index
 
 - [What is Kioshun?](#what-is-kioshun)
-- [Cluster (Overview)](#cluster-overview)
 - [Internals](INTERNALS.md)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -27,59 +33,9 @@
 
 ## What is Kioshun?
 
-Kioshun is a thread-safe (and fast!), in-memory cache for Go. You can **run it as a local cache** just like any other in-memory caches, or turn on the **peer-to-peer cluster** when you want replicas across hosts.
+Kioshun is a thread-safe (and fast!), sharded in-memory cache for Go.
 
 If you want to know more about Kioshun internals and how it works under the hood - see [Kioshun Internals](INTERNALS.md)
-
-## Cluster Overview
-
-> [!NOTE]
-> Clustering is fully **optional**. If you don’t enable the cluster, Kioshun runs as a standalone, in‑memory cache.
-
-Kioshun’s cluster turns every service instance into a **small, self-managing peer-to-peer cache**. You just point each one at a few reachable *Seeds* and it discovers the rest, builds a weighted rendezvous and replicates writes with configurable RF/WC so hot data stays local. Gossip keeps the peer list fresh, hinted handoff plus backfill repair all gaps, and reads go straight to the primary owner while read-through uses single-flight leases.
-
-```
-┌─────────────┐      Gossip + Weights      ┌─────────────┐
-│  Service A  │◀──────────────────────────▶│  Service B  │
-│  + Node     │◀───────────▶◀───────────▶  │  + Node     │
-└──────┬──────┘                            └──────┬──────┘
-       │   Owner‑routed Get/Set (RF)              │
-       └──────────────▶◀──────────────────────────┘
-                  Service C + Node
-```
-
-Small multinode example:
-
-```bash
-# on each server
-CACHE_BIND=:4443
-CACHE_PUBLIC=srv-a:4443   # srv-b / srv-c on others
-CACHE_SEEDS=srv-a:4443,srv-b:4443,srv-c:4443
-CACHE_AUTH=supersecret
-```
-
-```go
-// in code
-local := cache.NewWithDefaults[string, []byte]()
-
-cfg := cluster.Default()
-cfg.BindAddr = os.Getenv("CACHE_BIND")
-cfg.PublicURL = os.Getenv("CACHE_PUBLIC")
-cfg.Seeds = strings.Split(os.Getenv("CACHE_SEEDS"), ",")
-cfg.ReplicationFactor = 3; cfg.WriteConcern = 2
-cfg.Sec.AuthToken = os.Getenv("CACHE_AUTH")
-
-node := cluster.NewNode[string, []byte](cfg, cluster.StringKeyCodec[string]{}, local, cluster.BytesCodec{})
-if err := node.Start(); err != nil {
-    panic(err)
-}
-
-dc := cluster.NewDistributedCache[string, []byte](node)
-```
-
-Only a subset of nodes need to appear in `CACHE_SEEDS`. The list is purely for bootstrap - include a few stable peers so new processes can reach at least one live seed, then gossip distributes the rest of the membership automatically, whether you run 3 caches or 20.
-
-> See **CLUSTER.md** for more details.
 
 ## Installation
 
@@ -96,22 +52,23 @@ import (
     "fmt"
     "time"
 
-    cache "github.com/unkn0wn-root/kioshun"
+    "github.com/unkn0wn-root/kioshun"
 )
 
 func main() {
     // Create cache with default configuration
-    c := cache.NewWithDefaults[string, string]()
+    c := kioshun.NewDefault[string, string]()
     defer c.Close()
 
     // Set with default TTL (30 min)
-    c.Set("user:123", "David Nice 1", cache.DefaultExpiration)
+    c.Set("user:123", "David Nice 1", kioshun.DefaultExpiration)
 
     // Set with no expiration
-    c.Set("user:123", "David Nice 2", cache.NoExpiration)
+    c.Set("user:123", "David Nice 2", kioshun.NoExpiration)
 
-    // Set value with custom TTL
-    c.Set("user:123", "David Nice 3", 5*time.Minute)
+    // Queue a write for high-throughput paths
+    c.SetAsync("user:456", "David Nice 3", 5*time.Minute)
+    c.Sync()
 
     // Get value
     if value, found := c.Get("user:123"); found {
@@ -129,34 +86,52 @@ func main() {
 ### Basic Configuration
 
 ```go
-config := cache.Config{
+config := kioshun.Config{
     MaxSize:         100000,             // Maximum number of items
     ShardCount:      16,                 // Number of shards (0 = auto-detect)
     CleanupInterval: 5 * time.Minute,    // Cleanup frequency
     DefaultTTL:      30 * time.Minute,   // Default expiration time
-    EvictionPolicy:  cache.AdmissionLFU, // Eviction algorithm (default)
+    EvictionPolicy:  kioshun.SieveTinyLFU, // Eviction algorithm (default)
     StatsEnabled:    true,               // Enable statistics collection
+    WriteBufferSize: 1024,               // Per-shard async write queue
+    WriteBatchSize:  64,                 // Max commands applied per worker batch
 }
 
-cache := cache.New[string, any](config)
+c, err := kioshun.New[string, any](config)
+if err != nil {
+    // handle invalid configuration
+}
 ```
+
+> Each cache runs one write-worker goroutine per shard (plus a
+> cleanup goroutine when `CleanupInterval > 0`), so `ShardCount` sets the number
+> of background goroutines - default `min(NumCPU*4, 256)`. If you create many
+> caches (e.g. via the cache `Manager`), set `ShardCount` explicitly to bound the
+> total.
 
 ## API
 
 ```go
-cache.Set(key, value, ttl time.Duration) error
-cache.SetWithCallback(key, value, ttl, callback func(key, value)) error
-cache.Get(key) (value, found bool)
-cache.GetWithTTL(key) (value, ttl time.Duration, found bool)
-cache.Keys() []K
-cache.Clear()
-cache.Delete(key) bool
-cache.Exists(key) bool
-cache.Size() int64
-cache.Stats() Stats
-cache.TriggerCleanup()
-cache.Close() error
+c.Set(key, value, ttl time.Duration) error
+c.SetAsync(key, value, ttl time.Duration) error
+c.SetWithCallback(key, value, ttl, callback func(key, value)) error
+c.Get(key) (value, found bool)
+c.GetWithTTL(key) (value, ttl time.Duration, found bool)
+c.Keys() []K
+c.Clear()
+c.Sync() error
+c.Delete(key) bool
+c.Exists(key) bool
+c.Size() int64
+c.Stats() Stats
+c.PolicyStats() PolicyStats
+c.Cleanup()
+c.Close() error
 ```
+
+`Set` is synchronous and gives immediate read-after-write visibility for the key.
+Use `SetAsync` for queued high-throughput writes, and call `Sync` when a caller
+needs a global fence for queued writes across all shards.
 
 ### Statistics
 
@@ -171,6 +146,15 @@ type Stats struct {
     HitRatio    float64
     Shards      int
 }
+
+type PolicyStats struct {
+    Admits              int64
+    Rejects             int64
+    GhostHits           int64
+    Promotions          int64
+    ProbationEvictions  int64
+    MainEvictions       int64
+}
 ```
 
 ## HTTP Middleware
@@ -178,22 +162,53 @@ type Stats struct {
 Kioshun provides HTTP middleware out-of-the-box.
 
 ```go
-config := cache.DefaultMiddlewareConfig()
+import "github.com/unkn0wn-root/kioshun/httpcache"
+
+config := httpcache.DefaultConfig()
 config.DefaultTTL = 5 * time.Minute
 config.MaxSize = 100000
 
-middleware := cache.NewHTTPCacheMiddleware(config)
+middleware, err := httpcache.New(config)
+if err != nil {
+    // handle invalid configuration
+}
 defer middleware.Close()
 
-http.Handle("/api/users", middleware.Middleware(usersHandler))
+http.Handle("/api/users", middleware.Wrap(usersHandler))
 ```
 > See **[MIDDLEWARE.md](MIDDLEWARE.md)** for complete documentation, examples, and advanced configuration.
 
 ## Benchmark Results
 
-Latest benchmark run (Apple M4 Max, Go 1.24.7):
-- `SET`: 100,000,000 ops/sec · 75.55 ns/op · 41 B/op · 3 allocs/op
-- `GET`: 231,967,180 ops/sec · 25.87 ns/op · 31 B/op · 2 allocs/op
-- `Real-World`: 52,742,550 ops/sec · 65.25 ns/op · 48 B/op · 3 allocs/op
+You can find reproducible comparison tests in [benchmarks/](benchmarks/).
+Those compares Kioshun with Ristretto, BigCache, FreeCache, and go-cache using
+pre-generated workloads, with async and strict write modes reported separately.
 
-Full suite: [_benchmarks/README.md](_benchmarks/README.md)
+You can rerun the suite on your machine:
+
+```bash
+cd benchmarks
+GOCACHE=/tmp/kioshun-go-build go test -run=TestBenchmarkComparisonGetSetup -count=1 .
+GOCACHE=/tmp/kioshun-go-build go test -bench='BenchmarkCacheComparison' -benchmem -run=^$ -benchtime=1s .
+GOCACHE=/tmp/kioshun-go-build go test -bench=. -benchmem -run=^$ -benchtime=1s -timeout=30m .
+```
+
+Latest checked-in Kioshun snapshot from the comparison suite
+(`2026-06-02`, Apple M4 Max, Go `go1.26.0 darwin/arm64`):
+
+`Measured ops` is the Go benchmark iteration count for that timed workload, not
+the number of unique cache entries.
+
+| Workload | Measured ops | ns/op | B/op | allocs/op |
+| --- | ---: | ---: | ---: | ---: |
+| Set async | 39,253,849 | 40.44 | 0 | 0 |
+| Set strict | 18,755,151 | 67.31 | 0 | 0 |
+| Get TTL | 52,658,330 | 23.53 | 0 | 0 |
+| Get no TTL | 83,651,143 | 15.26 | 0 | 0 |
+| 70% read / 30% write async | 27,072,325 | 44.70 | 0 | 0 |
+| Real-world strict | 22,050,884 | 56.33 | 0 | 0 |
+
+The checked-in tables are example results, not universal rankings. In
+particular, large `[]byte` results compare each cache's API semantics:
+Kioshun stores caller-owned values by reference, while BigCache and FreeCache
+copy payload bytes.

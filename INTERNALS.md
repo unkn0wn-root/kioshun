@@ -1,218 +1,407 @@
 # Internals
 
-```
+## Package Layout
 
-┌──────────────────────────────────────────────────────────────────────────┐
-│                            Kioshun Cache                                 │
-├─────────────────┬─────────────────┬─────────────────┬────────────────────┤
-│     Shard 0     │     Shard 1     │     Shard 2     │  ...  │   Shard N  │
-│   RWMutex       │   RWMutex       │   RWMutex       │       │   RWMutex  │
-│                 │                 │                 │       │            │
-│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │       │ ┌─────────┐│
-│ │ Hash Map    │ │ │ Hash Map    │ │ │ Hash Map    │ │       │ │Hash Map ││
-│ │ K -> Item   │ │ │ K -> Item   │ │ │ K -> Item   │ │       │ │K -> Item││
-│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │       │ └─────────┘│
-│                 │                 │                 │       │            │
-│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │       │ ┌─────────┐│
-│ │ LRU List    │ │ │ LRU List    │ │ │ LRU List    │ │       │ │LRU List ││
-│ │ head ←→ tail│ │ │ head ←→ tail│ │ │ head ←→ tail│ │       │ │head↔tail││
-│ │ (sentinel)  │ │ │ (sentinel)  │ │ │ (sentinel)  │ │       │ │(sentinel││
-│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │       │ └─────────┘│
-│                 │                 │                 │       │            │
-│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │       │ ┌─────────┐│
-│ │LFU FreqList │ │ │LFU FreqList │ │ │LFU FreqList │ │       │ │LFU Freq ││
-│ │(if LFU mode)│ │ │(if LFU mode)│ │ │(if LFU mode)│ │       │ │(LFU only││
-│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │       │ └─────────┘│
-│                 │                 │                 │       │            │
-│ ┌─────────────┐ │ ┌─────────────┐ │ ┌─────────────┐ │       │ ┌─────────┐│
-│ │Admission    │ │ │Admission    │ │ │Admission    │ │       │ │Admission││
-│ │Filter       │ │ │Filter       │ │ │Filter       │ │       │ │Filter   ││
-│ │(AdmLFU only)│ │ │(AdmLFU only)│ │ │(AdmLFU only)│ │       │ │(AdmLFU) ││
-│ └─────────────┘ │ └─────────────┘ │ └─────────────┘ │       │ └─────────┘│
-│                 │                 │                 │       │            │
-│ Stats Counter   │ Stats Counter   │ Stats Counter   │       │ Stats      │
-└─────────────────┴─────────────────┴─────────────────┴────────────────────┘
+The root `kioshun` package implements a generic in-memory cache:
 
-```
+- `cache.go`: public cache API, configuration, sharding, reads, stats, cleanup.
+- `writes.go`: queued writes, synchronous mutation ordering, barriers, workers.
+- `shard.go`: per-shard state, list maintenance, item removal, TTL cleanup.
+- `eviction.go`: LRU, LFU, and FIFO eviction adapters.
+- `lfu.go`: exact LFU frequency bucket list.
+- `sieve.go`, `sketch.go`, `ghost.go`, `read_buffer.go`: SieveTinyLFU policy.
+- `queue.go`: bounded per-shard MPSC write queue.
+- `hash.go`, `fnv.go`: type-specialized hashing.
+- `manager.go`: named cache registry and global manager helpers.
 
-- Keys are sharded by a 64-bit hasher: integers are avalanched, short strings (≤8B) use FNV-1a, and longer strings use xxHash64. Shard index = `hash & (shardCount-1)`.
-- Each shard maintains an independent read-write mutex
-- Shard count auto-detected based on CPU cores (default: 4× CPU cores, max 256)
-- Object pooling reduces GC pressure
+The `httpcache` package builds HTTP response caching middleware on top of the
+root cache:
 
-## Eviction Policy
+- `httpcache/config.go`: HTTP middleware configuration and default resolution.
+- `httpcache/middleware.go`: handler wrapping, response capture, policies, keys.
+- `httpcache/pattern.go`: path index used by pattern invalidation.
 
-### LRU (Least Recently Used)
-**Implementation**: Circular doubly-linked list with sentinel nodes
-- **Access**: Move item to head position in O(1) - bypasses null checks using sentinels
-- **Eviction**: Remove least recent item (tail.prev) in O(1)
-- **Memory**: Minimal overhead per item (2 pointers: prev, next)
-- head ←→ item1 ←→ item2 ←→ ... ←→ itemN ←→ tail (sentinels)
+## Core Data Model
 
-**LRU Operations:**
-```go
-// O(1) access update - no null checks needed due to sentinels
-moveToLRUHead(item):
-  if head.next == item: return  // already at head
-  remove item from current position
-  insert item after head sentinel
+`Cache[K, V]` is a sharded cache. Each shard owns:
 
-// O(1) eviction - always valid due to sentinel structure
-evictLRU():
-  victim = tail.prev           // LRU item
-  removeFromLRU(victim)        // unlink from list
-  delete from hashmap          // remove from shard.data
-```
+- `data map[K]*cacheItem[K,V]`
+- one `sync.RWMutex`
+- a bounded write queue and one worker goroutine
+- an LRU-style intrusive list for LRU, FIFO, and general item unlinking
+- an LFU bucket list when `EvictionPolicy == LFU`
+- SieveTinyLFU policy state when `EvictionPolicy == SieveTinyLFU` and the shard is bounded
+- per-shard stats counters
 
-### LFU (Least Frequently Used) - **Frequency-Node Architecture**
-**Implementation**: Doubly-linked list of frequency buckets, each containing items with same access count
-- **Access**: Increment frequency and move item to next bucket in O(1) amortized
-- **Eviction**: Remove item from lowest frequency bucket in O(1)
-- **Memory**: Additional frequency tracking per item + bucket management
+`cacheItem` stores the value and all policy metadata in one pooled object:
 
-**LFU Structure:**
-```
-Frequency Buckets (sorted by access count):
-┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-│ Freq: 1  │←→  │ Freq: 2  │←→  │ Freq: 5  │←→  │ Freq: 8  │
-│ item1    │    │ item3    │    │ item2    │    │ item4    │
-│ item5    │    │ item7    │    │          │    │          │
-└──────────┘    └──────────┘    └──────────┘    └──────────┘
-```
+- `expireTime`: absolute Unix nanoseconds; `0` means no expiration.
+- `lastAccess`: updated by LRU/LFU/Sieve reads and writes where relevant.
+- `prev` and `next`: intrusive list pointers.
+- `lfuFreq`: exact LFU counter for the LFU policy.
+- `sieveQ`, `queue`, `reuse`, `visited`: SieveTinyLFU queue and SIEVE metadata.
+- `hash` and `tag`: cached hash and compact non-zero tag for ghost entries.
+- `key`: original map key so eviction can delete from `data`.
 
-**LFU Operations:**
-```go
-// O(1) amortized frequency increment
-increment(item):
-  currentBucket = itemFreq[item]
-  newFreq = currentBucket.freq + 1
+Items and synchronous write waiters are reused through `sync.Pool`. Releasing an
+item resets the whole struct before it returns to the pool.
 
-  // Move to next bucket or create new one
-  if nextBucket.freq == newFreq:
-    target = nextBucket
-  else:
-    target = createBucket(newFreq) // splice after current
+## Configuration
 
-  move item from currentBucket to target
-  if currentBucket.isEmpty(): removeBucket(currentBucket)
+`DefaultConfig()` uses:
 
-// O(1) eviction from lowest frequency bucket
-evictLFU():
-  lowestBucket = head.next     // first non-sentinel bucket
-  victim = any item from lowestBucket.items
-  remove victim from bucket and hashmap
-```
+- `MaxSize = 10000`
+- `ShardCount = 0`, meaning auto-detect
+- `CleanupInterval = 5 * time.Minute`
+- `DefaultTTL = 30 * time.Minute`
+- `EvictionPolicy = SieveTinyLFU`
+- `StatsEnabled = true`
+- `ProbationRatio = 10`
+- `GhostRatio = 100`
+- `Adapt = true`
+- `WriteBufferSize = 1024`
+- `WriteBatchSize = 64`
 
-### FIFO (First In, First Out)
-**Implementation**: Uses LRU list structure but treats it as insertion-order queue
-- **Access**: No position updates on access (maintains insertion order)
-- **Eviction**: Remove oldest inserted item (at tail.prev) in O(1)
+`New` validates the config, resolves `DefaultEvictionPolicy` to
+`SieveTinyLFU`, and fills zero write queue settings with their defaults.
 
-### AdmissionLFU (Adaptive Admission-controlled Least Frequently Used) - **Default**
-**Implementation**: Approximate LFU with admission control and scan resistance
-- **Access**: Update frequency counter in O(1) using Count-Min Sketch, no heap maintenance
-- **Eviction**: Random sampling (default 5 items, max 20) with LFU selection in O(k) where k = sample size
-- **Admission Control**: Multi-layered frequency-based admission with adaptive thresholds
-- **Scan Resistance**: Detects and adapts to scanning workloads automatically
-- Frequency bloom filter (10×shard size) + doorkeeper bloom filter (1/8 size) + workload detector per shard
+Shard count is rounded to a power of two because shard lookup is
+`hash & shardMask`. When `ShardCount <= 0`, the cache starts with
+`runtime.NumCPU() * 4`, capped at 256. For bounded caches, the shard count is
+also capped so small `MaxSize` values do not create zero-capacity shards. The
+total capacity is distributed exactly: each shard gets `MaxSize / shards`, and
+the first `MaxSize % shards` shards get one extra slot.
 
-**AdmissionLFU Architecture:**
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          Adaptive AdmissionLFU Shard                            │
-├─────────────────────────────┬───────────────────────────────────────────────────┤
-│ Adaptive Admission Filter   │                Cache Items                        │
-│  ┌─────────────────────────┐│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                  │
-│  │  Frequency Bloom Filter ││  │Item │ │Item │ │Item │ │Item │ ...              │
-│  │  Count-Min Sketch       ││  │Freq:│ │Freq:│ │Freq:│ │Freq:│                  │
-│  │  4-bit counters x10*cap ││  │  5  │ │  12 │ │  3  │ │  8  │                  │
-│  │  Hash: 4 functions      ││  └─────┘ └─────┘ └─────┘ └─────┘                  │
-│  │  Auto-aging threshold   ││                                                   │
-│  └─────────────────────────┘│  Random Sample 5 → Compare Frequencies            │
-│  ┌─────────────────────────┐│  Victim Selection: Min(freq, lastAccess)          │
-│  │    Doorkeeper Filter    ││  ↓                                                │
-│  │    Bloom Filter         ││  Adaptive Admission Decision                      │
-│  │    Size: cap/8          ││                                                   │
-│  │    Hash: 3 functions    ││  Normal Mode:                                     │
-│  │    Reset: 1min interval ││  • freq ≥ 3: Always admit                         │
-│  └─────────────────────────┘│  • freq > victim: Always admit                    │
-│  ┌─────────────────────────┐│  • freq = victim & freq > 0: Recency-based        │
-│  │   Workload Detector     ││  • else: Adaptive probability 5-95%               │
-│  │   Sequential patterns   ││                                                   │
-│  │   Admission rate track  ││  Scan Mode (detected patterns):                   │
-│  │   Miss streak tracking  ││  • Recency-based admission                        │
-│  │   Adaptive probability  ││  • Lower admission threshold                      │
-│  └─────────────────────────┘│  • Protect against cache pollution                │
-└─────────────────────────────┴───────────────────────────────────────────────────┘
-```
+`MaxSize == 0` means unlimited capacity. In that mode SieveTinyLFU policy state
+is not allocated, because no eviction or admission decision is needed.
 
-**Admission Control Components:**
+## Hashing
 
-1. **Frequency Estimation (Count-Min Sketch)**:
-   - 4-bit counters packed in uint64 arrays (16 counters per word)
-   - 4 hash functions with xxHash64-based avalanche mixing
-   - Automatic aging: counters halved when total increments ≥ size × 10
-   - Size: 10× shard capacity counters (min 1024 per shard)
+`newHasher[K]` selects a hash function once per cache type:
 
-2. **Doorkeeper Bloom Filter**:
-   - 3 hash functions for recent access tracking
-   - Size: 1/8 of frequency filter size for memory efficiency
-   - Periodic reset every 1 minute (configurable via AdmissionResetInterval)
-   - Immediate admission for items in doorkeeper (bypass frequency check)
+- strings of length `<= 8` use FNV-1a
+- longer strings use the local `xxHash64(seed=0)` implementation
+- integer-like keys are read directly and avalanched with xxHash64's finalizer
+- other comparable keys fall back to `fmt.Sprintf("%v", key)` and hash that string
 
-3. **Workload Detector (Scan Resistance)**:
-   - Tracks consecutive admission rejections (fast signal of cold scans)
-   - Uses an admissions/sec signal to flag sudden bursts (defaults: 100 req/s, 50 misses)
-   - Switches to a more recency-biased admission during detected scans (recency window defaults: 100 ms / 1 s)
+The hash selects the shard by `hash & shardMask`. The map still stores full keys,
+so hash collisions affect distribution only, not key equality.
 
-   Override these thresholds via `Config.AdmissionScanRateThreshold`, `Config.AdmissionScanMissThreshold`, `Config.AdmissionScanRecencyThreshold`, and `Config.AdmissionRecencyTieBreak` while keeping the same defaults when unset.
+SieveTinyLFU ghost entries use `(hash, tag)`, where `tag` is a non-zero `uint16`
+derived from an avalanched salted hash. The tag reduces false ghost hits without
+storing full keys in the ghost queue.
 
-4. **Adaptive Admission Algorithm**:
-   ```
-   Phase 1: Doorkeeper Check
-   if in_doorkeeper(key):
-       refresh_doorkeeper(key)
-       return ADMIT
+## TTL And Expiration
 
-   Phase 2: Scan Detection
-   if detect_scan(key):
-       if victim_age > 100ms:
-           return ADMIT    // Prefer recent items during scan
-       else:
-           return ADMIT if hash(key) % 100 < min_probability(5%)
+`Set` and `SetAsync` translate TTLs before enqueueing:
 
-   Phase 3: Update Frequency & Doorkeeper
-   new_freq = frequency_filter.increment(key)
-   doorkeeper.add(key)
+- `DefaultExpiration` (`0`) uses `Config.DefaultTTL`
+- positive TTLs become an absolute `expireTime`
+- `NoExpiration` (`-1`) results in `expireTime == 0`
 
-   Phase 4: Adaptive Admission Decision
-   if new_freq >= 3:                    // High frequency guarantee
-       return ADMIT
-   elif new_freq > victim_frequency:    // Better than victim
-       return ADMIT
-   elif new_freq == victim_frequency && new_freq > 0:  // Recency tie-breaking
-       return ADMIT if victim_age > 1_second
-   else:                                // Adaptive probabilistic admission
-       probability = adaptive_probability(5-95%) - (victim_frequency * 10)
-       return ADMIT if hash(key) % 100 < max(probability, 5%)
+Current code treats any other non-positive effective TTL as no expiration.
 
-   Phase 5: Probability Adjustment
-   adjust_probability_based_on_eviction_pressure()
-   ```
+Expired items can be removed by:
 
-5. **Adaptive Probability Control**:
-   - Dynamic admission probability between 5% and 95%
-   - Decreases probability (-5%) when eviction rate > 100/second
-   - Increases probability (+5%) when eviction rate < 10/second
-   - Eviction pressure monitored every second
+- `Get`, when it encounters an expired item
+- `Exists`, which uses a write lock and removes if expired
+- `Cleanup`, either called manually or by the cleanup worker
+
+`Keys` returns a point-in-time snapshot of non-expired keys, but it does not
+remove expired entries. `SetWithCallback` schedules a timer after commit and
+fires only if the item still exists and is expired when the timer wakes; cleanup
+is still responsible for removing the item.
+
+## Write Path
+
+Every shard has a bounded multi-producer, single-consumer ring queue. Producers
+claim slots with CAS on `head`; the shard worker owns `tail`. Each cell has a
+sequence number so the queue can distinguish empty, published, and freed slots
+across ring laps. The ring size is rounded to a power of two and is at least 2.
+
+`SetAsync` only enqueues. A nil error means the command was accepted, not that it
+has committed. Call `Sync` when committed visibility is required.
+
+`Set`, `SetWithCallback`, and `Delete` use the synchronous mutation path:
+
+1. Take the shard's `drainMu`, which is the single-consumer token for that shard.
+2. Drain queued writes accepted before this mutation.
+3. Take the shard write lock.
+4. Apply the mutation directly.
+5. Release locks and schedule callbacks outside the shard lock.
+
+That preserves per-shard ordering while avoiding a worker round trip for strict
+read-after-write operations.
+
+Shard workers wait on a coalesced `wake` channel. On wake they:
+
+1. Drain buffered SieveTinyLFU read samples into the sketch.
+2. Dequeue up to `WriteBatchSize` commands.
+3. Apply the batch under one shard write lock.
+4. Acknowledge commands that carry result channels.
+5. Drain read samples again between batches.
+
+`Sync`, `Clear`, and shutdown use barrier commands. A barrier enqueued to every
+shard is acknowledged only after all earlier commands for that shard have been
+applied. `Close` marks the cache closed, flushes accepted writes, closes
+`closeCh`, waits for workers, and clears all shards. Producers blocked on a full
+queue wake through `closeCh` and return `ErrCacheClosed`.
+
+## Read Path
+
+All reads return misses after the cache is closed.
+
+For LRU and LFU, `Get` takes the shard write lock because the read mutates policy
+metadata. LRU moves the item to the list head. LFU increments the exact frequency
+bucket and updates `lastAccess`.
+
+For FIFO, `Get` takes the read lock unless it has to remove an expired item. FIFO
+does not update list position on access.
+
+For bounded SieveTinyLFU, `Get` first tries `TryRLock`. If the shard is
+contended, it falls back to the write lock path. A hit records the key hash into
+the read buffer. After the shard has warmed past the warmup threshold, a hit also
+marks the item as visited. A miss records the hash only after warmup. Expired
+items are removed under the write lock. On the fast path, SieveTinyLFU copies
+the value and marks the item visited before resolving TTL outside the read lock;
+expired entries are revalidated and removed under the write lock before the read
+returns a miss.
+
+The SieveTinyLFU warmup threshold is `size*2 < cap`. Before that threshold, new
+writes skip admission/frequency work and segment pressure is not enforced; new
+entries are allowed to fill probation.
 
 ## Eviction Policies
 
+`EvictionPolicy` values are:
+
 ```go
 const (
-    LRU        EvictionPolicy = iota // Least Recently Used
-    LFU                              // Least Frequently Used
-    FIFO                             // First In, First Out
-    AdmissionLFU                     // Sampled LFU with admission control (default)
+    DefaultEvictionPolicy EvictionPolicy = iota
+    LRU
+    LFU
+    FIFO
+    SieveTinyLFU
 )
 ```
+
+### LRU
+
+LRU uses the shard's intrusive list with sentinel head and tail nodes. New and
+updated items are inserted at the head. Reads move the item to the head. Eviction
+drops `tail.prev`.
+
+Operations are O(1) under the shard write lock.
+
+### FIFO
+
+FIFO uses the same intrusive list, but reads do not move nodes. New items are
+added at the head, so `tail.prev` is the oldest inserted item and is evicted.
+
+### LFU
+
+LFU uses an ascending circular list of frequency buckets. Each bucket contains a
+map of items at that exact frequency, and `itemFreq` maps each item back to its
+bucket.
+
+New items start at frequency 1. Reads move the item to frequency `n+1`,
+creating or removing buckets as needed. Eviction picks one item from the lowest
+frequency bucket. Current LFU eviction does not use recency to break ties.
+
+Updating an existing LFU key resets it to frequency 1.
+
+### SieveTinyLFU
+
+SieveTinyLFU is the default bounded policy. It combines:
+
+- a probation FIFO queue for new entries
+- a main SIEVE queue for entries with reuse evidence
+- a compact ghost FIFO of recently evicted probation fingerprints
+- a TinyLFU-style frequency estimator
+- a small adaptive controller for the probation/main split
+
+It is allocated only for shards with `cap > 0`.
+
+#### Segment Sizing
+
+`ProbationRatio` and `GhostRatio` are percentages. A zero value means "use the
+default", not "zero capacity".
+
+For a shard capacity `c`:
+
+- minimum probation cap is `max(1, c/100)`
+- maximum probation cap is `max(min, c*60/100)`, capped below `c` when possible
+- initial probation cap is clamped from `c * ProbationRatio / 100`
+- main cap is `c - probationCap`
+- ghost cap is `mainCap * GhostRatio / 100`, with a minimum of 1 when main exists
+- adaptation step is `max(1, c/100)`
+- sketch/doorkeeper sample size is `max(c*10, 1024)`
+
+#### Frequency Estimator
+
+The frequency path uses a doorkeeper plus a count-min sketch:
+
+- the doorkeeper is a 2-hash Bloom-style filter
+- the first observation sets doorkeeper bits only
+- later observations add to the sketch
+- `estimate` returns the sketch estimate plus one if the doorkeeper still contains the item
+- the sketch has 4-bit saturating counters packed 16 per `uint64`
+- four indexes are derived by rotating the key hash and applying xxHash64 avalanche
+- all counters are aged by right-shifting after `sampleSize * 10` observations
+- aging also clears the doorkeeper
+
+Reads do not update the sketch directly. They write hashes into a striped,
+lossy, per-shard read buffer. The worker drains those samples into the estimator
+before and between write batches.
+
+The read buffer has up to 16 stripes, rounded to a power of two from
+`GOMAXPROCS`. `procID()` uses `runtime.procPin` through `go:linkname` only as a
+best-effort stripe hint. A full stripe overwrites old samples; that can reduce
+frequency accuracy but cannot corrupt cache contents.
+
+#### Admission And Replacement
+
+SieveTinyLFU inserts follow this path:
+
+1. During warmup, insert into probation and skip frequency/admission work.
+2. After warmup, record the key hash in the estimator.
+3. If `(hash, tag)` is in the ghost queue, remove the ghost entry and insert the
+   item directly into main with `visited=true`.
+4. Otherwise insert into probation with `reuse=0` and `visited=false`.
+5. Enforce resident capacity and segment pressure.
+
+Probation eviction examines the probation tail:
+
+- if the item has `reuse >= 1` or `visited=true`, it is promoted to main
+- otherwise it is evicted and recorded in the ghost queue
+
+Main eviction uses a SIEVE hand:
+
+- start from `hand`, falling back to the main tail when needed
+- scan up to `defaultMainVictimScan` items
+- if an item is visited, clear `visited`, decrement `reuse` if positive, and move backward
+- the first unvisited item is the main victim
+- forced eviction can take a candidate after the bounded scan
+
+When a probation promotion or ghost-hit item competes with a main victim,
+`shouldAdmit` compares TinyLFU estimates. Ties favor proven short-term reuse:
+ghost hits, probation promotions, unvisited victims, and victims with zero reuse.
+
+Capacity enforcement is bounded by `maxEvictionWork`. If the bounded pass cannot
+restore capacity because it spent work promoting probation entries, a forced tail
+drop restores the shard to capacity.
+
+#### Adaptation
+
+The controller tracks ghost hits, probation evictions, promotions, main
+survivals, and observations. Every one of these is maintained on the
+single-consumer maintenance path (the write worker, or a caller holding the
+shard write lock), so the read path never writes shared policy counters. Main
+usefulness is measured by `mainSurvivals`: the count of visited main residents
+the SIEVE hand spares during eviction sweeps. It is a maintenance-path proxy for
+"main read hits" that avoids a contended atomic increment on every read hit, and
+it tracks how many distinct main entries reads keep alive rather than being
+skewed by a single hammered key.
+
+Two mechanisms can change segment sizing:
+
+- an immediate ghost hit can grow probation by one adaptation step
+- periodic `tick` checks every `capacity * 10` observations and can also grow
+  probation when ghost hits dominate probation evictions
+- periodic `tick` can shrink probation when probation is evicting much more than
+  it promotes and main is earning its keep (more survivals than promotions)
+
+The shrink path moves one adaptation step of capacity from probation to main.
+
+## Stats
+
+`Stats()` always reports `Size`, `Capacity`, and `Shards`. When
+`StatsEnabled == true`, it also aggregates per-shard hits, misses, evictions,
+expirations, and computes `HitRatio`.
+
+`PolicyStats()` aggregates SieveTinyLFU counters:
+
+- `Admits`
+- `Rejects`
+- `GhostHits`
+- `Promotions`
+- `ProbationEvictions`
+- `MainEvictions`
+
+An admission reject means the newly inserted item lost admission and was removed
+during capacity enforcement.
+
+## Manager
+
+`Manager` keeps named configs in a locked map and cache instances in a
+`sync.Map`. `GetCache` creates a cache lazily using the registered config or
+`DefaultConfig`. If concurrent creators race, `LoadOrStore` keeps one cache and
+closes the loser so worker goroutines do not leak.
+
+Named caches are typed. Asking for the same name with a different `K,V` pair
+returns `ErrTypeMismatch`.
+
+## HTTP Middleware
+
+`httpcache.New` resolves middleware config, constructs a backing
+`kioshun.Cache[string, *Response]`, and installs:
+
+- `DefaultKeyGenerator`
+- `DefaultCachePolicy`
+- ignored response headers
+- cacheable method set
+- response body size limit
+- pattern index for invalidation
+
+`DefaultConfig` uses SieveTinyLFU, 16 shards, max 100000 responses, 5 minute TTL,
+GET/HEAD, common cacheable status codes, ignored volatile headers, and a 10 MB
+body capture limit.
+
+`Wrap` bypasses non-cacheable request methods. For cacheable methods:
+
+1. Generate the cache key.
+2. Serve a cached response when present.
+3. Otherwise wrap the `ResponseWriter`.
+4. Forward the request to the next handler.
+5. Capture final status, headers, and body.
+6. Ask the policy whether to cache and for what TTL.
+7. Store a defensive response snapshot in the backing cache.
+8. Add the key to the pattern index when the key can be mapped back to a path.
+
+The response writer:
+
+- treats 1xx responses as informational and does not commit final status
+- marks 101 Switching Protocols, flushes, and hijacks as streamed and not cacheable
+- preserves `Unwrap` for `http.ResponseController`
+- sets the miss header before committing a miss response
+- captures body bytes up to `MaxBodySize`
+
+`DefaultCachePolicy` rejects non-cacheable methods, non-cacheable statuses,
+oversized bodies, and `Cache-Control: no-cache`, `no-store`, or `private`. It
+uses positive `max-age` first, then positive `Expires`, then `DefaultTTL`.
+
+Key generators include:
+
+- `DefaultKeyGenerator`: MD5 of method, full URL, and common vary headers
+- `KeyWithVaryHeaders`: MD5 of method, full URL, and caller-specified headers
+- `KeyWithoutQuery`: plain `METHOD:/path`
+- `KeyWithoutQueryHashed`: MD5 of method, path, and common vary headers
+- `KeyWithUserID`: MD5 of method, full URL, and a user-id header
+- `PathBasedKeyGenerator`: plain `METHOD:/path`
+
+`Invalidate(pattern)` uses the path index. Exact patterns remove keys at one
+path. Patterns ending in `*` remove keys stored at the base path and descendants.
+The default key extractor returns an empty path, so pattern invalidation requires
+a compatible key generator and path extractor, such as `KeyWithoutQuery` with
+`PathExtractorFromKey`.
+
+## Algorithm References
+
+The implementation is not a direct copy of any one paper, but the terminology
+and policy design are grounded in these primary references:
+
+- [SIEVE: Cache eviction can be simple, effective, and scalable](https://www.usenix.org/system/files/nsdi24-zhang-yazhuo.pdf)
+- [TinyLFU: A Highly Efficient Cache Admission Policy](https://arxiv.org/abs/1512.00727)
+- [An improved data stream summary: the count-min sketch and its applications](https://www.cs.helsinki.fi/u/jilu/paper/countMin.pdf)
+- [xxHash specification](https://github.com/Cyan4973/xxHash/blob/dev/doc/xxhash_spec.md)
+- [Go `net/http.ResponseController`](https://go.dev/src/net/http/responsecontroller.go)
