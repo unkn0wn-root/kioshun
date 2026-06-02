@@ -4,6 +4,9 @@ import (
 	"sync"
 )
 
+// evictor removes one resident item from a bounded shard.
+// Callers hold the shard lock; only choose the victim and leave
+// map removal, policy unlinking, pooling and statistics to shard.dropItem.
 type evictor[K comparable, V any] interface {
 	evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool)
 }
@@ -25,11 +28,15 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 	if lfu == nil {
 		return
 	}
+	// removeLFU already detached LFU metadata; dropLRU only unlinks the shared
+	// resident list and map entry.
 	s.dropItem(lfu, itemPool, statsEnabled, true, dropLRU)
 }
 
 type fifoEvictor[K comparable, V any] struct{}
 
+// evict removes the tail entry from the shared LRU list. FIFO reads never move
+// entries, so tail.prev remains the oldest inserted resident for this policy.
 func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) {
 	if s.tail.prev == s.head {
 		return
@@ -38,6 +45,8 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 	s.dropItem(s.tail.prev, itemPool, statsEnabled, true, dropLRU)
 }
 
+// createEvictor returns the non-Sieve replacement policy for a shard.
+// Public config is normalized and validated before this point
 func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	switch policy {
 	case LRU:

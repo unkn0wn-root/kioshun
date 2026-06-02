@@ -17,6 +17,8 @@ const (
 	probationPromotionReuse = 1
 )
 
+// sieveQueueID mirrors queue ownership on cacheItem for cheap state inspection.
+// the authoritative ownership pointer is cacheItem.sieveQ.
 type sieveQueueID uint8
 
 const (
@@ -24,6 +26,8 @@ const (
 	mainQueue
 )
 
+// sieveVisited marks recent reuse. Readers write it at, while the
+// serialized maintenance path consumes and clears it during SIEVE scans.
 const sieveVisited = uint32(1)
 
 func sieveItemVisited[K comparable, V any](it *cacheItem[K, V]) bool {
@@ -42,7 +46,7 @@ func clearSieveItemVisited[K comparable, V any](it *cacheItem[K, V]) {
 	}
 }
 
-// sieveQueue is an intrusive FIFO queue backed by cacheItem links.
+// sieveQueue is an FIFO queue backed by cacheItem links.
 type sieveQueue[K comparable, V any] struct {
 	head cacheItem[K, V]
 	tail cacheItem[K, V]
@@ -164,6 +168,10 @@ type sieveTinyLFU[K comparable, V any] struct {
 	adaptive        bool
 }
 
+// newSieveTinyLFU builds the per-shard admission state for a bounded shard.
+// Probation is clamped between 1% and 60% of capacity so main has room for
+// protected entries when capacity permits, while the ghost queue is sized as a
+// fraction of main.
 func newSieveTinyLFU[K comparable, V any](c int64, pr, gr uint8) *sieveTinyLFU[K, V] {
 	p := &sieveTinyLFU[K, V]{capacity: c}
 	p.probation.init()
@@ -207,6 +215,9 @@ func (p *sieveTinyLFU[K, V]) recordAccess(h uint64) {
 	p.incrementFrequency(h)
 }
 
+// incrementFrequency records one access in the doorkeeper/sketch pair and ages
+// the window after resetAt samples. It runs on the serialized maintenance path,
+// including sampled reads drained by the shard worker.
 func (p *sieveTinyLFU[K, V]) incrementFrequency(h uint64) {
 	if p.door.add(h) {
 		p.sketch.add(h)
@@ -219,6 +230,8 @@ func (p *sieveTinyLFU[K, V]) incrementFrequency(h uint64) {
 	p.tick()
 }
 
+// estimate includes the doorkeeper bit as one recent access, so a key seen once
+// can compete without immediately consuming count-min sketch counters.
 func (p *sieveTinyLFU[K, V]) estimate(h uint64) uint8 {
 	e := p.sketch.estimate(h)
 	if p.door.contains(h) && e < sketchMaxCounter {
@@ -232,6 +245,9 @@ func (p *sieveTinyLFU[K, V]) owns(it *cacheItem[K, V]) bool {
 	return p.probation.holds(it) || p.main.holds(it)
 }
 
+// recordReadHit marks a policy owned item as recently used without moving it.
+// The SIEVE hand consumes the bit later, keeping reads cheap and queue
+// maintenance single-consumer.
 func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
 	// Reads only set the visited bit; queue ownership is maintained by the write.
 	// markSieveItemVisited is a conditional atomic store (skipped once the bit is
@@ -243,6 +259,9 @@ func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
 	}
 }
 
+// recordUpdate handles Set on an existing resident. Updates are treated as
+// reuse signals: main entries get another SIEVE chance, while probation entries
+// can be promoted before they reach the probation tail.
 func (p *sieveTinyLFU[K, V]) recordUpdate(it *cacheItem[K, V]) {
 	switch it.sieveQ {
 	case &p.main:
@@ -265,6 +284,9 @@ func (p *sieveTinyLFU[K, V]) recordUpdate(it *cacheItem[K, V]) {
 	}
 }
 
+// insert places a newly created resident into probation unless a ghost hit has
+// already shown that the item was evicted too soon; ghost hits bypass probation
+// and enter main as protected entries.
 func (p *sieveTinyLFU[K, V]) insert(it *cacheItem[K, V], gh bool) {
 	if gh && p.mainCap > 0 {
 		p.ghost.remove(it.hash, it.tag)
@@ -294,6 +316,8 @@ func (p *sieveTinyLFU[K, V]) insertMain(it *cacheItem[K, V]) {
 	}
 }
 
+// remove unlinks an item from whichever SIEVE queue owns it and repairs the
+// main hand if it was pointing at the removed node.
 func (p *sieveTinyLFU[K, V]) remove(it *cacheItem[K, V]) bool {
 	if it == nil {
 		return false
@@ -363,6 +387,9 @@ func (s *shard[K, V]) dropProbationVictim(it *cacheItem[K, V], pool *sync.Pool, 
 	return true
 }
 
+// evictProbation inspects the oldest probation entry. A recently reused entry
+// is promoted and returned as an in-flight main candidate; a cold entry is
+// evicted and recorded in the ghost queue.
 func (s *shard[K, V]) evictProbation(pool *sync.Pool, stats bool) *cacheItem[K, V] {
 	p := s.sieve
 	if p.probation.empty() {
@@ -382,6 +409,10 @@ func (s *shard[K, V]) evictProbation(pool *sync.Pool, stats bool) *cacheItem[K, 
 	return nil
 }
 
+// evictMain runs the SIEVE hand over main and applies TinyLFU admission when an
+// in-flight candidate competes with the selected victim. Dropping a rejected
+// candidate is not counted as an eviction because the policy rejected the
+// candidate rather than selecting a replacement victim.
 func (s *shard[K, V]) evictMain(
 	pool *sync.Pool,
 	stats bool,
@@ -416,6 +447,10 @@ func (s *shard[K, V]) evictMain(
 	return false
 }
 
+// enforceSieveCapacity restores the shard cap after an insert may have
+// overfilled the cache. The bounded pass favors normal SIEVE decisions; the
+// forced pass is a last-resort repair so promotions cannot leave the shard over
+// capacity.
 func (s *shard[K, V]) enforceSieveCapacity(
 	pool *sync.Pool,
 	stats bool,
@@ -485,6 +520,10 @@ func (p *sieveTinyLFU[K, V]) mainCandidate(it *cacheItem[K, V]) (*cacheItem[K, V
 	return it, true
 }
 
+// findMainVictim advances the SIEVE hand through main. Visited entries get a
+// second chance and have their bit cleared; unvisited entries are returned as
+// victims. A forced scan returns a victim even after the regular scan budget is
+// exhausted.
 func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K, V] {
 	if p.main.empty() {
 		return nil
@@ -534,6 +573,9 @@ func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K
 	return nil
 }
 
+// previousMainItem moves the hand toward older main entries and wraps at the
+// head sentinel. It returns nil if the next pointer no longer names a live main
+// resident.
 func (p *sieveTinyLFU[K, V]) previousMainItem(it *cacheItem[K, V]) *cacheItem[K, V] {
 	if it == nil {
 		return nil
@@ -549,6 +591,8 @@ func (p *sieveTinyLFU[K, V]) previousMainItem(it *cacheItem[K, V]) *cacheItem[K,
 	return prev
 }
 
+// shouldAdmit compares the candidate and victim frequency estimates, with
+// recency-based tie breaks for ghost hits and probation promotions.
 func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool {
 	// ghost hit or probation promotion has already proven short-term reuse.
 	// Once SIEVE finds an unvisited victim, that recency proof should beat stale
@@ -571,6 +615,9 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 	return tie || (!sieveItemVisited(v) && v.reuse == 0)
 }
 
+// tick advances the adaptive segment controller. It waits for a window of
+// observations before resizing so transient bursts do not immediately move
+// capacity between probation and main.
 func (p *sieveTinyLFU[K, V]) tick() {
 	if !p.adaptive {
 		return
@@ -597,12 +644,16 @@ func (p *sieveTinyLFU[K, V]) tick() {
 	p.controller.resetCycle()
 }
 
+// setProbationCap clamps probation and assigns the remainder to main, preserving
+// the fixed per-shard resident capacity.
 func (p *sieveTinyLFU[K, V]) setProbationCap(n int64) {
 	n = min(max(n, p.minProbationCap), p.maxProbationCap)
 	p.probationCap = n
 	p.mainCap = p.capacity - n
 }
 
+// forceDropSieveItem is the final capacity repair path. It removes the
+// probation tail first, then a forced main victim if probation is empty.
 func (s *shard[K, V]) forceDropSieveItem(pool *sync.Pool, stats bool) bool {
 	p := s.sieve
 	if !p.probation.empty() {

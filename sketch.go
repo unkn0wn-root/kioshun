@@ -10,7 +10,7 @@ const (
 	sketchCounterMask     = 0x0f
 	sketchMaxCounter      = 15
 	// aging shifts packed 4-bit counters right by one; this mask clears bits
-	// that would bleed across nibble boundaries. Keep tied to sketchCounterBits.
+	// that would bleed. Keep tied to sketchCounterBits.
 	sketchCounterAgingMask = 0x7777777777777777
 	sketchHashRotation0    = 0
 	sketchHashRotation1    = 17
@@ -36,6 +36,9 @@ func newDoorkeeper(n uint64) doorkeeper {
 	}
 }
 
+// add sets the doorkeeper bits and reports whether the fingerprint was already
+// present. Callers use the return value to keep first-time accesses out of the
+// heavier count-min sketch.
 func (d *doorkeeper) add(h uint64) bool {
 	if len(d.bits) == 0 {
 		return true
@@ -83,6 +86,8 @@ type countMinSketch struct {
 	resetAt  uint64
 }
 
+// newCountMinSketch rounds the logical counter count to a power of two so hash
+// indexes can use a mask instead of modulo.
 func newCountMinSketch(n uint64) countMinSketch {
 	if n < sketchMinCounters {
 		n = sketchMinCounters
@@ -109,6 +114,9 @@ func (s *countMinSketch) increment(h uint64) {
 	}
 }
 
+// add increments all four rows only while the estimated frequency is below the
+// saturation limit. Once the estimate reaches the 4-bit maximum, extra accesses
+// are ignored until aging makes room again.
 func (s *countMinSketch) add(h uint64) {
 	if len(s.counters) == 0 {
 		return
@@ -150,6 +158,8 @@ func (s *countMinSketch) minCounter(idx [4]uint64) uint8 {
 	return min
 }
 
+// age halves every packed 4-bit counter in place. The mask removes shifted bits
+// that would otherwise leak from one counter nibble into the next.
 func (s *countMinSketch) age() {
 	for i := range s.counters {
 		s.counters[i] = (s.counters[i] >> 1) & sketchCounterAgingMask
@@ -179,6 +189,8 @@ func (s *countMinSketch) incrementCounter(i uint64) {
 	}
 }
 
+// sketchIndex derives one sketch row index from a shared 64-bit hash. The
+// caller supplies a rotation to decorrelate rows; m must be a power-of-two mask.
 func sketchIndex(h, m uint64, rot int) uint64 {
 	h = bits.RotateLeft64(h, rot)
 	return xxHash64Avalanche(h) & m
