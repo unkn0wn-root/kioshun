@@ -8,7 +8,7 @@ import (
 const (
 	// readStripeSlots is how many access fingerprints a stripe buffers before
 	// producers begin overwriting the oldest unread sample.
-	// It also sets the drain-signal cadence: one wake per filled stripe.
+	// It also sets the drain-signal: one wake per filled stripe.
 	// Note: must be 2^n.
 	readStripeSlots = 64
 	readSlotMask    = readStripeSlots - 1

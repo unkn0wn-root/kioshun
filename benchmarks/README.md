@@ -1,4 +1,4 @@
-# Benchmark Methodology - Kioshun vs. Popular Go Caches
+# Kioshun vs. Others
 
 These benchmarks compare Kioshun against Ristretto, BigCache, FreeCache, and
 go-cache using deterministic, pre-generated workloads. Lower `ns/op` is better

@@ -190,7 +190,7 @@ http.Handle("/api/users", middleware.Wrap(usersHandler))
 
 ## Benchmark Results
 
-You can find reproducible comparison tests in [benchmarks/](benchmarks/).
+You can find comparison tests in [benchmarks](benchmarks/).
 Those compares Kioshun with Ristretto, BigCache, FreeCache, and go-cache using
 pre-generated workloads, with async and strict write modes reported separately.
 
@@ -217,8 +217,3 @@ the number of unique cache entries.
 | Get no TTL | 83,651,143 | 15.26 | 0 | 0 |
 | 70% read / 30% write async | 27,072,325 | 44.70 | 0 | 0 |
 | Real-world strict | 22,050,884 | 56.33 | 0 | 0 |
-
-The checked-in tables are example results, not universal rankings. In
-particular, large `[]byte` results compare each cache's API semantics:
-Kioshun stores caller-owned values by reference, while BigCache and FreeCache
-copy payload bytes.

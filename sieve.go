@@ -124,13 +124,13 @@ func (q *sieveQueue[K, V]) holds(it *cacheItem[K, V]) bool {
 // so all increments, reads, and resets are plain — none of these fields is
 // touched from the concurrent read path.
 //
-// mainSurvivals counts main-queue residents the SIEVE hand spared during
+// mainSurvivals counts main queue residents the SIEVE hand spared during
 // eviction sweeps (a set visited bit buys a second chance). It is the
-// maintenance-path proxy for "the main cache is earning its capacity", and
+// maintenance path proxy for "the main cache is earning its capacity", and
 // replaces a per-read main-hit counter whose atomic increment contended on the
 // read hot path. Counting survivors instead of raw hits also tracks how many
 // distinct main items reads keep alive, rather than being skewed by a single
-// hammered key.
+// "hammered" key.
 type adaptiveController struct {
 	ghostHits           uint64
 	probationEvictions  uint64
@@ -245,9 +245,6 @@ func (p *sieveTinyLFU[K, V]) owns(it *cacheItem[K, V]) bool {
 	return p.probation.holds(it) || p.main.holds(it)
 }
 
-// recordReadHit marks a policy owned item as recently used without moving it.
-// The SIEVE hand consumes the bit later, keeping reads cheap and queue
-// maintenance single-consumer.
 func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
 	// Reads only set the visited bit; queue ownership is maintained by the write.
 	// markSieveItemVisited is a conditional atomic store (skipped once the bit is
@@ -374,7 +371,7 @@ func (p *sieveTinyLFU[K, V]) promote(it *cacheItem[K, V]) {
 }
 
 // dropProbationVictim records a probation eviction and remembers the key for
-// possible ghost-hit readmission.
+// possible ghost hit readmission.
 func (s *shard[K, V]) dropProbationVictim(it *cacheItem[K, V], pool *sync.Pool, stats bool) bool {
 	p := s.sieve
 	h, tag := it.hash, it.tag
@@ -458,7 +455,7 @@ func (s *shard[K, V]) enforceSieveCapacity(
 	tie bool,
 ) {
 	p := s.sieve
-	// admitFromProbation evicts the probation tail; a promoted survivor becomes
+	// evicts the probation tail; a promoted survivor becomes
 	// the in-flight candidate weighed against the next main victim.
 	admitFromProbation := func() {
 		if it := s.evictProbation(pool, stats); it != nil {
@@ -542,9 +539,8 @@ func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K
 		if sieveItemVisited(it) {
 			clearSieveItemVisited(it)
 			if p.adaptive {
-				// The hand spared a visited main resident: a maintenance-path
-				// observation that reads are keeping main entries alive. This is
-				// the signal the adaptive shrink decision consumes, gathered here
+				// a maintenance-path observation that reads are keeping main entries alive.
+				// This is the signal the adaptive shrink decision consumes, gathered here
 				// instead of via a contended counter on every main read hit.
 				p.controller.mainSurvivals++
 			}

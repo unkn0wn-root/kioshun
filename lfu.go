@@ -4,8 +4,8 @@ package kioshun
 // Empty non-sentinel buckets are removed eagerly,
 // so head.next is always the current minimum.
 type freqNode[K comparable, V any] struct {
-	freq  int64                         // exact frequency (>= 0); head sentinel uses 0
-	items map[*cacheItem[K, V]]struct{} // set of items at this frequency
+	freq  int64
+	items map[*cacheItem[K, V]]struct{}
 	prev  *freqNode[K, V]
 	next  *freqNode[K, V]
 }

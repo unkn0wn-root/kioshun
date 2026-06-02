@@ -38,14 +38,14 @@ type mpscCell[K comparable, V any] struct {
 type mpscQueue[K comparable, V any] struct {
 	mask    uint64
 	buffer  []mpscCell[K, V]
-	wake    chan struct{}   // consumer wakeup (shared with read sampling)
+	wake    chan struct{}   // consumer wakeup
 	space   chan struct{}   // producer wakeup when the consumer frees a slot
 	closeCh <-chan struct{} // cache shutdown broadcast
 
 	_    [cacheLinePadding]byte
-	head atomic.Uint64 // producers reserve here (hot)
+	head atomic.Uint64 // hot
 	_    [cacheLinePadding]byte
-	tail uint64 // consumer position (single consumer)
+	tail uint64 // single consumer
 	_    [cacheLinePadding]byte
 }
 

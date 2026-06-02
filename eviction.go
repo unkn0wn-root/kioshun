@@ -28,8 +28,6 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 	if lfu == nil {
 		return
 	}
-	// removeLFU already detached LFU metadata; dropLRU only unlinks the shared
-	// resident list and map entry.
 	s.dropItem(lfu, itemPool, statsEnabled, true, dropLRU)
 }
 

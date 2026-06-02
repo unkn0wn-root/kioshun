@@ -38,7 +38,6 @@ func newCacheError(op, name string, cause error) *CacheError {
 	}
 }
 
-// ConfigError describes an invalid cache configuration field.
 type ConfigError struct {
 	Field  string
 	Value  any
@@ -55,7 +54,6 @@ func (e *ConfigError) Error() string {
 	return fmt.Sprintf("%v: %s %s (got %v)", ErrInvalidConfig, e.Field, e.Reason, e.Value)
 }
 
-// Unwrap returns ErrInvalidConfig so errors.Is can match configuration errors.
 func (e *ConfigError) Unwrap() error {
 	return ErrInvalidConfig
 }

@@ -10,14 +10,13 @@ import (
 
 // xxHash64 seed=0 implementation tuned for cache hot paths.
 const (
-	// xxHash64 primes
 	prime64_1 = 0x9E3779B185EBCA87
 	prime64_2 = 0xC2B2AE3D27D4EB4F
 	prime64_3 = 0x165667B19E3779F9
 	prime64_4 = 0x85EBCA77C2B2AE63
 	prime64_5 = 0x27D4EB2F165667C5
 
-	// precomputed seeds for seed=0 (v1 and v4 initial values per spec).
+	// precomputed seeds for seed=0
 	seed64_1 = 0x60EA27EEADC0B5D6 // prime64_1 + prime64_2
 	seed64_4 = 0x61C8864E7A143579 // -prime64_1 (two's complement)
 
