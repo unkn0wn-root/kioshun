@@ -7,11 +7,11 @@ All notable changes to this project will be documented in this file. See [standa
 
 ### ⚠ BREAKING CHANGES
 
-* v4 (#39)
+* v1 (#39)
 
 ### Features
 
-* v4 ([#39](https://github.com/unkn0wn-root/kioshun/issues/39)) ([4433b2d](https://github.com/unkn0wn-root/kioshun/commit/4433b2d2a3f6a55dab5786956d0ab68c79bec79a))
+* v1 ([#39](https://github.com/unkn0wn-root/kioshun/issues/39)) ([4433b2d](https://github.com/unkn0wn-root/kioshun/commit/4433b2d2a3f6a55dab5786956d0ab68c79bec79a))
 
 ### [0.3.15](https://github.com/unkn0wn-root/kioshun/compare/v0.3.14...v0.3.15) (2025-10-30)
 
