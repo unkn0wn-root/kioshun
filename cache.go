@@ -334,9 +334,6 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 
 	item, exists := shard.data[key]
 	if !exists {
-		if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
-			shard.sieve.recordAccess(kh)
-		}
 		if c.config.StatsEnabled {
 			atomic.AddInt64(&shard.misses, 1)
 		}
@@ -354,9 +351,6 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 
 				item, exists = shard.data[key]
 				if !exists {
-					if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
-						shard.sieve.recordAccess(kh)
-					}
 					if c.config.StatsEnabled {
 						atomic.AddInt64(&shard.misses, 1)
 					}
@@ -367,10 +361,6 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 			}
 
 			c.removeItem(shard, item, false)
-			if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
-				shard.sieve.recordAccess(kh)
-			}
-
 			if c.config.StatsEnabled {
 				atomic.AddInt64(&shard.expirations, 1)
 				atomic.AddInt64(&shard.misses, 1)
