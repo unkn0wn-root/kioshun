@@ -126,9 +126,6 @@ c.Close() error
 Use `SetAsync` for queued high-throughput writes, and call `Sync` when a caller
 needs a global fence for queued writes across all shards.
 
-Invalid configurations return `ConfigError` and match `ErrInvalidConfig` with
-`errors.Is`.
-
 ### Statistics
 
 ```go
