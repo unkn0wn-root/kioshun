@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -24,6 +25,8 @@ const (
 	benchCleanInterval = 5 * time.Minute
 	benchMemoryBudget  = 256 * 1024 * 1024
 )
+
+var errWriteNotAccepted = errors.New("write not accepted")
 
 type writeMode uint8
 
@@ -191,12 +194,16 @@ type RistrettoWrapper struct {
 }
 
 func (c *RistrettoWrapper) Set(key string, value []byte) error {
-	c.cache.SetWithTTL(key, value, int64(len(value)), c.ttl)
+	if !c.cache.SetWithTTL(key, value, int64(len(value)), c.ttl) {
+		return errWriteNotAccepted
+	}
 	return nil
 }
 
 func (c *RistrettoWrapper) SetStrict(key string, value []byte) error {
-	c.cache.SetWithTTL(key, value, int64(len(value)), c.ttl)
+	if !c.cache.SetWithTTL(key, value, int64(len(value)), c.ttl) {
+		return errWriteNotAccepted
+	}
 	c.cache.Wait()
 	return nil
 }
@@ -223,8 +230,8 @@ func (c *RistrettoWrapper) Close() error {
 	return nil
 }
 
-func newBenchCache(b *testing.B, name string, opts cacheOptions) cacheBench {
-	b.Helper()
+func newBenchCache(tb testing.TB, name string, opts cacheOptions) cacheBench {
+	tb.Helper()
 
 	ttl := benchTTL
 	kioshunTTL := benchTTL
@@ -247,7 +254,7 @@ func newBenchCache(b *testing.B, name string, opts cacheOptions) cacheBench {
 	switch name {
 	case "kioshun":
 		return &KioshunWrapper{
-			cache: newKioshunCache[string, []byte](b, kioshunConfig),
+			cache: newKioshunCache[string, []byte](tb, kioshunConfig),
 			ttl:   kioshunTTL,
 		}
 	case "ristretto":
@@ -258,7 +265,7 @@ func newBenchCache(b *testing.B, name string, opts cacheOptions) cacheBench {
 			Metrics:     false,
 		})
 		if err != nil {
-			b.Fatalf("create ristretto: %v", err)
+			tb.Fatalf("create ristretto: %v", err)
 		}
 		return &RistrettoWrapper{cache: ristrettoCache, ttl: ttl}
 	case "bigcache":
@@ -274,7 +281,7 @@ func newBenchCache(b *testing.B, name string, opts cacheOptions) cacheBench {
 		bigCacheConfig.Verbose = false
 		bigCache, err := bigcache.New(context.Background(), bigCacheConfig)
 		if err != nil {
-			b.Fatalf("create bigcache: %v", err)
+			tb.Fatalf("create bigcache: %v", err)
 		}
 		return &BigCacheWrapper{cache: bigCache}
 	case "freecache":
@@ -287,7 +294,7 @@ func newBenchCache(b *testing.B, name string, opts cacheOptions) cacheBench {
 			cache: gocache.NewFrom(goCacheTTL, benchCleanInterval, make(map[string]gocache.Item, benchTargetEntries)),
 		}
 	default:
-		b.Fatalf("unknown benchmark cache %q", name)
+		tb.Fatalf("unknown benchmark cache %q", name)
 		return nil
 	}
 }
@@ -348,9 +355,12 @@ func runParallelCycle(b *testing.B, n int, fn func(int)) {
 	})
 }
 
-func prepopulate(c cacheBench, keys []string, value []byte) {
+func prepopulate(tb testing.TB, c cacheBench, keys []string, value []byte) {
+	tb.Helper()
 	for _, key := range keys {
-		_ = c.Set(key, value)
+		if err := c.Set(key, value); err != nil {
+			tb.Fatalf("prepopulate set %q: %v", key, err)
+		}
 	}
 	c.Flush()
 }
@@ -401,19 +411,27 @@ func makeHotWorkload(hotKeys, coldKeys []string, values [][]byte, seed int64) []
 	return ops
 }
 
-func applyOp(c cacheBench, op workloadOp, mode writeMode) {
+func applyOp(c cacheBench, op workloadOp, mode writeMode) error {
 	switch op.op {
 	case opGet:
 		c.Get(op.key)
 	case opSet:
 		if mode == strictWrites {
-			_ = c.SetStrict(op.key, op.value)
-			return
+			return c.SetStrict(op.key, op.value)
 		}
-		_ = c.Set(op.key, op.value)
+		return c.Set(op.key, op.value)
 	case opDelete:
 		c.Delete(op.key)
 	}
+	return nil
+}
+
+func reportWriteFailures(b *testing.B, failures uint64) {
+	b.Helper()
+	if failures == 0 {
+		return
+	}
+	b.ReportMetric(float64(failures)/float64(b.N), "write_fail/op")
 }
 
 func benchmarkSet(b *testing.B, mode writeMode) {
@@ -421,15 +439,21 @@ func benchmarkSet(b *testing.B, mode writeMode) {
 	value := makeValue(1024)
 
 	forEachCache(b, cacheOptions{valueSize: len(value), ttl: true}, func(b *testing.B, c cacheBench) {
+		var failures atomic.Uint64
 		b.ResetTimer()
 		runParallelCycle(b, len(keys), func(i int) {
+			var err error
 			if mode == strictWrites {
-				_ = c.SetStrict(keys[i], value)
-				return
+				err = c.SetStrict(keys[i], value)
+			} else {
+				err = c.Set(keys[i], value)
 			}
-			_ = c.Set(keys[i], value)
+			if err != nil {
+				failures.Add(1)
+			}
 		})
 		b.StopTimer()
+		reportWriteFailures(b, failures.Load())
 		c.Flush()
 	})
 }
@@ -439,7 +463,7 @@ func benchmarkGet(b *testing.B, ttl bool) {
 	value := makeValue(1024)
 
 	forEachCache(b, cacheOptions{valueSize: len(value), ttl: ttl}, func(b *testing.B, c cacheBench) {
-		prepopulate(c, keys, value)
+		prepopulate(b, c, keys, value)
 		b.ResetTimer()
 		runParallelCycle(b, len(keys), func(i int) {
 			c.Get(keys[i])
@@ -452,12 +476,16 @@ func benchmarkWorkload(b *testing.B, mode writeMode, name string, ops []workload
 
 	b.Run(name, func(b *testing.B) {
 		forEachCache(b, cacheOptions{valueSize: len(prefillValue), ttl: true}, func(b *testing.B, c cacheBench) {
-			prepopulate(c, prefillKeys, prefillValue)
+			prepopulate(b, c, prefillKeys, prefillValue)
+			var failures atomic.Uint64
 			b.ResetTimer()
 			runParallelCycle(b, len(ops), func(i int) {
-				applyOp(c, ops[i], mode)
+				if err := applyOp(c, ops[i], mode); err != nil {
+					failures.Add(1)
+				}
 			})
 			b.StopTimer()
+			reportWriteFailures(b, failures.Load())
 			c.Flush()
 		})
 	})
@@ -470,14 +498,46 @@ func benchmarkLargeValues(b *testing.B, mode writeMode) {
 			values := makeValues(size)
 			ops := makeWorkload(keys, values, 0.35, 0.65, 0, int64(size))
 			forEachCache(b, cacheOptions{valueSize: size, ttl: true}, func(b *testing.B, c cacheBench) {
-				prepopulate(c, keys[:1000], values[0])
+				prepopulate(b, c, keys[:1000], values[0])
+				var failures atomic.Uint64
 				b.ResetTimer()
 				runParallelCycle(b, len(ops), func(i int) {
-					applyOp(c, ops[i], mode)
+					if err := applyOp(c, ops[i], mode); err != nil {
+						failures.Add(1)
+					}
 				})
 				b.StopTimer()
+				reportWriteFailures(b, failures.Load())
 				c.Flush()
 			})
+		})
+	}
+}
+
+func TestBenchmarkComparisonGetSetup(t *testing.T) {
+	for _, ttl := range []bool{true, false} {
+		t.Run(fmt.Sprintf("ttl_%t", ttl), func(t *testing.T) {
+			keys := makeKeys("sanity-get", benchKeySpace)
+			value := makeValue(1024)
+			opts := cacheOptions{valueSize: len(value), ttl: ttl}
+
+			for _, name := range cacheOrder {
+				t.Run(name, func(t *testing.T) {
+					c := newBenchCache(t, name, opts)
+					defer c.Close()
+
+					prepopulate(t, c, keys, value)
+					for _, key := range keys {
+						got, found := c.Get(key)
+						if !found {
+							t.Fatalf("expected prepopulated key %q to be present", key)
+						}
+						if len(got) != len(value) {
+							t.Fatalf("value length for %q = %d, want %d", key, len(got), len(value))
+						}
+					}
+				})
+			}
 		})
 	}
 }

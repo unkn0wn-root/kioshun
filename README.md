@@ -173,9 +173,19 @@ http.Handle("/api/users", middleware.Wrap(usersHandler))
 
 ## Benchmark Results
 
-Latest benchmark run (Apple M4 Max, Go 1.24.7):
-- `SET`: 100,000,000 ops/sec · 75.55 ns/op · 41 B/op · 3 allocs/op
-- `GET`: 231,967,180 ops/sec · 25.87 ns/op · 31 B/op · 2 allocs/op
-- `Real-World`: 52,742,550 ops/sec · 65.25 ns/op · 48 B/op · 3 allocs/op
+You can find reproducible comparison tests in [benchmarks/](benchmarks/).
+Those compares Kioshun with Ristretto, BigCache, FreeCache, and go-cache using
+pre-generated workloads, with async and strict write modes reported separately.
 
-Full suite: [benchmarks/README.md](benchmarks/README.md)
+Before citing numbers, rerun the suite on the target machine:
+
+```bash
+cd benchmarks
+GOCACHE=/tmp/kioshun-go-build go test -run=TestBenchmarkComparisonGetSetup -count=1 .
+GOCACHE=/tmp/kioshun-go-build go test -bench='BenchmarkCacheComparison' -benchmem -run=^$ -benchtime=1s .
+```
+
+The checked-in tables are example results, not universal rankings. In
+particular, large `[]byte` results compare each cache's API semantics:
+Kioshun stores caller-owned values by reference, while BigCache and FreeCache
+copy payload bytes.
