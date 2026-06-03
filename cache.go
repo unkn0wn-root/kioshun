@@ -8,35 +8,6 @@ import (
 	"time"
 )
 
-// Sentinel TTLs for Set and related methods: NoExpiration keeps an item until it
-// is evicted or deleted; DefaultExpiration falls back to Config.DefaultTTL.
-const (
-	NoExpiration      time.Duration = -1
-	DefaultExpiration time.Duration = 0
-)
-
-const (
-	defaultMaxSize         = 10000
-	defaultCleanupInterval = 5 * time.Minute
-	defaultTTL             = 30 * time.Minute
-	defaultWriteBufferSize = 1024
-	defaultWriteBatchSize  = 64
-
-	// scale by CPUs and round to 2^n
-	maxShardCount   = 256
-	shardMultiplier = 4
-)
-
-type EvictionPolicy int
-
-const (
-	DefaultEvictionPolicy EvictionPolicy = iota
-	LRU
-	LFU
-	FIFO
-	SieveTinyLFU
-)
-
 // Store is the key/value store implemented by Cache.
 type Store[K comparable, V any] interface {
 	Set(key K, value V, ttl time.Duration) error
@@ -47,36 +18,6 @@ type Store[K comparable, V any] interface {
 }
 
 var _ Store[string, int] = (*Cache[string, int])(nil)
-
-type cacheItem[K comparable, V any] struct {
-	value      V
-	expireTime int64 // absolute ns; 0 => no expiration
-	lastAccess int64 // last touch time (ns) for policies that use it
-	lfuFreq    int64 // exact LFU counter
-	prev       *cacheItem[K, V]
-	next       *cacheItem[K, V]
-	sieveQ     *sieveQueue[K, V]
-	key        K // original key for deletions
-	hash       uint64
-	tag        uint16
-	queue      sieveQueueID
-	reuse      uint8
-	visited    uint32
-}
-
-func acquireCacheItem[K comparable, V any](pool *sync.Pool) *cacheItem[K, V] {
-	it := pool.Get().(*cacheItem[K, V])
-	*it = cacheItem[K, V]{}
-	return it
-}
-
-func releaseCacheItem[K comparable, V any](pool *sync.Pool, it *cacheItem[K, V]) {
-	if it == nil {
-		return
-	}
-	*it = cacheItem[K, V]{}
-	pool.Put(it)
-}
 
 // Stats exposes approx. telemetry aggregated across shards.
 type Stats struct {
@@ -98,79 +39,6 @@ type PolicyStats struct {
 	Promotions         int64
 	ProbationEvictions int64
 	MainEvictions      int64
-}
-
-// Config controls cache capacity, sharding, eviction, and the async write
-// pipeline. Use DefaultConfig for recommended settings.
-type Config struct {
-	MaxSize         int64
-	ShardCount      int
-	CleanupInterval time.Duration
-	DefaultTTL      time.Duration
-	EvictionPolicy  EvictionPolicy
-	StatsEnabled    bool
-	ProbationRatio  uint8
-	GhostRatio      uint8
-	Adapt           bool
-	WriteBufferSize int // bounded per-shard queue depth for async writes.
-	WriteBatchSize  int // caps how many queued writes a shard worker applies under one lock.
-}
-
-// DefaultConfig returns adaptive SieveTinyLFU with
-// stats enabled and shard count scaled to the number of CPUs.
-func DefaultConfig() Config {
-	return Config{
-		MaxSize:         defaultMaxSize,
-		ShardCount:      0,
-		CleanupInterval: defaultCleanupInterval,
-		DefaultTTL:      defaultTTL,
-		EvictionPolicy:  SieveTinyLFU,
-		StatsEnabled:    true,
-		ProbationRatio:  defaultProbationRatio,
-		GhostRatio:      defaultGhostRatio,
-		Adapt:           true,
-		WriteBufferSize: defaultWriteBufferSize,
-		WriteBatchSize:  defaultWriteBatchSize,
-	}
-}
-
-// Validate reports invalid cache configuration values.
-func (c Config) Validate() error {
-	if c.MaxSize < 0 {
-		return newConfigError("MaxSize", c.MaxSize, "must be >= 0")
-	}
-	if c.ShardCount < 0 {
-		return newConfigError("ShardCount", c.ShardCount, "must be >= 0")
-	}
-	if c.CleanupInterval < 0 {
-		return newConfigError("CleanupInterval", c.CleanupInterval, "must be >= 0")
-	}
-	if c.DefaultTTL < 0 && c.DefaultTTL != NoExpiration {
-		return newConfigError("DefaultTTL", c.DefaultTTL, "must be >= 0 or NoExpiration")
-	}
-	if c.EvictionPolicy < DefaultEvictionPolicy || c.EvictionPolicy > SieveTinyLFU {
-		return newConfigError("EvictionPolicy", c.EvictionPolicy, "must be a known eviction policy")
-	}
-	if c.ProbationRatio > 100 {
-		return newConfigError("ProbationRatio", c.ProbationRatio, "must be <= 100")
-	}
-	if c.GhostRatio > 100 {
-		return newConfigError("GhostRatio", c.GhostRatio, "must be <= 100")
-	}
-	if c.WriteBufferSize < 0 {
-		return newConfigError("WriteBufferSize", c.WriteBufferSize, "must be >= 0")
-	}
-	if c.WriteBatchSize < 0 {
-		return newConfigError("WriteBatchSize", c.WriteBatchSize, "must be >= 0")
-	}
-	return nil
-}
-
-type getResult[V any] struct {
-	value      V
-	expireTime int64
-	now        int64
-	ok         bool
 }
 
 // Cache is a sharded, lock-based in-memory cache with per-policy metadata.
@@ -531,6 +399,13 @@ func (c *Cache[K, V]) isClosed() bool {
 
 func (c *Cache[K, V]) getShard(key K) *shard[K, V] {
 	return c.shardByHash(c.hasher.hash(key))
+}
+
+type getResult[V any] struct {
+	value      V
+	expireTime int64
+	now        int64
+	ok         bool
 }
 
 func (c *Cache[K, V]) get(key K) getResult[V] {
