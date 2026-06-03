@@ -47,8 +47,13 @@ type Middleware struct {
 	methods     map[string]struct{}
 	maxBodySize int64
 	limitBody   bool
-	patternIdx  *patternIndex
-	pathExtract func(string) string
+
+	// tracks cached keys by URL path for Invalidate. It is populated
+	// and queried only when patternEnabled is set (a PathExtractor was configured),
+	// and kept in sync by the backing cache's removal listener (onCacheRemove).
+	patternEnabled bool
+	patternIdx     *patternIndex
+	pathExtract    PathExtractor
 }
 
 // New creates a caching Middleware from config, applying DefaultConfig for unset fields.
@@ -73,13 +78,7 @@ func New(config Config) (*Middleware, error) {
 		cacheConfig.CleanupInterval = 0
 	}
 
-	cache, err := kioshun.New[string, *Response](cacheConfig)
-	if err != nil {
-		return nil, err
-	}
-
 	m := &Middleware{
-		cache:       cache,
 		keyGen:      DefaultKeyGenerator,
 		policy:      DefaultCachePolicy(config),
 		hitHeader:   config.HitHeader,
@@ -89,8 +88,23 @@ func New(config Config) (*Middleware, error) {
 		maxBodySize: config.MaxBodySize,
 		limitBody:   !config.DisableBodySizeLimit,
 		patternIdx:  newPatternIndex(),
-		pathExtract: defaultPathExtractor,
 	}
+
+	// pattern invalidation is opt-in: supplying a PathExtractor enables the index
+	// and wires the cache's removal listener. Callers that
+	// don't use Invalidate pay nothing for the index or the listener.
+	var opts []kioshun.Option[string, *Response]
+	if config.PathExtractor != nil {
+		m.patternEnabled = true
+		m.pathExtract = config.PathExtractor
+		opts = append(opts, kioshun.WithOnRemove(m.onCacheRemove))
+	}
+
+	cache, err := kioshun.New[string, *Response](cacheConfig, opts...)
+	if err != nil {
+		return nil, err
+	}
+	m.cache = cache
 
 	return m, nil
 }
@@ -131,11 +145,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			}
 			copy(cached.Body, body)
 
-			if err := m.cache.Set(key, cached, ttl); err == nil {
-				if path := m.pathExtract(key); path != "" {
-					m.patternIdx.addKey(path, key)
-				}
-
+			if err := m.store(key, cached, ttl); err == nil {
 				if m.onSet != nil {
 					m.onSet(key, ttl)
 				}
@@ -153,38 +163,72 @@ func (m *Middleware) Clear() {
 	m.patternIdx.clear()
 }
 
-// Invalidate removes cached entries matching a URL pattern.
+// Invalidate removes cached entries whose path matches urlPattern and returns
+// the number removed. urlPattern is either an exact path ("/api/users") or a
+// prefix ending in "*" ("/api/*"), matched against the path recovered by the
+// configured PathExtractor. Without a PathExtractor (see Config) the index is
+// empty and this returns 0.
 func (m *Middleware) Invalidate(urlPattern string) int {
-	removed := 0
+	if !m.patternEnabled {
+		return 0
+	}
 
-	matchingKeys := m.patternIdx.getMatchingKeys(urlPattern)
-	for _, key := range matchingKeys {
-		if path := m.pathExtract(key); path != "" {
-			m.patternIdx.removeKey(path, key)
-		}
+	removed := 0
+	for _, key := range m.patternIdx.getMatchingKeys(urlPattern) {
 		if m.cache.Delete(key) {
 			removed++
 		}
 	}
-
 	return removed
 }
 
-// InvalidateByFunc removes cached entries matching a custom predicate.
+// InvalidateByFunc removes cached entries whose key matches fn and returns the
+// number removed. When pattern invalidation is enabled, the index is reconciled
+// by the cache's removal listener as the matched entries are deleted.
 func (m *Middleware) InvalidateByFunc(fn func(string) bool) int {
 	removed := 0
-	keys := m.cache.Keys()
-
-	for _, key := range keys {
+	for _, key := range m.cache.Keys() {
 		if fn(key) && m.cache.Delete(key) {
-			if path := m.pathExtract(key); path != "" {
-				m.patternIdx.removeKey(path, key)
-			}
 			removed++
 		}
 	}
-
 	return removed
+}
+
+// store writes resp to the cache. When pattern invalidation is enabled it
+// indexes the key before the write, so a removal during Set - including a
+// SIEVE admission rejection that drops the entry immediately - is reported to
+// onCacheRemove and cleaned up.
+func (m *Middleware) store(key string, resp *Response, ttl time.Duration) error {
+	if !m.patternEnabled {
+		return m.cache.Set(key, resp, ttl)
+	}
+
+	path := m.pathExtract(key)
+	if path == "" {
+		return m.cache.Set(key, resp, ttl)
+	}
+
+	m.patternIdx.addKey(path, key, resp)
+	if err := m.cache.Set(key, resp, ttl); err != nil {
+		m.patternIdx.removeKeyByIdentity(path, key, resp)
+		return err
+	}
+	return nil
+}
+
+// onCacheRemove drops a key from the pattern index when the backing cache removes
+// it. It is wired as the cache's removal listener only when pattern invalidation
+// is enabled. The reason is irrelevant here: any removal (including an admission
+// rejection) means the key should leave the index. Removal is by response
+// identity, so a notification that arrives after the key was recached leaves the
+// live entry in place (see patternIndex).
+func (m *Middleware) onCacheRemove(key string, resp *Response, _ kioshun.RemovalReason) {
+	path := m.pathExtract(key)
+	if path == "" {
+		return
+	}
+	m.patternIdx.removeKeyByIdentity(path, key, resp)
 }
 
 // Close releases middleware resources.
@@ -197,9 +241,6 @@ func (m *Middleware) SetKeyGenerator(keyGen KeyGenerator) { m.keyGen = keyGen }
 
 // SetCachePolicy overrides the policy deciding what to cache and for how long.
 func (m *Middleware) SetCachePolicy(policy Policy) { m.policy = policy }
-
-// SetPathExtractor overrides the key-to-path extractor used for pattern invalidation.
-func (m *Middleware) SetPathExtractor(extractor PathExtractor) { m.pathExtract = extractor }
 
 // OnHit registers a callback invoked on each cache hit.
 func (m *Middleware) OnHit(callback func(string)) { m.onHit = callback }

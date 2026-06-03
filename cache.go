@@ -187,12 +187,17 @@ type Cache[K comparable, V any] struct {
 	waiterPool  sync.Pool // write ack waiters for sync mutation paths
 	hasher      hasher[K]
 	evictor     evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
+	onRemove    func(K, V, RemovalReason)
+	onEvict     func(K, V)
+	removeWake  chan struct{}
 }
+
+type Option[K comparable, V any] func(*Cache[K, V])
 
 // New constructs a Cache from config, returning an error if config is invalid.
 // Shard count is normalized to 2^n (and bounded by MaxSize); background
 // workers start immediately, so callers must Close the cache to release them.
-func New[K comparable, V any](config Config) (*Cache[K, V], error) {
+func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V], error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -279,6 +284,21 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 			s.readBuf = newReadBuffer() // pershard read sampling for the sketch
 		}
 		cache.shards[i] = s
+	}
+
+	for _, opt := range opts {
+		opt(cache)
+	}
+
+	nm := cache.removalNotifyMask()
+	if nm != 0 {
+		cache.removeWake = make(chan struct{}, 1)
+		for _, s := range cache.shards {
+			s.removeWake = cache.removeWake
+			s.removeNotifyMask = nm
+		}
+		cache.workers.Add(1)
+		go cache.removeNotifyWorker()
 	}
 
 	for _, s := range cache.shards {
@@ -381,7 +401,7 @@ func (c *Cache[K, V]) Exists(key K) bool {
 	}
 
 	if item.expireTime > 0 && now > item.expireTime {
-		c.removeItem(shard, item)
+		c.removeItem(shard, item, RemovedExpired)
 		if c.config.StatsEnabled {
 			atomic.AddInt64(&shard.expirations, 1)
 		}
@@ -568,7 +588,7 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 				continue
 			}
 
-			c.removeItem(shard, item)
+			c.removeItem(shard, item, RemovedExpired)
 			if c.config.StatsEnabled {
 				atomic.AddInt64(&shard.expirations, 1)
 				atomic.AddInt64(&shard.misses, 1)
@@ -644,7 +664,7 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		if res.now > res.expireTime {
 			shard.mu.Lock()
 			if cur, ok := shard.data[key]; ok && cur.expireTime > 0 && res.now > cur.expireTime {
-				c.removeItem(shard, cur)
+				c.removeItem(shard, cur, RemovedExpired)
 				if c.config.StatsEnabled {
 					atomic.AddInt64(&shard.expirations, 1)
 					atomic.AddInt64(&shard.misses, 1)
@@ -686,7 +706,7 @@ func (c *Cache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K, V]) ge
 	if item.expireTime > 0 {
 		now = time.Now().UnixNano()
 		if now > item.expireTime {
-			c.removeItem(shard, item)
+			c.removeItem(shard, item, RemovedExpired)
 			if c.config.StatsEnabled {
 				atomic.AddInt64(&shard.expirations, 1)
 				atomic.AddInt64(&shard.misses, 1)
@@ -715,7 +735,7 @@ func (c *Cache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
 }
 
-func (c *Cache[K, V]) removeItem(s *shard[K, V], item *cacheItem[K, V]) {
+func (c *Cache[K, V]) removeItem(s *shard[K, V], item *cacheItem[K, V], reason RemovalReason) {
 	mode := dropLRU
 	switch c.config.EvictionPolicy {
 	case LFU:
@@ -723,5 +743,5 @@ func (c *Cache[K, V]) removeItem(s *shard[K, V], item *cacheItem[K, V]) {
 	case SieveTinyLFU:
 		mode = dropSieve
 	}
-	s.dropItem(item, &c.itemPool, c.config.StatsEnabled, false, mode)
+	s.dropItem(item, &c.itemPool, c.config.StatsEnabled, reason, mode)
 }

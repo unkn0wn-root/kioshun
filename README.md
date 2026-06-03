@@ -136,12 +136,10 @@ c.Close() error
 > `SetAsync` is optional and only accepts the write into the shard queue meaning that the value
 > becomes visible after a background worker commits it.
 
-> Skip `Sync` for fire-and-forget or high throughput write paths where immediate
-> read-after-write visibility is not required. Call `Sync` at boundaries where
-> queued writes must be committed before continuing, such as tests, cache warmup,
-> shutdown handoff or reads that must observe previous async writes. `Sync` blocks
-> and reduces the throughput benefit of async writes so prefer `Set` for single
-> writes that need immediate visibility.
+> Construct with `kioshun.New(config, kioshun.WithOnRemove(func(key K, value V, reason kioshun.RemovalReason) { ... }))`
+> to receive a callback for every key removed by capacity eviction,
+> SieveTinyLFU admission rejection, TTL expiration or `Delete`. Use
+> `WithOnEvict(func(key K, value V) { ... })` for capacity evictions only.
 
 ### Statistics
 

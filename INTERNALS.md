@@ -19,7 +19,8 @@ root cache:
 
 - `httpcache/config.go`: HTTP middleware configuration and default resolution.
 - `httpcache/middleware.go`: handler wrapping, response capture, policies, keys.
-- `httpcache/pattern.go`: path index used by pattern invalidation.
+- `httpcache/pattern.go`: path-segment trie indexing cached keys for pattern
+  invalidation, kept in sync by the cache's removal listener.
 
 ## Core Data Model
 
@@ -111,6 +112,22 @@ Expired items can be removed by:
 remove expired entries. `SetWithCallback` schedules a timer after commit and
 fires only if the item still exists and is expired when the timer wakes; cleanup
 is still responsible for removing the item.
+
+### Removal Listener
+
+`WithOnRemove` registers a listener invoked once for every key that leaves the
+cache through capacity eviction, SieveTinyLFU admission rejection, TTL expiration
+or `Delete`. Each notification includes a `RemovalReason`. `WithOnEvict`
+registers a narrower listener for capacity evictions only. Neither listener is
+called for `Clear` or when an existing key's value is replaced. To keep listeners
+off the hot path, the removal paths (`dropItem` and `cleanup`) stage only the
+requested `(key, value, reason)` in a per-shard buffer under the shard
+lock, and a dedicated worker drains the buffers and runs listeners holding no
+shard lock - so listeners may call back into the cache. When no listener is
+configured no buffer is allocated and the worker is never started. Delivery is
+asynchronous, so consumers that maintain a secondary index (such as the httpcache
+pattern index) must tolerate notifications that arrive after a key has been
+reinserted.
 
 ## Write Path
 
@@ -351,7 +368,7 @@ returns `ErrTypeMismatch`.
 - ignored response headers
 - cacheable method set
 - response body size limit
-- pattern index for invalidation
+- pattern index for invalidation, enabled when `Config.PathExtractor` is set
 
 `DefaultConfig` uses SieveTinyLFU, 16 shards, max 100000 responses, 5 minute TTL,
 GET/HEAD, common cacheable status codes, ignored volatile headers, and a 10 MB
@@ -365,8 +382,11 @@ body capture limit.
 4. Forward the request to the next handler.
 5. Capture final status, headers, and body.
 6. Ask the policy whether to cache and for what TTL.
-7. Store a defensive response snapshot in the backing cache.
-8. Add the key to the pattern index when the key can be mapped back to a path.
+7. When pattern invalidation is enabled and the key maps to a path, add it to the
+   pattern index before the store, so a removal during the store (including a
+   SIEVE admission rejection) is reconciled by the removal listener.
+8. Store a defensive response snapshot in the backing cache, rolling back the
+   index entry if the store fails.
 
 The response writer:
 
@@ -389,11 +409,13 @@ Key generators include:
 - `KeyWithUserID`: MD5 of method, full URL, and a user-id header
 - `PathBasedKeyGenerator`: plain `METHOD:/path`
 
-`Invalidate(pattern)` uses the path index. Exact patterns remove keys at one
-path. Patterns ending in `*` remove keys stored at the base path and descendants.
-The default key extractor returns an empty path, so pattern invalidation requires
-a compatible key generator and path extractor, such as `KeyWithoutQuery` with
-`PathExtractorFromKey`.
+`Invalidate(pattern)` queries the path index for matching keys and deletes them
+from the cache; the removal listener then reconciles the index. Exact patterns
+match keys stored at one path, and patterns ending in `*` match the base path and
+its descendants. Pattern invalidation is enabled by setting `Config.PathExtractor`
+(which also wires the removal listener) together with a compatible key generator,
+such as `KeyWithoutQuery` with `PathExtractorFromKey`; without it the index stays
+empty and `Invalidate` returns 0.
 
 ## Algorithm References
 

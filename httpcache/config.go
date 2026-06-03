@@ -32,6 +32,12 @@ type Config struct {
 
 	HitHeader  string // Default: "X-Cache"
 	MissHeader string // Default: "X-Cache"
+
+	// PathExtractor enables URL-pattern invalidation via Invalidate by recovering
+	// a request path from a cache key. It must be paired with a path preserving
+	// key generator (for example KeyWithoutQuery together with PathExtractorFromKey).
+	// When nil, the pattern index is disabled and Invalidate is a no-op.
+	PathExtractor PathExtractor
 }
 
 // DefaultConfig returns the default HTTP cache middleware configuration.
@@ -145,6 +151,7 @@ func configWithDefaults(config Config) Config {
 	cfg.DisableCleanup = config.DisableCleanup
 	cfg.DisableCacheSizeLimit = config.DisableCacheSizeLimit
 	cfg.DisableBodySizeLimit = config.DisableBodySizeLimit
+	cfg.PathExtractor = config.PathExtractor
 	if cfg.DisableCleanup {
 		cfg.CleanupInterval = 0
 	}
