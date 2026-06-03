@@ -161,18 +161,17 @@ func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 }
 
 func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error {
-	var task *callbackTask[K, V]
+	var task callbackTask[K, V]
+	var hasTask bool
 	err := c.syncMutate(s, func() {
 		committed := c.applySetLocked(s, &cmd)
-		if t, ok := cmd.newCallbackTask(committed); ok {
-			task = &t
-		}
+		task, hasTask = cmd.newCallbackTask(committed)
 	})
 	if err != nil {
 		return err
 	}
-	if task != nil {
-		c.scheduleCallback(*task)
+	if hasTask {
+		c.scheduleCallback(task)
 	}
 	return nil
 }
