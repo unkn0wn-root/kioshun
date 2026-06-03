@@ -34,7 +34,7 @@
 
 ## What is Kioshun?
 
-Kioshun is a thread-safe (and fast!), sharded in-memory cache for Go.
+Kioshun is a fast, sharded in-memory cache for Go.
 
 If you want to know more about Kioshun internals and how it works under the hood - see [Kioshun Internals](INTERNALS.md)
 
@@ -62,15 +62,15 @@ func main() {
     defer c.Close()
 
     // Set with default TTL (30 min)
-    c.Set("user:123", "David Nice 1", kioshun.DefaultExpiration)
+    c.Set("user:123", "David", kioshun.DefaultExpiration)
 
-    // Set with no expiration
-    c.Set("user:123", "David Nice 2", kioshun.NoExpiration)
+    // `Set` commits the write before returning so the key is immediately readable.
+    c.Set("user:456", "John", kioshun.NoExpiration)
 
-    // Queue a write for high-throughput paths
-    c.SetAsync("user:456", "David Nice 3", 5*time.Minute)
+    // `SetAsync` queues the write and returns early.
+    c.SetAsync("user:789", "Paul", 5*time.Minute)
 
-    // Optional: wait when later code must observe queued writes
+    // Optional: call `Sync()` if you want to wait for value back.
     c.Sync()
 
     // Get value
@@ -86,7 +86,7 @@ func main() {
 
 ## Configuration
 
-### Basic Configuration
+### Basic
 
 ```go
 config := kioshun.Config{
@@ -102,15 +102,13 @@ config := kioshun.Config{
 
 c, err := kioshun.New[string, any](config)
 if err != nil {
-    // handle invalid configuration
+    // handle error
 }
 ```
 
-> Each cache runs one write-worker goroutine per shard (plus a
-> cleanup goroutine when `CleanupInterval > 0`), so `ShardCount` sets the number
-> of background goroutines - default `min(NumCPU*4, 256)`. If you create many
-> caches (e.g. via the cache `Manager`), set `ShardCount` explicitly to bound the
-> total.
+> Each cache runs one write-worker goroutine per shard (plus a cleanup goroutine when `CleanupInterval > 0`),
+> so `ShardCount` sets the number of background goroutines - default `min(NumCPU*4, 256)`.
+> If you create many caches (e.g. via the cache `Manager`), set `ShardCount` explicitly to bound the total.
 
 ## API
 
@@ -136,7 +134,7 @@ c.Close() error
 > `SetAsync` is optional and only accepts the write into the shard queue meaning that the value
 > becomes visible after a background worker commits it.
 
-> Construct with `kioshun.New(config, kioshun.WithOnRemove(func(key K, value V, reason kioshun.RemovalReason) { ... }))`
+> Create with `kioshun.New(config, kioshun.WithOnRemove(func(key K, value V, reason kioshun.RemovalReason) { ... }))`
 > to receive a callback for every key removed by capacity eviction,
 > SieveTinyLFU admission rejection, TTL expiration or `Delete`. Use
 > `WithOnEvict(func(key K, value V) { ... })` for capacity evictions only.
@@ -178,15 +176,15 @@ config.MaxSize = 100000
 
 middleware, err := httpcache.New(config)
 if err != nil {
-    // handle invalid configuration
+    // handle error
 }
 defer middleware.Close()
 
 http.Handle("/api/users", middleware.Wrap(usersHandler))
 ```
-> See **[MIDDLEWARE.md](MIDDLEWARE.md)** for complete documentation, examples, and advanced configuration.
+> See **[MIDDLEWARE.md](MIDDLEWARE.md)** for complete documentation.
 
-## Benchmark Results
+## Benchmarks
 
 You can find comparison tests in [benchmarks](benchmarks/).
 Those compares Kioshun with Ristretto, BigCache, FreeCache, and go-cache using
