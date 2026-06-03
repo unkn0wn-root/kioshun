@@ -2,6 +2,9 @@ package kioshun
 
 import "sync"
 
+// cacheItem is the entry stored in shard.data. It carries value/expiry metadata
+// plus the links and policy state used by LRU, LFU and SieveTinyLFU so policy
+// maintenance does not allocate wrapper nodes.
 type cacheItem[K comparable, V any] struct {
 	value      V
 	expireTime int64 // absolute ns; 0 => no expiration
