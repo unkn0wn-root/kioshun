@@ -56,7 +56,7 @@ func DefaultConfig() Config {
 		CleanupInterval: defaultCleanupInterval,
 		DefaultTTL:      defaultTTL,
 		EvictionPolicy:  SieveTinyLFU,
-		StatsEnabled:    true,
+		StatsEnabled:    false,
 		ProbationRatio:  defaultProbationRatio,
 		GhostRatio:      defaultGhostRatio,
 		Adapt:           true,
