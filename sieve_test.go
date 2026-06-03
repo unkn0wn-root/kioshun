@@ -563,8 +563,8 @@ func TestSieveTinyLFUSetKeepsShardWithinCapacity(t *testing.T) {
 	})
 	defer c.Close()
 
-	for k := 0; k < 64; k++ {
-		for hot := 0; hot < k; hot++ {
+	for k := range 64 {
+		for hot := range k {
 			c.Get(hot)
 		}
 		if err := c.Set(k, k, time.Hour); err != nil {
@@ -803,7 +803,7 @@ func TestSieveTinyLFUEqualFrequencyTieRejection(t *testing.T) {
 	in := &cacheItem[int, int]{hash: 11}
 	v := &cacheItem[int, int]{hash: 22, queue: mainQueue, reuse: 1}
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		a.sketch.increment(in.hash)
 		a.sketch.increment(v.hash)
 	}
@@ -833,7 +833,7 @@ func TestSieveTinyLFUQueueSizeMatchesShardSizeAfterMixedOps(t *testing.T) {
 	})
 	defer c.Close()
 
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		c.Set(i%12, i, time.Hour)
 		if i%3 == 0 {
 			c.Get(i % 6)
@@ -878,7 +878,7 @@ func TestSieveTinyLFUParallelRepeatedWritesKeepQueuesConsistent(t *testing.T) {
 	var failed int32
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	for g := 0; g < 8; g++ {
+	for g := range 8 {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -929,7 +929,7 @@ func TestSieveTinyLFUParallelRepeatedStringWritesAcrossShards(t *testing.T) {
 	var failed int32
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	for g := 0; g < 16; g++ {
+	for range 16 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -969,8 +969,8 @@ func TestSieveTinyLFUPooledItemsResetAfterClear(t *testing.T) {
 	})
 	defer c.Close()
 
-	for round := 0; round < 4; round++ {
-		for k := 0; k < 128; k++ {
+	for round := range 4 {
+		for k := range 128 {
 			if err := c.Set(k, round, time.Hour); err != nil {
 				t.Fatal(err)
 			}
@@ -981,7 +981,7 @@ func TestSieveTinyLFUPooledItemsResetAfterClear(t *testing.T) {
 		c.Clear()
 	}
 
-	for k := 0; k < 128; k++ {
+	for k := range 128 {
 		if err := c.Set(k, k, time.Hour); err != nil {
 			t.Fatal(err)
 		}
