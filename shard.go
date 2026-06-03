@@ -41,6 +41,15 @@ type shard[K comparable, V any] struct {
 	expirations int64 // per-shard TTL expirations
 
 	sieve *sieveTinyLFU[K, V]
+
+	// eviction notification staging, used only when the cache has an onEvict
+	// listener (evictWake is the shared worker wakeup, nil otherwise). dropItem
+	// and cleanup append removed (key, value) pairs to evictBuf under mu; the
+	// notify worker drains it after the lock is released. evictPending lets the
+	// worker skip shards with nothing staged without taking the lock.
+	evictWake    chan struct{}
+	evictBuf     []evictedEntry[K, V]
+	evictPending atomic.Bool
 }
 
 // itemDropMode selects which policy owns an item's intrusive links.
@@ -90,6 +99,12 @@ func (s *shard[K, V]) dropItem(
 	}
 
 	delete(s.data, key)
+	if s.evictWake != nil {
+		// Capture the value before the item returns to the pool.
+		s.evictBuf = append(s.evictBuf, evictedEntry[K, V]{key: key, value: item.value})
+		s.evictPending.Store(true)
+		signal(s.evictWake)
+	}
 	releaseCacheItem(itemPool, item)
 	atomic.AddInt64(&s.size, -1)
 	if statsEnabled && evicted {
@@ -212,9 +227,14 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 		}
 	}
 
+	notify := s.evictWake != nil
 	for _, key := range keysToDelete {
 		if item, exists := s.data[key]; exists {
 			delete(s.data, key)
+			if notify {
+				// capture the value before the item returns to the pool.
+				s.evictBuf = append(s.evictBuf, evictedEntry[K, V]{key: key, value: item.value})
+			}
 			switch {
 			case evictionPolicy == LFU:
 				s.lfuList.remove(item)
@@ -230,5 +250,10 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 				atomic.AddInt64(&s.expirations, 1)
 			}
 		}
+	}
+
+	if notify && len(s.evictBuf) > 0 {
+		s.evictPending.Store(true)
+		signal(s.evictWake)
 	}
 }

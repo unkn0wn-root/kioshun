@@ -30,6 +30,33 @@ func waitForMiddlewareWrites(t testing.TB, m *Middleware) {
 	}
 }
 
+// newPatternMiddleware builds a middleware wired for URL-pattern invalidation:
+// path-preserving keys plus a PathExtractor, which enables the index and the
+// backing cache's eviction listener.
+func newPatternMiddleware(t testing.TB) *Middleware {
+	t.Helper()
+	config := DefaultConfig()
+	config.PathExtractor = PathExtractorFromKey
+	m := newTestMiddleware(t, config)
+	m.SetKeyGenerator(KeyWithoutQuery())
+	return m
+}
+
+// waitFor polls cond until it holds or a deadline passes. Eviction notifications
+// (which reconcile the pattern index) are delivered asynchronously, so tests of
+// index state cannot assert immediately.
+func waitFor(t testing.TB, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition not met within deadline")
+}
+
 type committingResponseWriter struct {
 	header    http.Header
 	committed http.Header
@@ -418,48 +445,125 @@ func TestHTTPCacheMiddleware_NonCacheableMethodBypassesCachedKey(t *testing.T) {
 	}
 }
 
-func TestHTTPCacheMiddleware_InvalidationCleansStalePatternKeys(t *testing.T) {
-	middleware := newTestMiddleware(t, DefaultConfig())
+// Capacity eviction (including SIEVE admission rejection) must keep the pattern
+// index converged on the cache's resident key set rather than every key ever
+// cached.
+func TestHTTPCacheMiddleware_EvictionCleansPatternIndex(t *testing.T) {
+	config := DefaultConfig()
+	config.PathExtractor = PathExtractorFromKey
+	config.MaxSize = 100
+	config.ShardCount = 4
+	middleware := newTestMiddleware(t, config)
 	defer middleware.Close()
-
-	middleware.SetPathExtractor(PathExtractorFromKey)
-	middleware.patternIdx.addKey("/stale", "GET:/stale")
-
-	if removed := middleware.Invalidate("/stale"); removed != 0 {
-		t.Fatalf("removed=%d, want 0", removed)
-	}
-	if keys := middleware.patternIdx.getMatchingKeys("/stale"); len(keys) != 0 {
-		t.Fatalf("stale pattern keys=%v, want none", keys)
-	}
-}
-
-func TestHTTPCacheMiddleware_InvalidateByFuncCleansPatternIndex(t *testing.T) {
-	middleware := newTestMiddleware(t, DefaultConfig())
-	defer middleware.Close()
-
 	middleware.SetKeyGenerator(KeyWithoutQuery())
-	middleware.SetPathExtractor(PathExtractorFromKey)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("response"))
+		w.Write([]byte("ok"))
 	})
 	wrappedHandler := middleware.Wrap(handler)
 
-	req := httptest.NewRequest("GET", "/func/stale", nil)
-	rec := httptest.NewRecorder()
-	wrappedHandler.ServeHTTP(rec, req)
+	const total = 2000
+	for i := 0; i < total; i++ {
+		req := httptest.NewRequest("GET", fmt.Sprintf("/evict/%d", i), nil)
+		wrappedHandler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	waitForMiddlewareWrites(t, middleware)
+
+	// The eviction listener reconciles the index, so it converges to exactly the
+	// resident set — never the 2000 keys inserted.
+	waitFor(t, func() bool {
+		return int64(len(middleware.patternIdx.getMatchingKeys("/evict/*"))) == middleware.cache.Size()
+	})
+	if n := int64(len(middleware.patternIdx.getMatchingKeys("/evict/*"))); n > config.MaxSize {
+		t.Fatalf("index holds %d keys, want <= cache capacity %d", n, config.MaxSize)
+	}
+}
+
+// Invalidate deletes the matched entries; the eviction listener then reconciles
+// the index for exactly those keys, leaving unrelated entries in place.
+func TestHTTPCacheMiddleware_InvalidateCleansPatternIndex(t *testing.T) {
+	middleware := newPatternMiddleware(t)
+	defer middleware.Close()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	for _, path := range []string{"/api/users/1", "/api/users/2", "/api/posts/1"} {
+		wrappedHandler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", path, nil))
+	}
+	waitForMiddlewareWrites(t, middleware)
+
+	if removed := middleware.Invalidate("/api/users/*"); removed != 2 {
+		t.Fatalf("removed=%d, want 2", removed)
+	}
+
+	waitFor(t, func() bool {
+		return len(middleware.patternIdx.getMatchingKeys("/api/users/*")) == 0
+	})
+	if keys := middleware.patternIdx.getMatchingKeys("/api/posts/*"); len(keys) != 1 {
+		t.Fatalf("posts keys=%v, want one survivor", keys)
+	}
+}
+
+func TestHTTPCacheMiddleware_InvalidateByFunc(t *testing.T) {
+	middleware := newPatternMiddleware(t)
+	defer middleware.Close()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	for _, path := range []string{"/func/a", "/func/b", "/other/c"} {
+		wrappedHandler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", path, nil))
+	}
 	waitForMiddlewareWrites(t, middleware)
 
 	removed := middleware.InvalidateByFunc(func(key string) bool {
-		return strings.Contains(key, "/func/stale")
+		return strings.Contains(key, "/func/")
 	})
-	if removed != 1 {
-		t.Fatalf("removed=%d, want 1", removed)
+	if removed != 2 {
+		t.Fatalf("removed=%d, want 2", removed)
 	}
-	if keys := middleware.patternIdx.getMatchingKeys("/func/stale"); len(keys) != 0 {
-		t.Fatalf("pattern keys=%v, want none", keys)
+
+	waitFor(t, func() bool {
+		return len(middleware.patternIdx.getMatchingKeys("/func/*")) == 0
+	})
+	if keys := middleware.patternIdx.getMatchingKeys("/other/c"); len(keys) != 1 {
+		t.Fatalf("/other/c keys=%v, want one survivor", keys)
 	}
+}
+
+// TTL expiry swept by the cleanup worker must reconcile the index too.
+func TestHTTPCacheMiddleware_TTLExpiryCleansPatternIndex(t *testing.T) {
+	config := DefaultConfig()
+	config.PathExtractor = PathExtractorFromKey
+	config.DefaultTTL = 40 * time.Millisecond
+	config.CleanupInterval = 5 * time.Millisecond
+	middleware := newTestMiddleware(t, config)
+	defer middleware.Close()
+	middleware.SetKeyGenerator(KeyWithoutQuery())
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	wrappedHandler := middleware.Wrap(handler)
+
+	wrappedHandler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/ttl/1", nil))
+	waitForMiddlewareWrites(t, middleware)
+	if keys := middleware.patternIdx.getMatchingKeys("/ttl/1"); len(keys) != 1 {
+		t.Fatalf("keys before expiry=%v, want one entry", keys)
+	}
+
+	waitFor(t, func() bool {
+		return len(middleware.patternIdx.getMatchingKeys("/ttl/*")) == 0
+	})
 }
 
 func TestHTTPCacheMiddleware_BasicCaching(t *testing.T) {
@@ -1004,13 +1108,9 @@ func TestExtractMaxAge(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
-	config := DefaultConfig()
-	middleware := newTestMiddleware(t, config)
+	// Path-based keys plus a PathExtractor enable pattern matching.
+	middleware := newPatternMiddleware(t)
 	defer middleware.Close()
-
-	// Use path-based key generator for pattern matching
-	middleware.SetKeyGenerator(KeyWithoutQuery())
-	middleware.SetPathExtractor(PathExtractorFromKey)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -1077,12 +1177,8 @@ func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
-	config := DefaultConfig()
-	middleware := newTestMiddleware(t, config)
+	middleware := newPatternMiddleware(t)
 	defer middleware.Close()
-
-	middleware.SetKeyGenerator(KeyWithoutQuery())
-	middleware.SetPathExtractor(PathExtractorFromKey)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -1202,12 +1298,8 @@ func TestHTTPCacheMiddleware_CacheHitMissVerification(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
-	config := DefaultConfig()
-	middleware := newTestMiddleware(t, config)
+	middleware := newPatternMiddleware(t)
 	defer middleware.Close()
-
-	middleware.SetKeyGenerator(KeyWithoutQuery())
-	middleware.SetPathExtractor(PathExtractorFromKey)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -1259,12 +1351,8 @@ func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
 }
 
 func TestHTTPCacheMiddleware_BasicPatternInvalidation(t *testing.T) {
-	config := DefaultConfig()
-	middleware := newTestMiddleware(t, config)
+	middleware := newPatternMiddleware(t)
 	defer middleware.Close()
-
-	middleware.SetKeyGenerator(KeyWithoutQuery())
-	middleware.SetPathExtractor(PathExtractorFromKey)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)

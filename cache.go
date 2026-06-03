@@ -187,12 +187,26 @@ type Cache[K comparable, V any] struct {
 	waiterPool  sync.Pool // write ack waiters for sync mutation paths
 	hasher      hasher[K]
 	evictor     evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
+	onEvict     func(K, V)
+	evictWake   chan struct{}
+}
+
+type Option[K comparable, V any] func(*Cache[K, V])
+
+// WithOnEvict registers a listener invoked once for every key removed from the
+// cache by capacity eviction, TTL expiration or Delete. It is not called for
+// Clear or when an existing key's value is replaced. The listener runs on a
+// dedicated goroutine without holding any shard lock, so it may call back into
+// the cache; it should still return promptly, since a slow listener lets evicted
+// values queue in memory.
+func WithOnEvict[K comparable, V any](listener func(key K, value V)) Option[K, V] {
+	return func(c *Cache[K, V]) { c.onEvict = listener }
 }
 
 // New constructs a Cache from config, returning an error if config is invalid.
 // Shard count is normalized to 2^n (and bounded by MaxSize); background
 // workers start immediately, so callers must Close the cache to release them.
-func New[K comparable, V any](config Config) (*Cache[K, V], error) {
+func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V], error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -279,6 +293,19 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 			s.readBuf = newReadBuffer() // pershard read sampling for the sketch
 		}
 		cache.shards[i] = s
+	}
+
+	for _, opt := range opts {
+		opt(cache)
+	}
+
+	if cache.onEvict != nil {
+		cache.evictWake = make(chan struct{}, 1)
+		for _, s := range cache.shards {
+			s.evictWake = cache.evictWake
+		}
+		cache.workers.Add(1)
+		go cache.evictNotifyWorker()
 	}
 
 	for _, s := range cache.shards {

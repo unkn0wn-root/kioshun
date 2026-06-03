@@ -266,19 +266,22 @@ removed := middleware.Invalidate("/api/users/*") // Returns 0
 
 ### The Solution
 
-Use a path-based key generator **and** teach the pattern index how to recover the path from each key:
+Use a path-based key generator **and** give the config a `PathExtractor` so the
+pattern index can recover the path from each key. Supplying a `PathExtractor` is
+what enables pattern invalidation: it turns on the index and wires the cache's
+eviction listener that keeps the index in sync as entries are evicted or expire.
 
 ```go
 // CORRECT SETUP - Invalidation works
 config := httpcache.DefaultConfig()
+config.PathExtractor = httpcache.PathExtractorFromKey // enables pattern invalidation
 middleware, err := httpcache.New(config)
 if err != nil {
     // handle invalid configuration
 }
 
-// IMPORTANT: Set path-based key generator and path extractor
+// IMPORTANT: use a path-based key generator so keys carry a recoverable path
 middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
-middleware.SetPathExtractor(httpcache.PathExtractorFromKey)
 
 // Now invalidation works
 removed := middleware.Invalidate("/api/users/*") // Returns actual count
@@ -289,19 +292,20 @@ removed := middleware.Invalidate("/api/users/*") // Returns actual count
 | Key Generator | Example Key | Invalidation | Use Case |
 |---------------|-------------|--------------|----------|
 | `DefaultKeyGenerator` | `"a1b2c3d4..."` | ❌ **Won't work** | No invalidation needed |
-| `KeyWithoutQuery()` + `SetPathExtractor` | `"GET:/api/users"` | ✅ **Works** | **Recommended for invalidation** |
-| `PathBasedKeyGenerator` + `SetPathExtractor` | `"GET:/api/users"` | ✅ **Works** | Simple path-based caching |
+| `KeyWithoutQuery()` + `Config.PathExtractor` | `"GET:/api/users"` | ✅ **Works** | **Recommended for invalidation** |
+| `PathBasedKeyGenerator` + `Config.PathExtractor` | `"GET:/api/users"` | ✅ **Works** | Simple path-based caching |
 | `KeyWithVaryHeaders()` | `"a1b2c3d4..."` | ❌ **Won't work** | Custom headers + security |
 
 ### Minimal Pattern Invalidation Setup
 
 ```go
-middleware, err := httpcache.New(httpcache.DefaultConfig())
+config := httpcache.DefaultConfig()
+config.PathExtractor = httpcache.PathExtractorFromKey            // map keys -> paths (enables invalidation)
+middleware, err := httpcache.New(config)
 if err != nil {
     // handle invalid configuration
 }
 middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())          // readable keys
-middleware.SetPathExtractor(httpcache.PathExtractorFromKey)      // map keys -> paths
 
 // later…
 removed := middleware.Invalidate("/api/users/*")
@@ -325,6 +329,7 @@ func main() {
     // Setup middleware
     config := httpcache.DefaultConfig()
     config.DefaultTTL = 10 * time.Minute
+    config.PathExtractor = httpcache.PathExtractorFromKey // enables pattern invalidation
 
     middleware, err := httpcache.New(config)
     if err != nil {
@@ -332,9 +337,8 @@ func main() {
     }
     defer middleware.Close()
 
-    // Enable invalidation
+    // Use a path-based key generator so keys carry a recoverable path.
     middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
-    middleware.SetPathExtractor(httpcache.PathExtractorFromKey)
 
     // Setup handlers
     http.Handle("/api/users", middleware.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
