@@ -64,13 +64,13 @@ func main() {
     // Set with default TTL (30 min)
     c.Set("user:123", "David", kioshun.DefaultExpiration)
 
-    // `Set` commits the write before returning so the key is immediately readable.
+    // Set commits the write before returning so the key is immediately readable.
     c.Set("user:456", "John", kioshun.NoExpiration)
 
-    // `SetAsync` queues the write and returns early.
+    // SetAsync queues the write and returns early.
     c.SetAsync("user:789", "Paul", 5*time.Minute)
 
-    // Optional: call `Sync()` if you want to wait for value back.
+    // Optional: call Sync() if you want to wait for value back.
     c.Sync()
 
     // Get value
@@ -78,9 +78,6 @@ func main() {
         fmt.Printf("User: %s\n", value)
     }
 
-    // Get cache statistics
-    stats := c.Stats()
-    fmt.Printf("Hit ratio: %.2f%%\n", stats.HitRatio*100)
 }
 ```
 
@@ -95,7 +92,10 @@ config := kioshun.Config{
     CleanupInterval: 5 * time.Minute,      // Cleanup frequency
     DefaultTTL:      30 * time.Minute,     // Default expiration time
     EvictionPolicy:  kioshun.SieveTinyLFU, // Eviction algorithm (default)
-    StatsEnabled:    true,                 // Enable statistics collection
+    // StatsEnabled records cache activity metrics such as hits, misses and
+    // evictions. Tracking those counters adds runtime cost, so enable it for
+    // tests, diagnostics or deployments where throughput performance is less critical.
+    StatsEnabled:    true,
     WriteBufferSize: 1024,                 // Per-shard async write queue
     WriteBatchSize:  64,                   // Max commands applied per worker batch
 }

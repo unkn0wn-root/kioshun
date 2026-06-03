@@ -39,6 +39,9 @@ type Config struct {
 	CleanupInterval time.Duration
 	DefaultTTL      time.Duration
 	EvictionPolicy  EvictionPolicy
+	// StatsEnabled records cache activity metrics such as hits, misses and
+	// evictions. Tracking those counters adds runtime cost so enable it for
+	// tests, diagnostics or deployments where throughput perf.is less critical.
 	StatsEnabled    bool
 	ProbationRatio  uint8
 	GhostRatio      uint8
@@ -47,8 +50,8 @@ type Config struct {
 	WriteBatchSize  int // caps how many queued writes a shard worker applies under one lock.
 }
 
-// DefaultConfig returns adaptive SieveTinyLFU with
-// stats enabled and shard count scaled to the number of CPUs.
+// DefaultConfig returns adaptive SieveTinyLFU with stats disabled and shard
+// count scaled to the number of CPUs.
 func DefaultConfig() Config {
 	return Config{
 		MaxSize:         defaultMaxSize,

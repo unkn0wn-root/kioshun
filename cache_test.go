@@ -135,7 +135,9 @@ func TestCacheLRUEviction(t *testing.T) {
 }
 
 func TestCacheStats(t *testing.T) {
-	cache := newDefaultTestCache[string, string](t)
+	config := DefaultConfig()
+	config.StatsEnabled = true
+	cache := newTestCache[string, string](t, config)
 	defer cache.Close()
 
 	// Initial stats
