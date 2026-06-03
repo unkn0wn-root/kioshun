@@ -136,9 +136,10 @@ c.Close() error
 > `SetAsync` is optional and only accepts the write into the shard queue meaning that the value
 > becomes visible after a background worker commits it.
 
-> Construct with `kioshun.New(config, kioshun.WithOnEvict(func(key K, value V) { ... }))`
-> to receive a callback for every key removed by capacity eviction, TTL expiration
-> or `Delete`.
+> Construct with `kioshun.New(config, kioshun.WithOnRemove(func(key K, value V, reason kioshun.RemovalReason) { ... }))`
+> to receive a callback for every key removed by capacity eviction,
+> SieveTinyLFU admission rejection, TTL expiration or `Delete`. Use
+> `WithOnEvict(func(key K, value V) { ... })` for capacity evictions only.
 
 ### Statistics
 

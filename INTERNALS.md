@@ -20,7 +20,7 @@ root cache:
 - `httpcache/config.go`: HTTP middleware configuration and default resolution.
 - `httpcache/middleware.go`: handler wrapping, response capture, policies, keys.
 - `httpcache/pattern.go`: path-segment trie indexing cached keys for pattern
-  invalidation, kept in sync by the cache's eviction listener.
+  invalidation, kept in sync by the cache's removal listener.
 
 ## Core Data Model
 
@@ -115,16 +115,19 @@ is still responsible for removing the item.
 
 ### Removal Listener
 
-`WithOnEvict` registers a listener invoked once for every key that leaves the
-cache through capacity eviction, TTL expiration or `Delete`. It is not called
-for `Clear` or when an existing key's value is replaced. To keep the listener off
-the hot path, the two removal (`dropItem` and `cleanup`) stage the
-removed `(key, value)` pairs in a per-shard buffer under the shard lock, and a
-dedicated worker drains the buffers and runs the listener holding no shard lock -
-so the listener may call back into the cache. When no listener is configured no
-buffer is allocated and the worker is never started. Delivery is asynchronous, so
-consumers that maintain a secondary index (such as the httpcache pattern index)
-must tolerate notifications that arrive after a key has been reinserted.
+`WithOnRemove` registers a listener invoked once for every key that leaves the
+cache through capacity eviction, SieveTinyLFU admission rejection, TTL expiration
+or `Delete`. Each notification includes a `RemovalReason`. `WithOnEvict`
+registers a narrower listener for capacity evictions only. Neither listener is
+called for `Clear` or when an existing key's value is replaced. To keep listeners
+off the hot path, the removal paths (`dropItem` and `cleanup`) stage only the
+requested `(key, value, reason)` in a per-shard buffer under the shard
+lock, and a dedicated worker drains the buffers and runs listeners holding no
+shard lock - so listeners may call back into the cache. When no listener is
+configured no buffer is allocated and the worker is never started. Delivery is
+asynchronous, so consumers that maintain a secondary index (such as the httpcache
+pattern index) must tolerate notifications that arrive after a key has been
+reinserted.
 
 ## Write Path
 
@@ -380,8 +383,8 @@ body capture limit.
 5. Capture final status, headers, and body.
 6. Ask the policy whether to cache and for what TTL.
 7. When pattern invalidation is enabled and the key maps to a path, add it to the
-   pattern index before the store, so an eviction during the store (including a
-   SIEVE admission rejection) is reconciled by the eviction listener.
+   pattern index before the store, so a removal during the store (including a
+   SIEVE admission rejection) is reconciled by the removal listener.
 8. Store a defensive response snapshot in the backing cache, rolling back the
    index entry if the store fails.
 
@@ -407,10 +410,10 @@ Key generators include:
 - `PathBasedKeyGenerator`: plain `METHOD:/path`
 
 `Invalidate(pattern)` queries the path index for matching keys and deletes them
-from the cache; the eviction listener then reconciles the index. Exact patterns
+from the cache; the removal listener then reconciles the index. Exact patterns
 match keys stored at one path, and patterns ending in `*` match the base path and
 its descendants. Pattern invalidation is enabled by setting `Config.PathExtractor`
-(which also wires the eviction listener) together with a compatible key generator,
+(which also wires the removal listener) together with a compatible key generator,
 such as `KeyWithoutQuery` with `PathExtractorFromKey`; without it the index stays
 empty and `Invalidate` returns 0.
 

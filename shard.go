@@ -42,14 +42,15 @@ type shard[K comparable, V any] struct {
 
 	sieve *sieveTinyLFU[K, V]
 
-	// eviction notification staging, used only when the cache has an onEvict
-	// listener (evictWake is the shared worker wakeup, nil otherwise). dropItem
-	// and cleanup append removed (key, value) pairs to evictBuf under mu; the
-	// notify worker drains it after the lock is released. evictPending lets the
-	// worker skip shards with nothing staged without taking the lock.
-	evictWake    chan struct{}
-	evictBuf     []evictedEntry[K, V]
-	evictPending atomic.Bool
+	// removal notification staging, used only when the cache has at least one
+	// listener (removeWake is the shared worker wakeup, nil otherwise). dropItem
+	// and cleanup append removed (key, value, reason) to removeBuf under
+	// mu; the notify worker drains it after the lock is released. removePending
+	// lets the worker skip shards with nothing staged without taking the lock.
+	removeWake       chan struct{}
+	removeNotifyMask removalNotifyMask
+	removeBuf        []removedEntry[K, V]
+	removePending    atomic.Bool
 }
 
 // itemDropMode selects which policy owns an item's intrusive links.
@@ -71,7 +72,7 @@ func (s *shard[K, V]) dropItem(
 	item *cacheItem[K, V],
 	itemPool *sync.Pool,
 	statsEnabled bool,
-	evicted bool,
+	reason RemovalReason,
 	mode itemDropMode,
 ) bool {
 	key, ok := s.itemKey(item)
@@ -99,17 +100,23 @@ func (s *shard[K, V]) dropItem(
 	}
 
 	delete(s.data, key)
-	if s.evictWake != nil {
-		// Capture the value before the item returns to the pool.
-		s.evictBuf = append(s.evictBuf, evictedEntry[K, V]{key: key, value: item.value})
-		s.evictPending.Store(true)
-		signal(s.evictWake)
+	if s.stageRemoval(key, item.value, reason) {
+		s.removePending.Store(true)
+		signal(s.removeWake)
 	}
 	releaseCacheItem(itemPool, item)
 	atomic.AddInt64(&s.size, -1)
-	if statsEnabled && evicted {
+	if statsEnabled && reason == RemovedCapacity {
 		atomic.AddInt64(&s.evictions, 1)
 	}
+	return true
+}
+
+func (s *shard[K, V]) stageRemoval(key K, value V, reason RemovalReason) bool {
+	if s.removeWake == nil || s.removeNotifyMask&removalNotifyBit(reason) == 0 {
+		return false
+	}
+	s.removeBuf = append(s.removeBuf, removedEntry[K, V]{key: key, value: value, reason: reason})
 	return true
 }
 
@@ -227,13 +234,12 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 		}
 	}
 
-	notify := s.evictWake != nil
+	staged := false
 	for _, key := range keysToDelete {
 		if item, exists := s.data[key]; exists {
 			delete(s.data, key)
-			if notify {
-				// capture the value before the item returns to the pool.
-				s.evictBuf = append(s.evictBuf, evictedEntry[K, V]{key: key, value: item.value})
+			if s.stageRemoval(key, item.value, RemovedExpired) {
+				staged = true
 			}
 			switch {
 			case evictionPolicy == LFU:
@@ -252,8 +258,8 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 		}
 	}
 
-	if notify && len(s.evictBuf) > 0 {
-		s.evictPending.Store(true)
-		signal(s.evictWake)
+	if staged {
+		s.removePending.Store(true)
+		signal(s.removeWake)
 	}
 }

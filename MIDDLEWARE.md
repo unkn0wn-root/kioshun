@@ -269,7 +269,8 @@ removed := middleware.Invalidate("/api/users/*") // Returns 0
 Use a path-based key generator **and** give the config a `PathExtractor` so the
 pattern index can recover the path from each key. Supplying a `PathExtractor` is
 what enables pattern invalidation: it turns on the index and wires the cache's
-eviction listener that keeps the index in sync as entries are evicted or expire.
+removal listener that keeps the index in sync as entries are evicted, rejected,
+expired or deleted.
 
 ```go
 // CORRECT SETUP - Invalidation works

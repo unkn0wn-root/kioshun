@@ -18,7 +18,7 @@ func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 		return
 	}
 
-	s.dropItem(s.tail.prev, itemPool, statsEnabled, true, dropLRU)
+	s.dropItem(s.tail.prev, itemPool, statsEnabled, RemovedCapacity, dropLRU)
 }
 
 type lfuEvictor[K comparable, V any] struct{}
@@ -30,7 +30,7 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 	}
 	// removeLFU already unlinked the LFU bucket; dropLRU unlinks the shared LRU
 	// list and map without a redundant lookup.
-	s.dropItem(lfu, itemPool, statsEnabled, true, dropLRU)
+	s.dropItem(lfu, itemPool, statsEnabled, RemovedCapacity, dropLRU)
 }
 
 type fifoEvictor[K comparable, V any] struct{}
@@ -42,7 +42,7 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 		return
 	}
 
-	s.dropItem(s.tail.prev, itemPool, statsEnabled, true, dropLRU)
+	s.dropItem(s.tail.prev, itemPool, statsEnabled, RemovedCapacity, dropLRU)
 }
 
 // createEvictor returns the non-Sieve replacement policy for a shard.

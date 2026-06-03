@@ -406,7 +406,7 @@ func (c *Cache[K, V]) deleteLocked(s *shard[K, V], key K) bool {
 	if !exists {
 		return false
 	}
-	c.removeItem(s, item)
+	c.removeItem(s, item, RemovedDeleted)
 	return true
 }
 

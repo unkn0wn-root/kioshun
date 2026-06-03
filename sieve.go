@@ -375,7 +375,7 @@ func (p *sieveTinyLFU[K, V]) promote(it *cacheItem[K, V]) {
 func (s *shard[K, V]) dropProbationVictim(it *cacheItem[K, V], pool *sync.Pool, stats bool) bool {
 	p := s.sieve
 	h, tag := it.hash, it.tag
-	if !s.dropSieveItem(it, pool, stats, true) {
+	if !s.dropSieveItem(it, pool, stats, RemovedCapacity) {
 		return false
 	}
 	p.controller.probationEvictions++
@@ -427,17 +427,17 @@ func (s *shard[K, V]) evictMain(
 	v := p.findMainVictim(scan, force)
 	if v == nil {
 		if force && in != nil {
-			s.dropSieveItem(in, pool, stats, false)
+			s.dropSieveItem(in, pool, stats, RemovedRejected)
 			return true
 		}
 		return false
 	}
 
 	if in != nil && in != v && !p.shouldAdmit(in, v, tie) {
-		return s.dropSieveItem(in, pool, stats, false)
+		return s.dropSieveItem(in, pool, stats, RemovedRejected)
 	}
 
-	if s.dropSieveItem(v, pool, stats, true) {
+	if s.dropSieveItem(v, pool, stats, RemovedCapacity) {
 		p.stats.MainEvictions++
 		return true
 	}
@@ -664,7 +664,7 @@ func (s *shard[K, V]) forceDropSieveItem(pool *sync.Pool, stats bool) bool {
 		if it == nil {
 			return false
 		}
-		if s.dropSieveItem(it, pool, stats, true) {
+		if s.dropSieveItem(it, pool, stats, RemovedCapacity) {
 			p.stats.MainEvictions++
 			return true
 		}
@@ -672,6 +672,6 @@ func (s *shard[K, V]) forceDropSieveItem(pool *sync.Pool, stats bool) bool {
 	return false
 }
 
-func (s *shard[K, V]) dropSieveItem(it *cacheItem[K, V], pool *sync.Pool, stats bool, evicted bool) bool {
-	return s.dropItem(it, pool, stats, evicted, dropSieve)
+func (s *shard[K, V]) dropSieveItem(it *cacheItem[K, V], pool *sync.Pool, stats bool, reason RemovalReason) bool {
+	return s.dropItem(it, pool, stats, reason, dropSieve)
 }

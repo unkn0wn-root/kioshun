@@ -32,7 +32,7 @@ func waitForMiddlewareWrites(t testing.TB, m *Middleware) {
 
 // newPatternMiddleware builds a middleware wired for URL-pattern invalidation:
 // path-preserving keys plus a PathExtractor, which enables the index and the
-// backing cache's eviction listener.
+// backing cache's removal listener.
 func newPatternMiddleware(t testing.TB) *Middleware {
 	t.Helper()
 	config := DefaultConfig()
@@ -470,7 +470,7 @@ func TestHTTPCacheMiddleware_EvictionCleansPatternIndex(t *testing.T) {
 	}
 	waitForMiddlewareWrites(t, middleware)
 
-	// The eviction listener reconciles the index, so it converges to exactly the
+	// The removal listener reconciles the index, so it converges to exactly the
 	// resident set — never the 2000 keys inserted.
 	waitFor(t, func() bool {
 		return int64(len(middleware.patternIdx.getMatchingKeys("/evict/*"))) == middleware.cache.Size()
@@ -480,7 +480,7 @@ func TestHTTPCacheMiddleware_EvictionCleansPatternIndex(t *testing.T) {
 	}
 }
 
-// Invalidate deletes the matched entries; the eviction listener then reconciles
+// Invalidate deletes the matched entries; the removal listener then reconciles
 // the index for exactly those keys, leaving unrelated entries in place.
 func TestHTTPCacheMiddleware_InvalidateCleansPatternIndex(t *testing.T) {
 	middleware := newPatternMiddleware(t)

@@ -50,7 +50,7 @@ type Middleware struct {
 
 	// tracks cached keys by URL path for Invalidate. It is populated
 	// and queried only when patternEnabled is set (a PathExtractor was configured),
-	// and kept in sync by the backing cache's eviction listener (onCacheEvict).
+	// and kept in sync by the backing cache's removal listener (onCacheRemove).
 	patternEnabled bool
 	patternIdx     *patternIndex
 	pathExtract    PathExtractor
@@ -91,13 +91,13 @@ func New(config Config) (*Middleware, error) {
 	}
 
 	// pattern invalidation is opt-in: supplying a PathExtractor enables the index
-	// and wires the cache's eviction listener. Callers that
+	// and wires the cache's removal listener. Callers that
 	// don't use Invalidate pay nothing for the index or the listener.
 	var opts []kioshun.Option[string, *Response]
 	if config.PathExtractor != nil {
 		m.patternEnabled = true
 		m.pathExtract = config.PathExtractor
-		opts = append(opts, kioshun.WithOnEvict(m.onCacheEvict))
+		opts = append(opts, kioshun.WithOnRemove(m.onCacheRemove))
 	}
 
 	cache, err := kioshun.New[string, *Response](cacheConfig, opts...)
@@ -184,7 +184,7 @@ func (m *Middleware) Invalidate(urlPattern string) int {
 
 // InvalidateByFunc removes cached entries whose key matches fn and returns the
 // number removed. When pattern invalidation is enabled, the index is reconciled
-// by the cache's eviction listener as the matched entries are deleted.
+// by the cache's removal listener as the matched entries are deleted.
 func (m *Middleware) InvalidateByFunc(fn func(string) bool) int {
 	removed := 0
 	for _, key := range m.cache.Keys() {
@@ -196,9 +196,9 @@ func (m *Middleware) InvalidateByFunc(fn func(string) bool) int {
 }
 
 // store writes resp to the cache. When pattern invalidation is enabled it
-// indexes the key before the write, so an eviction during Set - including a
+// indexes the key before the write, so a removal during Set - including a
 // SIEVE admission rejection that drops the entry immediately - is reported to
-// onCacheEvict and cleaned up.
+// onCacheRemove and cleaned up.
 func (m *Middleware) store(key string, resp *Response, ttl time.Duration) error {
 	if !m.patternEnabled {
 		return m.cache.Set(key, resp, ttl)
@@ -217,12 +217,13 @@ func (m *Middleware) store(key string, resp *Response, ttl time.Duration) error 
 	return nil
 }
 
-// onCacheEvict drops a key from the pattern index when the backing cache evicts,
-// expires or deletes it. It is wired as the cache's eviction listener only when
-// pattern invalidation is enabled. Removal is by response identity, so a
-// notification that arrives after the key was recached leaves the live entry in
-// place (see patternIndex).
-func (m *Middleware) onCacheEvict(key string, resp *Response) {
+// onCacheRemove drops a key from the pattern index when the backing cache removes
+// it. It is wired as the cache's removal listener only when pattern invalidation
+// is enabled. The reason is irrelevant here: any removal (including an admission
+// rejection) means the key should leave the index. Removal is by response
+// identity, so a notification that arrives after the key was recached leaves the
+// live entry in place (see patternIndex).
+func (m *Middleware) onCacheRemove(key string, resp *Response, _ kioshun.RemovalReason) {
 	path := m.pathExtract(key)
 	if path == "" {
 		return
