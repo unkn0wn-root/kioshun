@@ -290,12 +290,12 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		opt(cache)
 	}
 
-	notifyMask := cache.removalNotifyMask()
-	if notifyMask != 0 {
+	nm := cache.removalNotifyMask()
+	if nm != 0 {
 		cache.removeWake = make(chan struct{}, 1)
 		for _, s := range cache.shards {
 			s.removeWake = cache.removeWake
-			s.removeNotifyMask = notifyMask
+			s.removeNotifyMask = nm
 		}
 		cache.workers.Add(1)
 		go cache.removeNotifyWorker()
