@@ -28,6 +28,8 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnable
 	if lfu == nil {
 		return
 	}
+	// removeLFU already unlinked the LFU bucket; dropLRU unlinks the shared LRU
+	// list and map without a redundant lookup.
 	s.dropItem(lfu, itemPool, statsEnabled, true, dropLRU)
 }
 
@@ -44,7 +46,7 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabl
 }
 
 // createEvictor returns the non-Sieve replacement policy for a shard.
-// Public config is normalized and validated before this point
+// Public config is normalized and validated before this point.
 func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	switch policy {
 	case LRU:

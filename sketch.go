@@ -106,14 +106,6 @@ func newCountMinSketch(n uint64) countMinSketch {
 	}
 }
 
-func (s *countMinSketch) increment(h uint64) {
-	s.add(h)
-	s.samples++
-	if s.resetAt > 0 && s.samples >= s.resetAt {
-		s.age()
-	}
-}
-
 // add increments all four rows only while the estimated frequency is below the
 // saturation limit. Once the estimate reaches the 4-bit maximum, extra accesses
 // are ignored until aging makes room again.
@@ -148,14 +140,12 @@ func (s *countMinSketch) indexes(h uint64) [4]uint64 {
 }
 
 func (s *countMinSketch) minCounter(idx [4]uint64) uint8 {
-	min := s.counter(idx[0])
-	for _, i := range idx[1:] {
-		if v := s.counter(i); v < min {
-			min = v
-		}
-	}
-
-	return min
+	return min(
+		s.counter(idx[0]),
+		s.counter(idx[1]),
+		s.counter(idx[2]),
+		s.counter(idx[3]),
+	)
 }
 
 // age halves every packed 4-bit counter in place. The mask removes shifted bits

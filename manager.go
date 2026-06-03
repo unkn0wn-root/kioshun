@@ -22,6 +22,7 @@ type Manager struct {
 	configMu sync.RWMutex
 }
 
+// NewManager returns an empty Manager with no registered configurations or caches.
 func NewManager() *Manager {
 	return &Manager{
 		configs: make(map[string]Config),
@@ -111,7 +112,7 @@ func (m *Manager) Stats() map[string]Stats {
 	return stats
 }
 
-// CloseAll closes and removes every managed cache instance
+// CloseAll closes and removes every managed cache instance.
 // Registered configurations are left intact, so the same names
 // can be recreated from this manager afterwards.
 func (m *Manager) CloseAll() error {

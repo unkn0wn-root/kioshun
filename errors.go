@@ -6,13 +6,17 @@ import (
 )
 
 var (
-	ErrCacheExists   = errors.New("cache already exists")
-	ErrCacheNotFound = errors.New("cache not found")
-	ErrTypeMismatch  = errors.New("cache type mismatch")
+	// ErrCacheExists is returned when registering a name that already has a configuration.
+	ErrCacheExists = errors.New("cache already exists")
+	// ErrTypeMismatch is returned when a cached instance's type parameters differ from those requested.
+	ErrTypeMismatch = errors.New("cache type mismatch")
+	// ErrInvalidConfig is the sentinel that ConfigError unwraps to.
 	ErrInvalidConfig = errors.New("invalid cache configuration")
-	ErrCacheClosed   = errors.New("cache is closed")
+	// ErrCacheClosed is returned by operations on a closed cache.
+	ErrCacheClosed = errors.New("cache is closed")
 )
 
+// CacheError describes a failure from a named cache operation (register, get, close).
 type CacheError struct {
 	Op    string
 	Name  string
@@ -38,6 +42,7 @@ func newCacheError(op, name string, cause error) *CacheError {
 	}
 }
 
+// ConfigError describes an invalid configuration field; it unwraps to ErrInvalidConfig.
 type ConfigError struct {
 	Field  string
 	Value  any

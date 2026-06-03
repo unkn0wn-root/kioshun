@@ -13,6 +13,9 @@ const (
 	writeBarrier
 )
 
+// inlineAckBuf sizes the stack allocated ack slice so small batches avoid a heap alloc.
+const inlineAckBuf = 8
+
 // writeCommand is the shard write-queue payload.
 // Plain Set keeps its hot fields inline.
 // Callback data stays behind extra so the common path avoids it.
@@ -49,6 +52,20 @@ type callbackTask[K comparable, V any] struct {
 	callback   func(K, V)
 }
 
+// newCallbackTask returns the expiry callback task for a committed Set, with
+// ok=false when the command did not commit, never expires, or has no callback.
+func (cmd *writeCommand[K, V]) newCallbackTask(committed bool) (callbackTask[K, V], bool) {
+	if !committed || cmd.expireTime <= 0 || cmd.extra == nil || cmd.extra.callback == nil {
+		return callbackTask[K, V]{}, false
+	}
+	return callbackTask[K, V]{
+		key:        cmd.key,
+		value:      cmd.value,
+		expireTime: cmd.expireTime,
+		callback:   cmd.extra.callback,
+	}, true
+}
+
 func (c *Cache[K, V]) set(key K, value V, ttl time.Duration, callback func(K, V)) error {
 	s, cmd := c.setCommand(key, value, ttl, callback)
 	return c.enqueue(s, cmd)
@@ -64,8 +81,7 @@ func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback fun
 		ttl = c.config.DefaultTTL
 	}
 
-	now := int64(0)
-	expireTime := int64(0)
+	var now, expireTime int64
 	if ttl > 0 {
 		now = time.Now().UnixNano()
 		expireTime = now + ttl.Nanoseconds()
@@ -90,7 +106,7 @@ func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback fun
 // enqueue is the async producer boundary: closed caches fail immediately and a
 // full queue applies backpressure until the shard worker frees space.
 func (c *Cache[K, V]) enqueue(s *shard[K, V], cmd writeCommand[K, V]) error {
-	if atomic.LoadInt32(&c.closed) == 1 {
+	if c.isClosed() {
 		return ErrCacheClosed
 	}
 	return s.queue.enqueue(cmd)
@@ -125,14 +141,14 @@ func (c *Cache[K, V]) releaseWriteWaiter(waiter *writeWaiter) {
 // shard lock. The closed-check is repeated after drainMu is held so a concurrent
 // Close cannot race past the barrier into a shard being torn down.
 func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
-	if atomic.LoadInt32(&c.closed) == 1 {
+	if c.isClosed() {
 		return ErrCacheClosed
 	}
 
 	s.drainMu.Lock()
 	defer s.drainMu.Unlock()
 
-	if atomic.LoadInt32(&c.closed) == 1 {
+	if c.isClosed() {
 		return ErrCacheClosed
 	}
 
@@ -147,14 +163,9 @@ func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error {
 	var task *callbackTask[K, V]
 	err := c.syncMutate(s, func() {
-		committed := c.applySetLocked(s, cmd.key, cmd.value, cmd.expireTime, cmd.now, cmd.hash, cmd.tag)
-		if committed && cmd.expireTime > 0 && cmd.extra != nil && cmd.extra.callback != nil {
-			task = &callbackTask[K, V]{
-				key:        cmd.key,
-				value:      cmd.value,
-				expireTime: cmd.expireTime,
-				callback:   cmd.extra.callback,
-			}
+		committed := c.applySetLocked(s, &cmd)
+		if t, ok := cmd.newCallbackTask(committed); ok {
+			task = &t
 		}
 	})
 	if err != nil {
@@ -180,7 +191,7 @@ func (c *Cache[K, V]) Sync() error {
 }
 
 func (c *Cache[K, V]) enqueueAllAndWait(op writeOp) error {
-	if atomic.LoadInt32(&c.closed) == 1 {
+	if c.isClosed() {
 		return ErrCacheClosed
 	}
 	return c.enqueueBarrierAll(op)
@@ -222,10 +233,10 @@ func (c *Cache[K, V]) enqueueBarrierAll(op writeOp) error {
 }
 
 func (c *Cache[K, V]) clearDirect() {
-	for _, shard := range c.shards {
-		shard.mu.Lock()
-		c.clearShardLocked(shard)
-		shard.mu.Unlock()
+	for _, s := range c.shards {
+		s.mu.Lock()
+		c.clearShardLocked(s)
+		s.mu.Unlock()
 	}
 }
 
@@ -263,13 +274,6 @@ func (c *Cache[K, V]) drainShard(s *shard[K, V]) {
 
 func (c *Cache[K, V]) drainShardLocked(s *shard[K, V]) {
 	batch := s.writeBatch
-	if len(batch) == 0 {
-		batchSize := c.config.WriteBatchSize
-		if batchSize <= 0 {
-			batchSize = defaultWriteBatchSize
-		}
-		batch = make([]writeCommand[K, V], batchSize)
-	}
 
 	s.drainReadSamples()
 	for {
@@ -283,7 +287,7 @@ func (c *Cache[K, V]) drainShardLocked(s *shard[K, V]) {
 }
 
 func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]) {
-	var ackBuf [8]chan struct{}
+	var ackBuf [inlineAckBuf]chan struct{}
 	acks := ackBuf[:0]
 	var callbacks []callbackTask[K, V]
 
@@ -292,14 +296,9 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 		cmd := &batch[i]
 		switch cmd.op {
 		case writeSet:
-			committed := c.applySetLocked(s, cmd.key, cmd.value, cmd.expireTime, cmd.now, cmd.hash, cmd.tag)
-			if committed && cmd.expireTime > 0 && cmd.extra != nil && cmd.extra.callback != nil {
-				callbacks = append(callbacks, callbackTask[K, V]{
-					key:        cmd.key,
-					value:      cmd.value,
-					expireTime: cmd.expireTime,
-					callback:   cmd.extra.callback,
-				})
+			committed := c.applySetLocked(s, cmd)
+			if t, ok := cmd.newCallbackTask(committed); ok {
+				callbacks = append(callbacks, t)
 			}
 			if ch := cmd.resultChan(); ch != nil {
 				acks = append(acks, ch)
@@ -325,123 +324,109 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 	}
 }
 
-func (c *Cache[K, V]) applySetLocked(
-	shard *shard[K, V],
-	key K,
-	value V,
-	expireTime int64,
-	now int64,
-	kh uint64,
-	tag uint16,
-) bool {
-	if ex, exists := shard.data[key]; exists {
-		ex.value = value
-		ex.lastAccess = now
-		ex.expireTime = expireTime
-		ex.hash = kh
-		ex.tag = tag
+// newItem returns a pooled, populated item for cmd. acquireCacheItem zeroes the
+// node, so list links and lfuFreq start clean.
+func (c *Cache[K, V]) newItem(cmd *writeCommand[K, V]) *cacheItem[K, V] {
+	item := acquireCacheItem[K, V](&c.itemPool)
+	item.value = cmd.value
+	item.lastAccess = cmd.now
+	item.key = cmd.key
+	item.hash = cmd.hash
+	item.tag = cmd.tag
+	item.expireTime = cmd.expireTime
+	return item
+}
+
+func (c *Cache[K, V]) applySetLocked(s *shard[K, V], cmd *writeCommand[K, V]) bool {
+	if ex, exists := s.data[cmd.key]; exists {
+		ex.value = cmd.value
+		ex.lastAccess = cmd.now
+		ex.expireTime = cmd.expireTime
+		ex.hash = cmd.hash
+		ex.tag = cmd.tag
 
 		switch c.config.EvictionPolicy {
 		case LRU:
-			shard.moveToLRUHead(ex)
+			s.moveToLRUHead(ex)
 		case LFU:
-			shard.lfuList.remove(ex)
+			s.lfuList.remove(ex)
 			ex.lfuFreq = 1
-			shard.lfuList.add(ex)
+			s.lfuList.add(ex)
 		case SieveTinyLFU:
 			ex.lfuFreq = 0
-			if shard.sieve != nil && !shard.belowSieveWarmupLocked() {
-				shard.sieve.recordUpdate(ex)
+			if s.sieve != nil && !s.belowSieveWarmupLocked() {
+				s.sieve.recordUpdate(ex)
 			}
 		}
 		return true
 	}
 
-	if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
-		warmup := shard.belowSieveWarmupLocked()
+	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
+		warmup := s.belowSieveWarmupLocked()
 		if !warmup {
-			shard.sieve.recordAccess(kh)
+			s.sieve.recordAccess(cmd.hash)
 		}
 
-		item := acquireCacheItem[K, V](&c.itemPool)
-		item.value = value
-		item.lastAccess = now
-		item.lfuFreq = 0
-		item.key = key
-		item.hash = kh
-		item.tag = tag
-		item.expireTime = expireTime
+		item := c.newItem(cmd)
+		s.data[cmd.key] = item
+		atomic.AddInt64(&s.size, 1)
 
-		shard.data[key] = item
-		atomic.AddInt64(&shard.size, 1)
-
-		ghostHit := !warmup && shard.sieve.ghost.contains(kh, tag)
-		shard.sieve.insert(item, ghostHit)
+		ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash, cmd.tag)
+		s.sieve.insert(item, ghostHit)
 		if !warmup {
-			shard.enforceSieveCapacity(&c.itemPool, c.config.StatsEnabled, item, ghostHit)
+			s.enforceSieveCapacity(&c.itemPool, c.config.StatsEnabled, item, ghostHit)
 		}
-		if _, ok := shard.data[key]; ok {
-			shard.sieve.stats.Admits++
+		if _, ok := s.data[cmd.key]; ok {
+			s.sieve.stats.Admits++
 			return true
 		}
-		shard.sieve.stats.Rejects++
+		s.sieve.stats.Rejects++
 		return false
 	}
 
 	// non-Sieve policies evict before inserting so the new item is not selected.
-	if shard.cap > 0 && atomic.LoadInt64(&shard.size) >= shard.cap {
-		c.evictor.evict(shard, &c.itemPool, c.config.StatsEnabled)
+	if s.cap > 0 && atomic.LoadInt64(&s.size) >= s.cap {
+		c.evictor.evict(s, &c.itemPool, c.config.StatsEnabled)
 	}
 
-	item := acquireCacheItem[K, V](&c.itemPool)
-	item.value = value
-	item.lastAccess = now
-	item.lfuFreq = 0
-	item.key = key
-	item.hash = kh
-	item.tag = tag
-	item.expireTime = expireTime
-
-	shard.data[key] = item
-	shard.addToLRUHead(item)
+	item := c.newItem(cmd)
+	s.data[cmd.key] = item
+	s.addToLRUHead(item)
 
 	if c.config.EvictionPolicy == LFU {
-		shard.lfuList.add(item)
+		s.lfuList.add(item)
 	}
 
-	atomic.AddInt64(&shard.size, 1)
+	atomic.AddInt64(&s.size, 1)
 	return true
 }
 
-func (c *Cache[K, V]) deleteLocked(shard *shard[K, V], key K) bool {
-	item, exists := shard.data[key]
+func (c *Cache[K, V]) deleteLocked(s *shard[K, V], key K) bool {
+	item, exists := s.data[key]
 	if !exists {
 		return false
 	}
-	c.removeItem(shard, item, false)
+	c.removeItem(s, item)
 	return true
 }
 
-func (c *Cache[K, V]) clearShardLocked(shard *shard[K, V]) {
-	for _, item := range shard.data {
+func (c *Cache[K, V]) clearShardLocked(s *shard[K, V]) {
+	for _, item := range s.data {
 		releaseCacheItem(&c.itemPool, item)
 	}
-	shard.data = make(map[K]*cacheItem[K, V])
-	shard.initLRU()
+	s.data = make(map[K]*cacheItem[K, V])
+	s.initLRU()
 	if c.config.EvictionPolicy == LFU {
-		shard.lfuList = newLFUList[K, V]()
+		s.lfuList = newLFUList[K, V]()
 	}
-	if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
-		shard.sieve.reset()
+	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
+		s.sieve.reset()
 	}
-	atomic.StoreInt64(&shard.size, 0)
+	atomic.StoreInt64(&s.size, 0)
 }
 
 func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
-	delay := time.Duration(task.expireTime - time.Now().UnixNano())
-	if delay < 0 {
-		delay = 0
-	}
+	delay := max(time.Duration(task.expireTime-time.Now().UnixNano()), 0)
 
 	go func() {
 		timer := time.NewTimer(delay)
@@ -449,14 +434,14 @@ func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
 
 		select {
 		case <-timer.C:
-			shard := c.getShard(task.key)
-			shard.mu.RLock()
-			item, exists := shard.data[task.key]
+			s := c.getShard(task.key)
+			s.mu.RLock()
+			item, exists := s.data[task.key]
 			if exists && item.expireTime > 0 && time.Now().UnixNano() > item.expireTime {
-				shard.mu.RUnlock()
+				s.mu.RUnlock()
 				task.callback(task.key, task.value)
 			} else {
-				shard.mu.RUnlock()
+				s.mu.RUnlock()
 			}
 		case <-c.closeCh:
 			return

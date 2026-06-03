@@ -6,8 +6,8 @@ import "sync/atomic"
 const cacheLinePadding = 64
 
 // writeQueue connects cache producers to a shard's single write worker.
-// It's multi-producer/single-consumer, applies back-pressure instead of dropping
-// write must wake blocked producers on shutdown.
+// It is multi-producer/single-consumer and applies back-pressure instead of
+// dropping writes; on shutdown it must wake blocked producers.
 type writeQueue[K comparable, V any] interface {
 	enqueue(cmd writeCommand[K, V]) error
 	tryDequeue(buf []writeCommand[K, V]) int
