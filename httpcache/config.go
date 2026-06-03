@@ -1,7 +1,7 @@
 package httpcache
 
 import (
-	"fmt"
+	"errors"
 	"slices"
 	"time"
 
@@ -54,32 +54,32 @@ func DefaultConfig() Config {
 // Validate reports invalid HTTP cache configuration values.
 func (c Config) Validate() error {
 	if c.MaxSize < 0 {
-		return fmt.Errorf("httpcache: MaxSize must be >= 0")
+		return errors.New("httpcache: MaxSize must be >= 0")
 	}
 	if c.ShardCount < 0 {
-		return fmt.Errorf("httpcache: ShardCount must be >= 0")
+		return errors.New("httpcache: ShardCount must be >= 0")
 	}
 	if c.CleanupInterval < 0 {
-		return fmt.Errorf("httpcache: CleanupInterval must be >= 0")
+		return errors.New("httpcache: CleanupInterval must be >= 0")
 	}
 	if c.DefaultTTL < 0 && c.DefaultTTL != kioshun.NoExpiration {
-		return fmt.Errorf("httpcache: DefaultTTL must be >= 0 or NoExpiration")
+		return errors.New("httpcache: DefaultTTL must be >= 0 or NoExpiration")
 	}
 
 	switch c.EvictionPolicy {
 	case kioshun.DefaultEvictionPolicy, kioshun.LRU, kioshun.LFU, kioshun.FIFO, kioshun.SieveTinyLFU:
 	default:
-		return fmt.Errorf("httpcache: EvictionPolicy must be a known eviction policy")
+		return errors.New("httpcache: EvictionPolicy must be a known eviction policy")
 	}
 
 	if c.ProbationRatio > 100 {
-		return fmt.Errorf("httpcache: ProbationRatio must be <= 100")
+		return errors.New("httpcache: ProbationRatio must be <= 100")
 	}
 	if c.GhostRatio > 100 {
-		return fmt.Errorf("httpcache: GhostRatio must be <= 100")
+		return errors.New("httpcache: GhostRatio must be <= 100")
 	}
 	if c.MaxBodySize < 0 {
-		return fmt.Errorf("httpcache: MaxBodySize must be >= 0")
+		return errors.New("httpcache: MaxBodySize must be >= 0")
 	}
 	return nil
 }

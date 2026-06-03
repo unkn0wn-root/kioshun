@@ -32,7 +32,7 @@ func newPatternNode() *patternNode {
 	}
 }
 
-func defaultPathExtractor(key string) string { return "" }
+func defaultPathExtractor(_ string) string { return "" }
 
 // NormalizePath converts a URL path into a normalized slice of path segments
 // Empty path handling:
@@ -162,7 +162,7 @@ func (pi *patternIndex) collectDirectKeys(node *patternNode) []string {
 }
 
 func (pi *patternIndex) collectAllKeys(node *patternNode) []string {
-	var keys []string
+	keys := make([]string, 0, len(node.keys))
 	for k := range node.keys {
 		keys = append(keys, k)
 	}

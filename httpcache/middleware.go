@@ -1,12 +1,14 @@
+// Package httpcache provides HTTP response caching middleware backed by a kioshun cache.
 package httpcache
 
 import (
 	"bufio"
 	"bytes"
 	"crypto/md5"
-	"fmt"
+	"encoding/hex"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/unkn0wn-root/kioshun"
 )
 
+// Response is a cached HTTP response.
 type Response struct {
 	StatusCode int
 	Headers    http.Header
@@ -30,6 +33,7 @@ type Policy func(*http.Request, int, http.Header, []byte) (shouldCache bool, ttl
 // PathExtractor recovers a URL path from a cache key for pattern invalidation.
 type PathExtractor func(string) string
 
+// Middleware is an HTTP response caching middleware backed by a kioshun cache.
 type Middleware struct {
 	cache       *kioshun.Cache[string, *Response]
 	keyGen      KeyGenerator
@@ -47,6 +51,7 @@ type Middleware struct {
 	pathExtract func(string) string
 }
 
+// New creates a caching Middleware from config, applying DefaultConfig for unset fields.
 func New(config Config) (*Middleware, error) {
 	config, err := resolveConfig(config)
 	if err != nil {
@@ -187,11 +192,22 @@ func (m *Middleware) Close() error {
 	return m.cache.Close()
 }
 
-func (m *Middleware) SetKeyGenerator(keyGen KeyGenerator)        { m.keyGen = keyGen }
-func (m *Middleware) SetCachePolicy(policy Policy)               { m.policy = policy }
-func (m *Middleware) SetPathExtractor(extractor PathExtractor)   { m.pathExtract = extractor }
-func (m *Middleware) OnHit(callback func(string))                { m.onHit = callback }
-func (m *Middleware) OnMiss(callback func(string))               { m.onMiss = callback }
+// SetKeyGenerator overrides the cache key generator.
+func (m *Middleware) SetKeyGenerator(keyGen KeyGenerator) { m.keyGen = keyGen }
+
+// SetCachePolicy overrides the policy deciding what to cache and for how long.
+func (m *Middleware) SetCachePolicy(policy Policy) { m.policy = policy }
+
+// SetPathExtractor overrides the key-to-path extractor used for pattern invalidation.
+func (m *Middleware) SetPathExtractor(extractor PathExtractor) { m.pathExtract = extractor }
+
+// OnHit registers a callback invoked on each cache hit.
+func (m *Middleware) OnHit(callback func(string)) { m.onHit = callback }
+
+// OnMiss registers a callback invoked on each cache miss.
+func (m *Middleware) OnMiss(callback func(string)) { m.onMiss = callback }
+
+// OnSet registers a callback invoked after a response is cached.
 func (m *Middleware) OnSet(callback func(string, time.Duration)) { m.onSet = callback }
 
 // serveCached writes a cached response and emits cache-hit metadata.
@@ -201,7 +217,7 @@ func (m *Middleware) serveCached(w http.ResponseWriter, cached *Response, key st
 	}
 
 	for k, v := range cached.Headers {
-		w.Header()[k] = append([]string(nil), v...)
+		w.Header()[k] = slices.Clone(v)
 	}
 
 	w.Header().Set(m.hitHeader, "HIT")
@@ -209,7 +225,7 @@ func (m *Middleware) serveCached(w http.ResponseWriter, cached *Response, key st
 	w.Header().Set("X-Cache-Age", time.Since(cached.CachedAt).String())
 
 	w.WriteHeader(cached.StatusCode)
-	w.Write(cached.Body)
+	_, _ = w.Write(cached.Body)
 }
 
 func ignoredHeaders(config Config) map[string]struct{} {
@@ -239,7 +255,7 @@ func (m *Middleware) cachedHeaders(headers http.Header) http.Header {
 		if _, ignored := m.ignore[http.CanonicalHeaderKey(name)]; ignored {
 			continue
 		}
-		cached[name] = append([]string(nil), values...)
+		cached[name] = slices.Clone(values)
 	}
 	return cached
 }
@@ -262,7 +278,7 @@ func DefaultKeyGenerator(r *http.Request) string {
 		}
 	}
 
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // DefaultCachePolicy builds a policy that respects HTTP cache headers.
@@ -340,7 +356,7 @@ type responseWriter struct {
 func newResponseWriter(w http.ResponseWriter, missHeader string, maxBody int64, limitBody bool) *responseWriter {
 	return &responseWriter{
 		ResponseWriter: w,
-		statusCode:     200,
+		statusCode:     http.StatusOK,
 		missHeader:     missHeader,
 		maxBody:        maxBody,
 		limitBody:      limitBody,
@@ -459,7 +475,7 @@ func KeyWithVaryHeaders(varyHeaders []string) KeyGenerator {
 			}
 		}
 
-		return fmt.Sprintf("%x", h.Sum(nil))
+		return hex.EncodeToString(h.Sum(nil))
 	}
 }
 
@@ -484,7 +500,7 @@ func KeyWithoutQueryHashed() KeyGenerator {
 			}
 		}
 
-		return fmt.Sprintf("%x", h.Sum(nil))
+		return hex.EncodeToString(h.Sum(nil))
 	}
 }
 
@@ -508,7 +524,7 @@ func KeyWithUserID(userIDHeader string) KeyGenerator {
 			h.Write([]byte("user:" + userID))
 		}
 
-		return fmt.Sprintf("%x", h.Sum(nil))
+		return hex.EncodeToString(h.Sum(nil))
 	}
 }
 
@@ -562,8 +578,7 @@ func extractMaxAge(cacheControl string) time.Duration {
 		return 0
 	}
 
-	parts := strings.Split(cacheControl, ",")
-	for _, part := range parts {
+	for part := range strings.SplitSeq(cacheControl, ",") {
 		part = strings.TrimSpace(part)
 		name, value, ok := strings.Cut(part, "=")
 		if ok && strings.EqualFold(strings.TrimSpace(name), "max-age") {
@@ -580,7 +595,7 @@ func hasCacheControlDirective(cacheControl string, directives ...string) bool {
 		return false
 	}
 
-	for _, part := range strings.Split(cacheControl, ",") {
+	for part := range strings.SplitSeq(cacheControl, ",") {
 		name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
 		name = strings.TrimSpace(name)
 		for _, directive := range directives {
