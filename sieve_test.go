@@ -103,6 +103,16 @@ func TestGhostQueueDuplicateDoesNotGrow(t *testing.T) {
 	}
 }
 
+// increment is a test helper: it drives add + sample-aging directly, without the
+// doorkeeper gate production applies in sieveTinyLFU.incrementFrequency.
+func (s *countMinSketch) increment(h uint64) {
+	s.add(h)
+	s.samples++
+	if s.resetAt > 0 && s.samples >= s.resetAt {
+		s.age()
+	}
+}
+
 func TestCountMinSketchIncrementEstimateAgeClear(t *testing.T) {
 	s := newCountMinSketch(32)
 	h := uint64(12345)

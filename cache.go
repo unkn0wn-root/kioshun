@@ -8,10 +8,14 @@ import (
 	"time"
 )
 
+// Sentinel TTLs for Set and related methods: NoExpiration keeps an item until it
+// is evicted or deleted; DefaultExpiration falls back to Config.DefaultTTL.
 const (
 	NoExpiration      time.Duration = -1
 	DefaultExpiration time.Duration = 0
+)
 
+const (
 	defaultMaxSize         = 10000
 	defaultCleanupInterval = 5 * time.Minute
 	defaultTTL             = 30 * time.Minute
@@ -23,7 +27,6 @@ const (
 	shardMultiplier = 4
 )
 
-// EvictionPolicy selects the policy used when a bounded cache shard is full.
 type EvictionPolicy int
 
 const (
@@ -34,6 +37,7 @@ const (
 	SieveTinyLFU
 )
 
+// Store is the key/value store implemented by Cache.
 type Store[K comparable, V any] interface {
 	Set(key K, value V, ttl time.Duration) error
 	Get(key K) (V, bool)
@@ -96,6 +100,8 @@ type PolicyStats struct {
 	MainEvictions      int64
 }
 
+// Config controls cache capacity, sharding, eviction, and the async write
+// pipeline. Use DefaultConfig for recommended settings.
 type Config struct {
 	MaxSize         int64
 	ShardCount      int
@@ -110,6 +116,8 @@ type Config struct {
 	WriteBatchSize  int // caps how many queued writes a shard worker applies under one lock.
 }
 
+// DefaultConfig returns adaptive SieveTinyLFU with
+// stats enabled and shard count scaled to the number of CPUs.
 func DefaultConfig() Config {
 	return Config{
 		MaxSize:         defaultMaxSize,
@@ -181,6 +189,9 @@ type Cache[K comparable, V any] struct {
 	evictor     evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
 }
 
+// New constructs a Cache from config, returning an error if config is invalid.
+// Shard count is normalized to 2^n (and bounded by MaxSize); background
+// workers start immediately, so callers must Close the cache to release them.
 func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -204,8 +215,7 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 
 	// guard against zero per-shard capacity when MaxSize is small.
 	if config.MaxSize > 0 {
-		limit := config.MaxSize
-		limit = min(limit, int64(maxShardCount))
+		limit := min(config.MaxSize, int64(maxShardCount))
 		maxPow2 := 1
 		for (int64(maxPow2) << 1) <= limit {
 			maxPow2 <<= 1
@@ -238,7 +248,7 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 		cache.evictor = createEvictor[K, V](config.EvictionPolicy)
 	}
 
-	for i := 0; i < shardCount; i++ {
+	for i := range shardCount {
 		sc := int64(0)
 		if config.MaxSize > 0 {
 			sc = cache.perShardCap
@@ -283,6 +293,9 @@ func New[K comparable, V any](config Config) (*Cache[K, V], error) {
 	return cache, nil
 }
 
+// NewDefault constructs a Cache with DefaultConfig.
+// It panics only if the built-in default configuration is invalid,
+// which is programmer error and should never happen.
 func NewDefault[K comparable, V any]() *Cache[K, V] {
 	cache, err := New[K, V](DefaultConfig())
 	if err != nil {
@@ -352,7 +365,7 @@ func (c *Cache[K, V]) Clear() {
 
 // Exists checks membership without mutating recency/frequency (removes if expired).
 func (c *Cache[K, V]) Exists(key K) bool {
-	if atomic.LoadInt32(&c.closed) == 1 {
+	if c.isClosed() {
 		return false
 	}
 
@@ -368,7 +381,7 @@ func (c *Cache[K, V]) Exists(key K) bool {
 	}
 
 	if item.expireTime > 0 && now > item.expireTime {
-		c.removeItem(shard, item, false)
+		c.removeItem(shard, item)
 		if c.config.StatsEnabled {
 			atomic.AddInt64(&shard.expirations, 1)
 		}
@@ -379,7 +392,7 @@ func (c *Cache[K, V]) Exists(key K) bool {
 
 // Keys returns a point-in-time snapshot of non-expired keys across shards.
 func (c *Cache[K, V]) Keys() []K {
-	if atomic.LoadInt32(&c.closed) == 1 {
+	if c.isClosed() {
 		return nil
 	}
 
@@ -467,7 +480,7 @@ func (c *Cache[K, V]) Close() error {
 
 // Cleanup removes expired items across all shards.
 func (c *Cache[K, V]) Cleanup() {
-	if atomic.LoadInt32(&c.closed) == 1 {
+	if c.isClosed() {
 		return
 	}
 
@@ -491,13 +504,17 @@ func (c *Cache[K, V]) cleanupWorker() {
 	}
 }
 
+// isClosed reports whether Close has been called.
+func (c *Cache[K, V]) isClosed() bool {
+	return atomic.LoadInt32(&c.closed) == 1
+}
+
 func (c *Cache[K, V]) getShard(key K) *shard[K, V] {
-	hash := c.hasher.hash(key)
-	return c.shards[hash&c.shardMask]
+	return c.shardByHash(c.hasher.hash(key))
 }
 
 func (c *Cache[K, V]) get(key K) getResult[V] {
-	if atomic.LoadInt32(&c.closed) == 1 {
+	if c.isClosed() {
 		return getResult[V]{}
 	}
 	kh := c.hasher.hash(key)
@@ -551,7 +568,7 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 				continue
 			}
 
-			c.removeItem(shard, item, false)
+			c.removeItem(shard, item)
 			if c.config.StatsEnabled {
 				atomic.AddInt64(&shard.expirations, 1)
 				atomic.AddInt64(&shard.misses, 1)
@@ -627,7 +644,7 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		if res.now > res.expireTime {
 			shard.mu.Lock()
 			if cur, ok := shard.data[key]; ok && cur.expireTime > 0 && res.now > cur.expireTime {
-				c.removeItem(shard, cur, false)
+				c.removeItem(shard, cur)
 				if c.config.StatsEnabled {
 					atomic.AddInt64(&shard.expirations, 1)
 					atomic.AddInt64(&shard.misses, 1)
@@ -669,7 +686,7 @@ func (c *Cache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K, V]) ge
 	if item.expireTime > 0 {
 		now = time.Now().UnixNano()
 		if now > item.expireTime {
-			c.removeItem(shard, item, false)
+			c.removeItem(shard, item)
 			if c.config.StatsEnabled {
 				atomic.AddInt64(&shard.expirations, 1)
 				atomic.AddInt64(&shard.misses, 1)
@@ -698,7 +715,7 @@ func (c *Cache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
 }
 
-func (c *Cache[K, V]) removeItem(s *shard[K, V], it *cacheItem[K, V], ev bool) {
+func (c *Cache[K, V]) removeItem(s *shard[K, V], item *cacheItem[K, V]) {
 	mode := dropLRU
 	switch c.config.EvictionPolicy {
 	case LFU:
@@ -706,5 +723,5 @@ func (c *Cache[K, V]) removeItem(s *shard[K, V], it *cacheItem[K, V], ev bool) {
 	case SieveTinyLFU:
 		mode = dropSieve
 	}
-	s.dropItem(it, &c.itemPool, c.config.StatsEnabled, ev, mode)
+	s.dropItem(item, &c.itemPool, c.config.StatsEnabled, false, mode)
 }

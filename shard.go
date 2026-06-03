@@ -65,10 +65,6 @@ func (s *shard[K, V]) dropItem(
 	evicted bool,
 	mode itemDropMode,
 ) bool {
-	if item == nil {
-		return false
-	}
-
 	key, ok := s.itemKey(item)
 	if !ok {
 		return false
@@ -213,7 +209,6 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 	for key, item := range s.data {
 		if item.expireTime > 0 && now > item.expireTime {
 			keysToDelete = append(keysToDelete, key)
-			continue
 		}
 	}
 

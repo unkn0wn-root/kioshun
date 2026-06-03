@@ -29,10 +29,8 @@ func newLFUList[K comparable, V any]() *lfuList[K, V] {
 }
 
 func (l *lfuList[K, V]) add(item *cacheItem[K, V]) {
-	freq := int64(1)
-	item.lfuFreq = freq
-
-	node := l.getOrCreateFreqNode(freq)
+	item.lfuFreq = 1
+	node := l.ensureIndex(l.head, 1)
 	node.items[item] = struct{}{}
 	l.itemFreq[item] = node
 }
@@ -118,14 +116,6 @@ func (l *lfuList[K, V]) ensureIndex(prev *freqNode[K, V], freq int64) *freqNode[
 
 	l.freqMap[freq] = newNode
 	return newNode
-}
-
-func (l *lfuList[K, V]) getOrCreateFreqNode(freq int64) *freqNode[K, V] {
-	if freq == 1 {
-		return l.ensureIndex(l.head, 1)
-	}
-	prev := l.freqMap[freq-1]
-	return l.ensureIndex(prev, freq)
 }
 
 // removeFreqNode unlinks an empty non-sentinel bucket and drops its freq map entry.
