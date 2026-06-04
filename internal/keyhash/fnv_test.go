@@ -1,4 +1,4 @@
-package kioshun
+package keyhash
 
 import (
 	"strconv"

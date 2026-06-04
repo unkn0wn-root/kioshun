@@ -1,4 +1,4 @@
-package kioshun
+package keyhash
 
 const (
 	fnvOffset64 = 14695981039346656037

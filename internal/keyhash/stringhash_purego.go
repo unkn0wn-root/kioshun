@@ -1,18 +1,20 @@
-package kioshun
+//go:build kioshun_purego
+
+package keyhash
 
 import (
 	"encoding/binary"
-	"fmt"
 	"math/bits"
-	"reflect"
 	"unsafe"
 )
 
-// xxHash64 seed=0 implementation tuned for cache hot paths.
+// This file is the pure Go string hasher used when the cache
+// is built with -tags kioshun_purego. The default build instead links the Go
+// runtime's memhash backend (see stringhash_runtime.go) so if you're
+// not comfortable with using runtime memhash - use this instead.
+
 const (
 	prime64_1 = 0x9E3779B185EBCA87
-	prime64_2 = 0xC2B2AE3D27D4EB4F
-	prime64_3 = 0x165667B19E3779F9
 	prime64_4 = 0x85EBCA77C2B2AE63
 	prime64_5 = 0x27D4EB2F165667C5
 
@@ -28,99 +30,18 @@ const (
 	smallRotation = 23
 	tinyRotation  = 11
 
-	// xor-shifts (order matters).
-	avalancheShift1 = 33
-	avalancheShift2 = 29
-	avalancheShift3 = 32
-
 	// lane-combine rotations
 	v1Rotation = 1
 	v2Rotation = 7
 	v3Rotation = 12
 	v4Rotation = 18
 
-	ghostTagSalt = 0x9ddfea08eb382d69
-)
-
-// <=8B uses FNV-1a, larger strings use xxHash64.
-const (
+	// <=8B uses FNV-1a, larger strings use xxHash64.
 	stringByteLength = 8
 )
 
-// hashableInteger is every key kind we hash by reading its integer
-// representation directly. newHasher selects T from reflect.Kind so the
-// unsafe read matches K's integer representation.
-type hashableInteger interface {
-	~int | ~int8 | ~int16 | ~int32 | ~int64 |
-		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
-}
-
-type hasher[K comparable] struct {
-	sum func(K) uint64
-}
-
-func newHasher[K comparable]() hasher[K] {
-	var zero K
-	if typ := reflect.TypeOf(zero); typ != nil {
-		switch typ.Kind() {
-		case reflect.String:
-			return hasher[K]{sum: hashStringKey[K]}
-		case reflect.Int:
-			return hasher[K]{sum: hashIntKey[K, int]}
-		case reflect.Int8:
-			return hasher[K]{sum: hashIntKey[K, int8]}
-		case reflect.Int16:
-			return hasher[K]{sum: hashIntKey[K, int16]}
-		case reflect.Int32:
-			return hasher[K]{sum: hashIntKey[K, int32]}
-		case reflect.Int64:
-			return hasher[K]{sum: hashIntKey[K, int64]}
-		case reflect.Uint:
-			return hasher[K]{sum: hashIntKey[K, uint]}
-		case reflect.Uint8:
-			return hasher[K]{sum: hashIntKey[K, uint8]}
-		case reflect.Uint16:
-			return hasher[K]{sum: hashIntKey[K, uint16]}
-		case reflect.Uint32:
-			return hasher[K]{sum: hashIntKey[K, uint32]}
-		case reflect.Uint64:
-			return hasher[K]{sum: hashIntKey[K, uint64]}
-		case reflect.Uintptr:
-			return hasher[K]{sum: hashIntKey[K, uintptr]}
-		}
-	}
-
-	return hasher[K]{sum: hashFallbackKey[K]}
-}
-
-func (h hasher[K]) hash(key K) uint64 {
-	return h.sum(key)
-}
-
-func (h hasher[K]) tag(key K) uint16 {
-	return tagFromHash(h.hash(key))
-}
-
-func tagFromHash(hash uint64) uint16 {
-	tag := uint16(xxHash64Avalanche(hash^ghostTagSalt) >> 48)
-	if tag == 0 {
-		return 1
-	}
-	return tag
-}
-
-func hashStringKey[K comparable](key K) uint64 {
-	return hashString(*(*string)(unsafe.Pointer(&key)))
-}
-
-func hashIntKey[K comparable, T hashableInteger](key K) uint64 {
-	return xxHash64Avalanche(uint64(*(*T)(unsafe.Pointer(&key))))
-}
-
-func hashFallbackKey[K comparable](key K) uint64 {
-	return hashString(fmt.Sprintf("%v", key))
-}
-
+// hashString is the pure Go counterpart to the memhash-based hashString in
+// stringhash_runtime.go: FNV-1a for short keys, xxHash64 for longer ones.
 func hashString(s string) uint64 {
 	if len(s) <= stringByteLength {
 		return fnvHash64(s)
@@ -136,7 +57,7 @@ func hashString(s string) uint64 {
 func xxHash64(input string) uint64 {
 	length := len(input)
 	if length == 0 {
-		return xxHash64Avalanche(prime64_5)
+		return Avalanche(prime64_5)
 	}
 	data := unsafe.Slice(unsafe.StringData(input), length)
 
@@ -144,11 +65,11 @@ func xxHash64(input string) uint64 {
 	if length >= largeInputThreshold {
 		h64 = xxHash64Large(data, uint64(length))
 	} else {
-		h64 = prime64_5 + uint64(length) // small-input init
+		h64 = prime64_5 + uint64(length) // small input init
 		h64 = xxHash64Small(data, h64)
 	}
 
-	return xxHash64Avalanche(h64)
+	return Avalanche(h64)
 }
 
 // xxHash64Large processes 32B blocks with four accumulators before finalizing the tail.
@@ -227,15 +148,5 @@ func xxHash64Finalize(data []byte, h64 uint64) uint64 {
 		data = data[1:]
 	}
 
-	return h64
-}
-
-// do the final xor-shift/multiply chain to enforce avalanche behavior.
-func xxHash64Avalanche(h64 uint64) uint64 {
-	h64 ^= h64 >> avalancheShift1
-	h64 *= prime64_2
-	h64 ^= h64 >> avalancheShift2
-	h64 *= prime64_3
-	h64 ^= h64 >> avalancheShift3
 	return h64
 }
