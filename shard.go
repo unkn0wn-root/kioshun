@@ -185,6 +185,9 @@ func (s *shard[K, V]) drainReadSamples() {
 func (s *shard[K, V]) drainStripe(p *sieveTinyLFU[K, V], st *readStripe) {
 	t := st.tail.Load()
 	h := st.head.Load()
+	if t == h {
+		return
+	}
 	if t-h > readStripeSlots {
 		h = t - readStripeSlots
 	}
