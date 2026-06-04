@@ -97,7 +97,7 @@ func (q *sieveQueue[K, V]) popBack() *cacheItem[K, V] {
 }
 
 func (q *sieveQueue[K, V]) remove(it *cacheItem[K, V]) bool {
-	if !q.holds(it) || it.prev == nil || it.next == nil {
+	if it == nil || it.sieveQ != q || it.prev == nil || it.next == nil {
 		return false
 	}
 	if it.prev.next != it || it.next.prev != it {
