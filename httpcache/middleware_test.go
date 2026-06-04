@@ -471,7 +471,7 @@ func TestHTTPCacheMiddleware_EvictionCleansPatternIndex(t *testing.T) {
 	waitForMiddlewareWrites(t, middleware)
 
 	// The removal listener reconciles the index, so it converges to exactly the
-	// resident set — never the 2000 keys inserted.
+	// resident set - never the 2000 keys inserted.
 	waitFor(t, func() bool {
 		return int64(len(middleware.patternIdx.getMatchingKeys("/evict/*"))) == middleware.cache.Size()
 	})

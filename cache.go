@@ -150,7 +150,6 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		}
 		if config.EvictionPolicy == SieveTinyLFU && s.cap > 0 {
 			s.sieve = newSieveTinyLFU[K, V](s.cap, config.ProbationRatio, config.GhostRatio)
-			s.sieve.adaptive = config.Adapt
 			s.readBuf = newReadBuffer() // pershard read sampling for the sketch
 		}
 		cache.shards[i] = s
@@ -510,7 +509,7 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		warmup := shard.belowSieveWarmupLocked()
 		shard.mu.RUnlock()
 		if !warmup {
-			shard.sampleRead(kh)
+			shard.sampleRead(kh, true)
 		}
 		if c.config.StatsEnabled {
 			atomic.AddInt64(&shard.misses, 1)
@@ -560,7 +559,7 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 	}
 	// feed the read into the frequency sketch via the per-shard read buffer so
 	// TinyLFU admission reflects read popularity, not just write traffic.
-	shard.sampleRead(kh)
+	shard.sampleRead(kh, true)
 	return res
 }
 
@@ -571,7 +570,7 @@ func (c *Cache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K, V]) ge
 	item, exists := shard.data[key]
 	if !exists {
 		if shard.sieve != nil && !shard.belowSieveWarmupLocked() {
-			shard.sampleRead(kh)
+			shard.sampleRead(kh, false)
 		}
 		if c.config.StatsEnabled {
 			atomic.AddInt64(&shard.misses, 1)
@@ -599,7 +598,7 @@ func (c *Cache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K, V]) ge
 	if c.config.StatsEnabled {
 		atomic.AddInt64(&shard.hits, 1)
 	}
-	shard.sampleRead(kh)
+	shard.sampleRead(kh, false)
 	return getResult[V]{
 		value:      item.value,
 		expireTime: item.expireTime,

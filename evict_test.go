@@ -221,7 +221,7 @@ func TestOnRemove_CapacityEvictionAccounting(t *testing.T) {
 				t.Fatalf("got %d duplicate eviction notifications", rec.repeats)
 			}
 			// Set with NoExpiration and no Delete, so every notification is a
-			// capacity removal — except SieveTinyLFU, which may also reject a
+			// capacity removal - except SieveTinyLFU, which may also reject a
 			// candidate that loses admission (RemovedRejected).
 			for _, rsn := range rec.allReasons() {
 				switch policy {

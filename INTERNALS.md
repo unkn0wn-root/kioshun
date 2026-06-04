@@ -56,10 +56,9 @@ item resets the whole struct before it returns to the pool.
 - `CleanupInterval = 5 * time.Minute`
 - `DefaultTTL = 30 * time.Minute`
 - `EvictionPolicy = SieveTinyLFU`
-- `StatsEnabled = true`
+- `StatsEnabled = false`
 - `ProbationRatio = 10`
 - `GhostRatio = 100`
-- `Adapt = true`
 - `WriteBufferSize = 1024`
 - `WriteBatchSize = 64`
 
@@ -240,9 +239,11 @@ SieveTinyLFU is the default bounded policy. It combines:
 
 - a probation FIFO queue for new entries
 - a main SIEVE queue for entries with reuse evidence
-- a compact ghost FIFO of recently evicted probation fingerprints
+- two compact ghost FIFOs of recently evicted fingerprints: `ghost` (B1) for
+  probation victims and `mghost` (B2) for main victims
 - a TinyLFU-style frequency estimator
 - a small adaptive controller for the probation/main split
+- a self-tuning admission controller (recency vs frequency) driven by the B2 ghost
 
 It is allocated only for shards with `cap > 0`.
 
@@ -257,7 +258,8 @@ For a shard capacity `c`:
 - maximum probation cap is `max(min, c*60/100)`, capped below `c` when possible
 - initial probation cap is clamped from `c * ProbationRatio / 100`
 - main cap is `c - probationCap`
-- ghost cap is `mainCap * GhostRatio / 100`, with a minimum of 1 when main exists
+- B1 ghost cap is `mainCap * GhostRatio / 100`, with a minimum of 1 when main exists
+- B2 ghost cap is `c` (about one shard-capacity of recent main-victim fingerprints)
 - adaptation step is `max(1, c/100)`
 - sketch/doorkeeper sample size is `max(c*10, 1024)`
 
@@ -279,8 +281,8 @@ lossy, per-shard read buffer. The worker drains those samples into the estimator
 before and between write batches.
 
 The read buffer has up to 16 stripes, rounded to a power of two from
-`GOMAXPROCS`. `procID()` uses `runtime.procPin` through `go:linkname` only as a
-best-effort stripe hint. A full stripe overwrites old samples; that can reduce
+`GOMAXPROCS`. `procID()` uses `runtime.procPin` through `go:linkname`
+as stripe hint. A full stripe overwrites old samples; that can reduce
 frequency accuracy but cannot corrupt cache contents.
 
 #### Admission And Replacement
@@ -288,8 +290,9 @@ frequency accuracy but cannot corrupt cache contents.
 SieveTinyLFU inserts follow this path:
 
 1. During warmup, insert into probation and skip frequency/admission work.
-2. After warmup, record the key hash in the estimator.
-3. If `(hash, tag)` is in the ghost queue, remove the ghost entry and insert the
+2. After warmup, record the key hash in the estimator, and note a B2 resurrection
+   if the key was a recent main-eviction victim.
+3. If `(hash, tag)` is in the B1 ghost queue, remove the ghost entry and insert the
    item directly into main with `visited=true`.
 4. Otherwise insert into probation with `reuse=0` and `visited=false`.
 5. Enforce resident capacity and segment pressure.
@@ -308,8 +311,18 @@ Main eviction uses a SIEVE hand:
 - forced eviction can take a candidate after the bounded scan
 
 When a probation promotion or ghost-hit item competes with a main victim,
-`shouldAdmit` compares TinyLFU estimates. Ties favor proven short-term reuse:
-ghost hits, probation promotions, unvisited victims, and victims with zero reuse.
+`shouldAdmit` compares TinyLFU estimates, and the admission tuner (see Adaptation)
+decides how ties are broken:
+
+- in the default recency mode, ties favor proven short-term reuse: ghost hits,
+  probation promotions, unvisited victims, and victims with zero reuse
+- in frequency mode it is plain TinyLFU - the candidate is admitted only when its
+  estimate strictly beats the victim's, so the incumbent wins ties
+
+A main eviction victim's `(hash, tag)` is recorded in the B2 ghost. If that key is
+inserted again later, the reinsertion is a "resurrection": evidence the cache
+evicted an item it still needed. Resurrections do not change placement; they are
+the signal the admission tuner reads.
 
 Capacity enforcement is bounded by `maxEvictionWork`. If the bounded pass cannot
 restore capacity because it spent work promoting probation entries, a forced tail
@@ -317,25 +330,66 @@ drop restores the shard to capacity.
 
 #### Adaptation
 
-The controller tracks ghost hits, probation evictions, promotions, main
-survivals, and observations. Every one of these is maintained on the
-single-consumer maintenance path (the write worker, or a caller holding the
-shard write lock), so the read path never writes shared policy counters. Main
-usefulness is measured by `mainSurvivals`: the count of visited main residents
-the SIEVE hand spares during eviction sweeps. It is a maintenance-path proxy for
-"main read hits" that avoids a contended atomic increment on every read hit, and
-it tracks how many distinct main entries reads keep alive rather than being
-skewed by a single hammered key.
+Adaptation is part of SieveTinyLFU and has no public on/off switch. `tick` fires
+once per window of `capacity * 10` observations and drives two independent
+controllers off the same per-cycle counters, all maintained on the
+single-consumer maintenance path (the write worker, or a caller holding the shard
+write lock), so the read path never writes shared policy counters.
 
-Two mechanisms can change segment sizing:
+**Segment sizing** tracks ghost hits, probation evictions, promotions, and main
+survivals. Main usefulness is measured by `mainSurvivals`: the count of visited
+main residents the SIEVE hand spares during eviction sweeps. It is a
+maintenance-path proxy for "main read hits" that avoids a contended atomic
+increment on every read hit, and it tracks how many distinct main entries reads
+keep alive rather than being skewed by a single hammered key.
 
-- an immediate ghost hit can grow probation by one adaptation step
-- periodic `tick` checks every `capacity * 10` observations and can also grow
-  probation when ghost hits dominate probation evictions
-- periodic `tick` can shrink probation when probation is evicting much more than
-  it promotes and main is earning its keep (more survivals than promotions)
+The hard case is telling a stationary skew (which wants a tiny probation so main
+pins the hot set) apart from a shifting hot set (which wants a large recency
+window, behaving like LRU): both show heavy probation churn and frequent B1 ghost
+hits, so neither of those signals separates them. The dual-ghost *resurrection
+rate* `cycleB2Hits / cycleMainEvicts` (the same signal the admission tuner reads)
+does. A stationary working set keeps resurrecting its main victims (they are
+still wanted); a shifting one abandons them.
 
-The shrink path moves one adaptation step of capacity from probation to main.
+Segment sizing changes at the periodic controller window:
+
+- a **shifting hot set** grows probation aggressively (a larger step,
+  `probationGrowStepPct` of capacity) when main is churning yet its victims are
+  abandoned (resurrection rate below `probationResurrectLow`) while probation
+  keeps re-evicting entries that return (B1 ghost hits exceed promotions). A
+  `cycleMainEvicts > promotions` gate keeps a stable main - where there are almost
+  no main evictions, so the resurrection rate reads as zero - from being mistaken
+  for a shift, and the grow is suppressed while the admission tuner is pinning a
+  cyclic ("loop") workload with frequency.
+- otherwise `tick` grows probation modestly (one adaptation step) when ghost hits
+  dominate probation evictions (probation too small; this also covers loops), and
+- shrinks probation (one adaptation step) when probation is evicting much more
+  than it promotes and main is earning its keep (more survivals than promotions).
+
+Growing the recency window lets a newly hot key survive to its reuse instead of
+being evicted from a tiny probation before its second access - the case where a
+recency-heavy workload would otherwise trail plain LRU.
+
+**Admission tuning** (`admissionTuner`) self-selects recency vs frequency
+tie-breaking per shard, with no configuration. Recency maximizes hit ratio on
+shifting and bursty working sets but thrashes on stationary cyclic ("loop")
+workloads whose footprint exceeds capacity, where frequency instead pins a stable
+resident set; no fixed mode wins both. The tuner defaults to recency and only
+switches when the B2 ghost shows the loop signature:
+
+- each cycle it computes a *resurrection rate* = B2 ghost hits / main evictions,
+  and the churn cost (evictions + rejects), which tracks the miss rate
+- a loop keeps resurrecting its victims (rate near 1); shifting/bursty workloads
+  abandon theirs (rate near 0), so only a loop accumulates the entry evidence
+- on enough evidence it runs a one-cycle frequency trial, and commits only if the
+  trial actually cuts churn cost below the recency baseline
+- a committed shard reverts to recency the moment churn climbs back (the workload
+  shifted out of its loop), and each reverted trial doubles a cooldown so a
+  workload that never benefits stops re-trialing
+
+Because the entry gate requires the loop signature, recency-biased workloads never
+trial frequency and never regress; the churn-based commit/revert keeps a wrong bet
+to at most about one window. The mode is internal and not configurable.
 
 ## Stats
 

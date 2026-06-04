@@ -71,7 +71,6 @@ func New(config Config) (*Middleware, error) {
 		EvictionPolicy:  config.EvictionPolicy,
 		ProbationRatio:  config.ProbationRatio,
 		GhostRatio:      config.GhostRatio,
-		Adapt:           !config.DisableAdapt,
 		StatsEnabled:    !config.DisableStats,
 	}
 	if config.DisableCleanup {

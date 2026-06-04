@@ -108,8 +108,8 @@ func zipfTrace(seed int64, n, keys int, s float64) []int {
 
 func loopTrace(rounds, keys int) []int {
 	tr := make([]int, 0, rounds*keys)
-	for r := 0; r < rounds; r++ {
-		for k := 0; k < keys; k++ {
+	for range rounds {
+		for k := range keys {
 			tr = append(tr, k)
 		}
 	}
@@ -118,12 +118,12 @@ func loopTrace(rounds, keys int) []int {
 
 func scanTrace(stable, warm, scan int) []int {
 	tr := make([]int, 0, stable*warm+scan)
-	for i := 0; i < warm; i++ {
-		for k := 0; k < stable; k++ {
+	for range warm {
+		for k := range stable {
 			tr = append(tr, k)
 		}
 	}
-	for k := 0; k < scan; k++ {
+	for k := range scan {
 		tr = append(tr, 1_000_000+k)
 	}
 	return tr
@@ -132,9 +132,9 @@ func scanTrace(stable, warm, scan int) []int {
 func shiftingTrace(seed int64, phases, phaseLen, hot, cold int) []int {
 	r := rand.New(rand.NewSource(seed))
 	tr := make([]int, 0, phases*phaseLen)
-	for p := 0; p < phases; p++ {
+	for p := range phases {
 		base := p * hot
-		for i := 0; i < phaseLen; i++ {
+		for range phaseLen {
 			if r.Intn(100) < 85 {
 				tr = append(tr, base+r.Intn(hot))
 			} else {
@@ -148,14 +148,14 @@ func shiftingTrace(seed int64, phases, phaseLen, hot, cold int) []int {
 func burstTrace(seed int64, bursts, hot, cold int) []int {
 	r := rand.New(rand.NewSource(seed))
 	tr := make([]int, 0, bursts*(hot*6+cold))
-	for b := 0; b < bursts; b++ {
+	for b := range bursts {
 		base := b * hot
-		for rep := 0; rep < 6; rep++ {
-			for k := 0; k < hot; k++ {
+		for range 6 {
+			for k := range hot {
 				tr = append(tr, base+k)
 			}
 		}
-		for i := 0; i < cold; i++ {
+		for range cold {
 			tr = append(tr, 2_000_000+r.Intn(100_000))
 		}
 	}
@@ -165,7 +165,7 @@ func burstTrace(seed int64, bursts, hot, cold int) []int {
 func writeHeavyTrace(seed int64, n, hot, cold int) []int {
 	r := rand.New(rand.NewSource(seed))
 	tr := make([]int, 0, n)
-	for i := 0; i < n; i++ {
+	for range n {
 		if r.Intn(100) < 35 {
 			tr = append(tr, r.Intn(hot))
 		} else {
@@ -204,7 +204,8 @@ func TestPolicyScanResistance(t *testing.T) {
 	as := countFound(ad, 0, int(cap))
 	ls := countFound(lru, 0, int(cap))
 
-	t.Logf("scan admission=%.2f%% lru=%.2f%% survivors admission=%d lru=%d",
+	t.Logf(
+		"scan admission=%.2f%% lru=%.2f%% survivors admission=%d lru=%d",
 		float64(ah)/float64(ah+am)*100,
 		float64(lh)/float64(lh+lm)*100,
 		as,
@@ -281,10 +282,7 @@ func TestPolicyWriteHeavy(t *testing.T) {
 	}
 }
 
-// runTraceAdaptive replays a trace through an adaptive single-shard SieveTinyLFU
-// cache and reports the run plus the probation cap before/after so the test can
-// confirm the adaptive controller actually moved the split.
-func runTraceAdaptive(cap int64, tr []int) (r polRun, pcStart, pcEnd int64) {
+func runTraceSieve(cap int64, tr []int) (r polRun, pcStart, pcEnd int64) {
 	c, err := New[int, int](Config{
 		MaxSize:         cap,
 		ShardCount:      1,
@@ -292,7 +290,6 @@ func runTraceAdaptive(cap int64, tr []int) (r polRun, pcStart, pcEnd int64) {
 		DefaultTTL:      time.Hour,
 		EvictionPolicy:  SieveTinyLFU,
 		StatsEnabled:    true,
-		Adapt:           true,
 	})
 	if err != nil {
 		panic(err)
@@ -300,38 +297,50 @@ func runTraceAdaptive(cap int64, tr []int) (r polRun, pcStart, pcEnd int64) {
 	defer c.Close()
 
 	pcStart = c.shards[0].sieve.probationCap
-	r = polRun{name: "SieveTinyLFU+Adapt", pol: SieveTinyLFU}
+	r = polRun{name: "SieveTinyLFU", pol: SieveTinyLFU}
 	r.hit, r.miss = runTraceInto(c, tr)
 	r.size = c.Size()
 	pcEnd = c.shards[0].sieve.probationCap
 	return r, pcStart, pcEnd
 }
 
-// TestPolicyAdaptiveHitRatio exercises the Adapt=true control path end to end
-// (the rest of the policy suite runs with adaptation off). The maintenance-path
-// mainSurvivals signal feeds the shrink decision here; the assertions guard that
-// bidirectional resizing keeps the cache at least as good as the cheap baselines.
-func TestPolicyAdaptiveHitRatio(t *testing.T) {
+func TestPolicySieveTinyLFUHitRatio(t *testing.T) {
 	cap := int64(128)
 
-	// Stationary Zipf: the adaptive split must still beat plain FIFO.
 	zipf := zipfTrace(11, 30_000, 2_000, 1.12)
-	ad, pc0, pc1 := runTraceAdaptive(cap, zipf)
+	ad, pc0, pc1 := runTraceSieve(cap, zipf)
 	fi := runTrace(FIFO, cap, zipf)
-	t.Logf("zipf adaptive=%.2f%% fifo=%.2f%% probationCap %d->%d",
+	t.Logf("zipf sieve=%.2f%% fifo=%.2f%% probationCap %d->%d",
 		hitPct(ad)*100, hitPct(fi)*100, pc0, pc1)
 	assertCap(t, ad, cap)
 	if ad.hit < fi.hit {
-		t.Fatalf("adaptive SieveTinyLFU below FIFO on zipf: adaptive=%d fifo=%d", ad.hit, fi.hit)
+		t.Fatalf("SieveTinyLFU below FIFO on zipf: sieve=%d fifo=%d", ad.hit, fi.hit)
 	}
 
-	// Shifting hotset: adaptation must not collapse the hit rate (same floor the
-	// static TestPolicyShiftingHotset enforces).
 	shift := shiftingTrace(23, 8, 4_000, 96, 8_000)
-	sad, spc0, spc1 := runTraceAdaptive(cap, shift)
-	t.Logf("shifting adaptive=%.2f%% probationCap %d->%d", hitPct(sad)*100, spc0, spc1)
+	sad, spc0, spc1 := runTraceSieve(cap, shift)
+	t.Logf("shifting sieve=%.2f%% probationCap %d->%d", hitPct(sad)*100, spc0, spc1)
 	assertCap(t, sad, cap)
 	if hitPct(sad) < 0.45 {
-		t.Fatalf("adaptive SieveTinyLFU collapsed on shifting hotset: %.2f%%", hitPct(sad)*100)
+		t.Fatalf("SieveTinyLFU collapsed on shifting hotset: %.2f%%", hitPct(sad)*100)
+	}
+}
+
+func TestPolicySieveGrowsProbationOnRecency(t *testing.T) {
+	cap := int64(256)
+	tr := burstTrace(37, 50, 64, 256)
+
+	ad, pc0, pc1 := runTraceSieve(cap, tr)
+	lru := runTrace(LRU, cap, tr)
+	t.Logf("burst sieve=%.2f%% lru=%.2f%% probationCap %d->%d",
+		hitPct(ad)*100, hitPct(lru)*100, pc0, pc1)
+	assertCap(t, ad, cap)
+
+	if pc1 <= pc0 {
+		t.Fatalf("probation should grow on a recency-heavy workload: probationCap %d->%d", pc0, pc1)
+	}
+	if ad.hit*100 < lru.hit*85 {
+		t.Fatalf("SieveTinyLFU trails LRU too far on burst: sieve=%d lru=%d (%.1f%% of LRU)",
+			ad.hit, lru.hit, float64(ad.hit)/float64(lru.hit)*100)
 	}
 }

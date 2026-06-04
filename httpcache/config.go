@@ -19,7 +19,6 @@ type Config struct {
 	EvictionPolicy        kioshun.EvictionPolicy
 	ProbationRatio        uint8
 	GhostRatio            uint8
-	DisableAdapt          bool // SieveTinyLFU adaptive sizing.
 	DisableStats          bool // cache statistics collection.
 	DisableCleanup        bool // periodic cleanup.
 	DisableCacheSizeLimit bool // makes MaxSize unlimited in the backing cache.
@@ -146,7 +145,6 @@ func configWithDefaults(config Config) Config {
 		cfg.MissHeader = config.MissHeader
 	}
 
-	cfg.DisableAdapt = config.DisableAdapt
 	cfg.DisableStats = config.DisableStats
 	cfg.DisableCleanup = config.DisableCleanup
 	cfg.DisableCacheSizeLimit = config.DisableCacheSizeLimit

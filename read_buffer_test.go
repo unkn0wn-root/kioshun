@@ -31,7 +31,7 @@ func TestReadBufferSampleThenDrainFeedsSketch(t *testing.T) {
 	}
 
 	for i := 0; i < 50; i++ {
-		s.sampleRead(h)
+		s.sampleRead(h, false)
 	}
 	s.drainReadSamples()
 
@@ -57,7 +57,7 @@ func TestReadBufferLossyOverflowDrainsRecentWindow(t *testing.T) {
 	// The drain must stay bounded and still replay the most recent window.
 	total := readStripeSlots * (len(s.readBuf.stripes) + 4) * 8
 	for i := 0; i < total; i++ {
-		s.sampleRead(h)
+		s.sampleRead(h, false)
 	}
 	s.drainReadSamples()
 
@@ -73,11 +73,36 @@ func TestReadBufferZeroHashMappedToSentinel(t *testing.T) {
 	// hash 0 collides with the empty-slot sentinel; sample() remaps it to 1 so
 	// it is not silently dropped by the drain.
 	for i := 0; i < 30; i++ {
-		s.sampleRead(0)
+		s.sampleRead(0, false)
 	}
 	s.drainReadSamples()
 	if got := s.sieve.estimate(1); got == 0 {
 		t.Fatal("zero-hash samples were dropped instead of remapped to sentinel 1")
+	}
+}
+
+func TestReadBufferSignalsAtHeadRelativeFullWindow(t *testing.T) {
+	rb := readBuffer{
+		stripes: make([]readStripe, 1),
+		mask:    0,
+	}
+	st := &rb.stripes[0]
+	st.tail.Store(10)
+	st.head.Store(10)
+
+	for i := 0; i < readStripeSlots-1; i++ {
+		_, needDrain := rb.sample(uint64(i + 1))
+		if needDrain {
+			t.Fatalf("sample %d signaled before head-relative window was full", i)
+		}
+	}
+
+	_, needDrain := rb.sample(123)
+	if !needDrain {
+		t.Fatal("sample did not signal when tail-head reached readStripeSlots")
+	}
+	if got := st.tail.Load() - st.head.Load(); got != readStripeSlots {
+		t.Fatalf("backlog=%d, want %d", got, readStripeSlots)
 	}
 }
 
@@ -94,7 +119,7 @@ func TestReadBufferConcurrentSampleDrain(t *testing.T) {
 			defer wg.Done()
 			h := uint64(id + 1)
 			for !stop.Load() {
-				s.sampleRead(h)
+				s.sampleRead(h, false)
 			}
 		}(g)
 	}
@@ -127,7 +152,6 @@ func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
 		DefaultTTL:      time.Hour,
 		EvictionPolicy:  SieveTinyLFU,
 		StatsEnabled:    true,
-		Adapt:           false,
 	})
 	defer c.Close()
 
@@ -160,7 +184,6 @@ func TestReadMissesFeedAdmissionSketch(t *testing.T) {
 		DefaultTTL:      time.Hour,
 		EvictionPolicy:  SieveTinyLFU,
 		StatsEnabled:    false,
-		Adapt:           false,
 	})
 	defer c.Close()
 
