@@ -521,6 +521,26 @@ func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
 	}
 }
 
+func TestSieveTinyLFUGhostHitDoesNotResizeImmediately(t *testing.T) {
+	a := newSieveTinyLFU[int, int](100, 10, 100)
+	a.adaptive = true
+	start := a.probationCap
+	it := &cacheItem[int, int]{hash: 1}
+	a.ghost.add(it.hash, 0)
+
+	a.insert(it, true)
+
+	if a.probationCap != start {
+		t.Fatalf("probationCap=%d, want unchanged %d", a.probationCap, start)
+	}
+	if a.main.size != 1 || it.queue != mainQueue {
+		t.Fatalf("ghost hit main size=%d queue=%d, want main resident", a.main.size, it.queue)
+	}
+	if a.controller.ghostHits != 1 || a.stats.GhostHits != 1 {
+		t.Fatalf("ghost hits controller/stats=%d/%d, want 1/1", a.controller.ghostHits, a.stats.GhostHits)
+	}
+}
+
 func TestSieveTinyLFUMaintainForcesCapacityAfterBoundedScan(t *testing.T) {
 	s := &shard[int, int]{data: make(map[int]*cacheItem[int, int]), cap: 3}
 	s.initLRU()

@@ -289,9 +289,6 @@ func (p *sieveTinyLFU[K, V]) insert(it *cacheItem[K, V], gh bool) {
 		p.ghost.remove(it.hash, it.tag)
 		p.controller.ghostHits++
 		p.stats.GhostHits++
-		if p.adaptive && p.probationCap < p.maxProbationCap {
-			p.setProbationCap(p.probationCap + p.adaptStep)
-		}
 		p.insertMain(it)
 		return
 	}
