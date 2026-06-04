@@ -78,12 +78,19 @@ is not allocated, because no eviction or admission decision is needed.
 
 ## Hashing
 
-`newHasher[K]` selects a hash function once per cache type:
+`internal/keyhash.New[K]` selects a hash function once per cache type:
 
-- strings of length `<= 8` use FNV-1a
-- longer strings use the local `xxHash64(seed=0)` implementation
+- strings use the Go runtime `memhash` backend by default
+- builds with `-tags kioshun_purego` use FNV-1a for strings of length `<= 8`
+  and a local `xxHash64(seed=0)` implementation for longer strings
 - integer-like keys are read directly and avalanched with xxHash64's finalizer
 - other comparable keys fall back to `fmt.Sprintf("%v", key)` and hash that string
+
+The default string hasher uses `unsafe` plus `go:linkname` to call the Go
+runtime's `memhash`. It is intended for maximum throughput and only reads string
+bytes so it should be safe but it depends on a runtime internal symbol.
+If that tradeoff is not acceptable for your environment and you would like to skip using linkname,
+build with `-tags kioshun_purego` to use pure Go string backend instead.
 
 The hash selects the shard by `hash & shardMask`. The map still stores full keys,
 so hash collisions affect distribution only, not key equality.

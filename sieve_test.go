@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/unkn0wn-root/kioshun/internal/keyhash"
 )
 
 func TestSieveQueuePushPopRemove(t *testing.T) {
@@ -338,22 +340,22 @@ func TestSieveTinyLFUExpiredFastPathDoesNotCountMainSurvival(t *testing.T) {
 
 	shard := c.shards[0]
 	now := time.Now().UnixNano()
-	expiredHash := c.hasher.hash(1)
-	otherHash := c.hasher.hash(2)
+	expiredHash := c.hasher.Sum(1)
+	otherHash := c.hasher.Sum(2)
 
 	expired := &cacheItem[int, int]{
 		key:        1,
 		value:      1,
 		expireTime: now - int64(time.Second),
 		hash:       expiredHash,
-		tag:        tagFromHash(expiredHash),
+		tag:        keyhash.TagFromHash(expiredHash),
 	}
 	other := &cacheItem[int, int]{
 		key:        2,
 		value:      2,
 		expireTime: now + int64(time.Hour),
 		hash:       otherHash,
-		tag:        tagFromHash(otherHash),
+		tag:        keyhash.TagFromHash(otherHash),
 	}
 
 	shard.mu.Lock()
@@ -492,8 +494,8 @@ func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
 	waitForWrites(t, c)
 
 	s := c.shards[0]
-	h := c.hasher.hash(1)
-	tag := c.hasher.tag(1)
+	h := c.hasher.Sum(1)
+	tag := c.hasher.Tag(1)
 	if !s.sieve.ghost.contains(h, tag) {
 		t.Fatal("expected cold eviction to leave a ghost entry")
 	}

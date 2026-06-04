@@ -3,6 +3,8 @@ package kioshun
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/unkn0wn-root/kioshun/internal/keyhash"
 )
 
 type writeOp uint8
@@ -87,13 +89,13 @@ func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback fun
 		expireTime = now + ttl.Nanoseconds()
 	}
 
-	kh := c.hasher.hash(key)
+	kh := c.hasher.Sum(key)
 	cmd := writeCommand[K, V]{
 		op:         writeSet,
 		key:        key,
 		value:      value,
 		hash:       kh,
-		tag:        tagFromHash(kh),
+		tag:        keyhash.TagFromHash(kh),
 		now:        now,
 		expireTime: expireTime,
 	}

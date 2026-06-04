@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/unkn0wn-root/kioshun/internal/keyhash"
 )
 
 // Store is the key/value store implemented by Cache.
@@ -53,7 +55,7 @@ type Cache[K comparable, V any] struct {
 	workers     sync.WaitGroup
 	itemPool    sync.Pool // *cacheItem[K, V] reuse to lower GC pressure
 	waiterPool  sync.Pool // write ack waiters for sync mutation paths
-	hasher      hasher[K]
+	hasher      keyhash.Hasher[K]
 	evictor     evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
 	onRemove    func(K, V, RemovalReason)
 	onEvict     func(K, V)
@@ -116,7 +118,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		cache.perShardCap = config.MaxSize / int64(shardCount)
 	}
 
-	cache.hasher = newHasher[K]()
+	cache.hasher = keyhash.New[K]()
 	if config.EvictionPolicy != SieveTinyLFU {
 		cache.evictor = createEvictor[K, V](config.EvictionPolicy)
 	}
@@ -238,7 +240,7 @@ func (c *Cache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callbac
 
 // Delete removes a key (if present), unlinks it from lists and recycles the node.
 func (c *Cache[K, V]) Delete(key K) bool {
-	kh := c.hasher.hash(key)
+	kh := c.hasher.Sum(key)
 	deleted, err := c.deleteSync(c.shardByHash(kh), key)
 	if err != nil {
 		return false
@@ -398,7 +400,7 @@ func (c *Cache[K, V]) isClosed() bool {
 }
 
 func (c *Cache[K, V]) getShard(key K) *shard[K, V] {
-	return c.shardByHash(c.hasher.hash(key))
+	return c.shardByHash(c.hasher.Sum(key))
 }
 
 type getResult[V any] struct {
@@ -412,7 +414,7 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 	if c.isClosed() {
 		return getResult[V]{}
 	}
-	kh := c.hasher.hash(key)
+	kh := c.hasher.Sum(key)
 	shard := c.shardByHash(kh)
 
 	if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {

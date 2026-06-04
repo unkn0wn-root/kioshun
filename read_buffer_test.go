@@ -171,7 +171,7 @@ func TestReadMissesFeedAdmissionSketch(t *testing.T) {
 	}
 
 	const key = 10_000
-	h := c.hasher.hash(key)
+	h := c.hasher.Sum(key)
 	for i := 0; i < readStripeSlots; i++ {
 		if _, ok := c.Get(key); ok {
 			t.Fatal("unexpected hit for miss-sampling key")

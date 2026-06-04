@@ -1,6 +1,10 @@
 package kioshun
 
-import "math/bits"
+import (
+	"math/bits"
+
+	"github.com/unkn0wn-root/kioshun/internal/keyhash"
+)
 
 const (
 	sketchMinCounters     = 1024
@@ -183,5 +187,5 @@ func (s *countMinSketch) incrementCounter(i uint64) {
 // caller supplies a rotation to decorrelate rows; m must be a power-of-two mask.
 func sketchIndex(h, m uint64, rot int) uint64 {
 	h = bits.RotateLeft64(h, rot)
-	return xxHash64Avalanche(h) & m
+	return keyhash.Avalanche(h) & m
 }
