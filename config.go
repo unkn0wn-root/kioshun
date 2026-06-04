@@ -45,12 +45,11 @@ type Config struct {
 	StatsEnabled    bool
 	ProbationRatio  uint8
 	GhostRatio      uint8
-	Adapt           bool
 	WriteBufferSize int // bounded per-shard queue depth for async writes.
 	WriteBatchSize  int // caps how many queued writes a shard worker applies under one lock.
 }
 
-// DefaultConfig returns adaptive SieveTinyLFU with stats disabled and shard
+// DefaultConfig returns self-tuning SieveTinyLFU with stats disabled and shard
 // count scaled to the number of CPUs.
 func DefaultConfig() Config {
 	return Config{
@@ -62,7 +61,6 @@ func DefaultConfig() Config {
 		StatsEnabled:    false,
 		ProbationRatio:  defaultProbationRatio,
 		GhostRatio:      defaultGhostRatio,
-		Adapt:           true,
 		WriteBufferSize: defaultWriteBufferSize,
 		WriteBatchSize:  defaultWriteBatchSize,
 	}

@@ -204,7 +204,6 @@ func TestNewSieveTinyLFUAdaptiveBounds(t *testing.T) {
 
 func TestSieveTinyLFURecordReadHitMarksVisitedOnly(t *testing.T) {
 	a := newSieveTinyLFU[int, int](16, 10, 100)
-	a.adaptive = true
 	probationItem := &cacheItem[int, int]{key: 1}
 	mainItem := &cacheItem[int, int]{key: 2}
 
@@ -252,7 +251,6 @@ func TestSieveTinyLFUAdaptiveResetCycleClearsCounters(t *testing.T) {
 
 func TestSieveTinyLFUAdaptiveShrinkUsesMainSurvivals(t *testing.T) {
 	a := newSieveTinyLFU[int, int](100, 10, 100)
-	a.adaptive = true
 	start := a.probationCap
 
 	// Probation churns (evictions > 2x promotions) and main is warm
@@ -280,7 +278,6 @@ func TestSieveTinyLFUAdaptiveShrinkUsesMainSurvivals(t *testing.T) {
 
 func TestSieveTinyLFUAdaptiveShrinkBlockedWhenMainCold(t *testing.T) {
 	a := newSieveTinyLFU[int, int](100, 10, 100)
-	a.adaptive = true
 	start := a.probationCap
 
 	// Probation churns, but main earns nothing (survivals <= promotions): the
@@ -299,8 +296,6 @@ func TestSieveTinyLFUAdaptiveShrinkBlockedWhenMainCold(t *testing.T) {
 
 func TestSieveTinyLFUMainSweepCountsSurvivals(t *testing.T) {
 	a := newSieveTinyLFU[int, int](16, 10, 100)
-	a.adaptive = true
-
 	spared := &cacheItem[int, int]{key: 1}
 	victim := &cacheItem[int, int]{key: 2}
 	a.insertMain(spared)
@@ -334,7 +329,6 @@ func TestSieveTinyLFUExpiredFastPathDoesNotCountMainSurvival(t *testing.T) {
 		CleanupInterval: 0,
 		DefaultTTL:      time.Hour,
 		EvictionPolicy:  SieveTinyLFU,
-		Adapt:           true,
 	})
 	defer c.Close()
 
@@ -383,7 +377,6 @@ func TestSieveTinyLFUInitializesState(t *testing.T) {
 		EvictionPolicy:  SieveTinyLFU,
 		ProbationRatio:  25,
 		GhostRatio:      50,
-		Adapt:           true,
 	})
 	defer c.Close()
 
@@ -393,9 +386,6 @@ func TestSieveTinyLFUInitializesState(t *testing.T) {
 		}
 		if s.sieve.probationCap != 1 || s.sieve.mainCap != 3 || s.sieve.ghostCap != 1 {
 			t.Fatalf("shard %d caps pc=%d mc=%d gc=%d, want 1/3/1", i, s.sieve.probationCap, s.sieve.mainCap, s.sieve.ghostCap)
-		}
-		if !s.sieve.adaptive {
-			t.Fatalf("shard %d adapt flag not wired", i)
 		}
 		if s.sieve.probation.size != 0 || s.sieve.main.size != 0 || !s.sieve.probation.empty() || !s.sieve.main.empty() {
 			t.Fatalf("shard %d policy queues should start empty", i)
@@ -523,7 +513,6 @@ func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
 
 func TestSieveTinyLFUGhostHitDoesNotResizeImmediately(t *testing.T) {
 	a := newSieveTinyLFU[int, int](100, 10, 100)
-	a.adaptive = true
 	start := a.probationCap
 	it := &cacheItem[int, int]{hash: 1}
 	a.ghost.add(it.hash, 0)

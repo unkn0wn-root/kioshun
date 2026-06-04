@@ -140,40 +140,60 @@ func (s *shard[K, V]) belowSieveWarmupLocked() bool {
 	return s.cap > 0 && s.size*2 < s.cap
 }
 
-// sampleRead records a read access into the per-shard read buffer and wakes the
-// write worker to drain it when a stripe fills; never touches the policy directly.
-func (s *shard[K, V]) sampleRead(h uint64) {
+// sampleRead records a read access into the per-shard read buffer. sample()
+// reports backlog when the consumer has fallen a full window behind. When that
+// happens and drainInline is set, the reader drains that one stripe itself if it
+// can claim the single consumer token without blocking, bounding inline work to
+// a single stripe; otherwise it wakes the worker. Below that backlog this is
+// just the buffer append.
+//
+// drainInline must be false when the caller holds s.mu: the synchronous write
+// path locks drainMu before s.mu, so draining under s.mu would invert that
+// order and it would also extend an exclusive hold with sketch work. The
+func (s *shard[K, V]) sampleRead(h uint64, drainInline bool) {
 	if s.wake == nil {
 		return
 	}
-	if s.readBuf.sample(h) {
-		signal(s.wake) // may already be pending
+	stripe, needDrain := s.readBuf.sample(h)
+	if !needDrain {
+		return
 	}
+	if drainInline && s.sieve != nil && s.drainMu.TryLock() {
+		s.drainStripe(s.sieve, &s.readBuf.stripes[stripe])
+		s.drainMu.Unlock()
+		return
+	}
+	signal(s.wake) // may already be pending
 }
 
-// drainReadSamples replays buffered read fingerprints into the frequency sketch.
-// Queue drains are serialized by drainMu so policy maintenance remains
-// single-consumer even when synchronous callers help drain their shard.
+// drainReadSamples replays every stripe's buffered read fingerprints into the
+// frequency sketch. Queue drains are serialized by drainMu so policy maintenance
+// remains single consumer even when synchronous callers help drain their shard.
 func (s *shard[K, V]) drainReadSamples() {
 	p := s.sieve
 	if p == nil {
 		return
 	}
 	for i := range s.readBuf.stripes {
-		st := &s.readBuf.stripes[i]
-		t := st.tail.Load()
-		h := st.head
-		if t-h > readStripeSlots {
-			// producers lapped the consumer; only the most recent window survives.
-			h = t - readStripeSlots
-		}
-		for ; h < t; h++ {
-			if v := st.buf[h&readSlotMask].Swap(0); v != 0 {
-				p.incrementFrequency(v)
-			}
-		}
-		st.head = t
+		s.drainStripe(p, &s.readBuf.stripes[i])
 	}
+}
+
+// drainStripe replays one stripe's fingerprints into the sketch. The caller must
+// hold drainMu (the single consumer token). When producers have lapped the
+// consumer only the most recent window survives; older samples are dropped.
+func (s *shard[K, V]) drainStripe(p *sieveTinyLFU[K, V], st *readStripe) {
+	t := st.tail.Load()
+	h := st.head.Load()
+	if t-h > readStripeSlots {
+		h = t - readStripeSlots
+	}
+	for ; h < t; h++ {
+		if v := st.buf[h&readSlotMask].Swap(0); v != 0 {
+			p.incrementFrequency(v)
+		}
+	}
+	st.head.Store(t)
 }
 
 func (s *shard[K, V]) initLRU() {

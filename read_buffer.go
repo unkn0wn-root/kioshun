@@ -22,11 +22,11 @@ const (
 // readStripe is a "lossy" multi-producer/single-consumer ring of access
 // fingerprints (key hashes). Readers append wait-free; the shard's write worker
 // is the only consumer. When producers outrun the consumer the oldest samples
-// are overwritten — acceptable because samples only feed the frequency sketch,
+// are overwritten - acceptable because samples only feed the frequency sketch,
 // where a dropped sample costs a little accuracy but never correctness.
 type readStripe struct {
 	tail atomic.Uint64                  // next write index (producers)
-	head uint64                         // next read index (consumer)
+	head atomic.Uint64                  // next read index (consumer-written, producer-read as a hint)
 	buf  [readStripeSlots]atomic.Uint64 // fingerprints; 0 == empty slot
 }
 
@@ -49,14 +49,19 @@ func newReadBuffer() readBuffer {
 }
 
 // sample records an access fingerprint into the caller's P-local stripe and
-// reports whether that stripe just filled, so the caller can wake the drain
-// (coalesced). Lossy by design.
-func (rb *readBuffer) sample(h uint64) bool {
+// returns that stripe's index plus whether the consumer has fallen a full window
+// behind. Once tail-head reaches readStripeSlots, the next producer writes begin
+// overwriting unread samples; the caller can drain exactly that stripe or wake
+// the worker. The head load is a hint: head only advances, so a stale read can
+// over-report backlog and cause an extra drain, but it cannot hide a full window
+// that existed before the sample. Lossy by design.
+func (rb *readBuffer) sample(h uint64) (stripe int, needDrain bool) {
 	if h == 0 {
 		h = 1 // reserve 0 as the empty slot sentinel
 	}
-	st := &rb.stripes[uint64(procID())&rb.mask]
+	idx := uint64(procID()) & rb.mask
+	st := &rb.stripes[idx]
 	i := st.tail.Add(1) - 1
 	st.buf[i&readSlotMask].Store(h)
-	return i&readSlotMask == readSlotMask
+	return int(idx), (i+1)-st.head.Load() >= readStripeSlots
 }
