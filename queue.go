@@ -11,6 +11,7 @@ const cacheLinePadding = 64
 type writeQueue[K comparable, V any] interface {
 	enqueue(cmd writeCommand[K, V]) error
 	tryDequeue(buf []writeCommand[K, V]) int
+	quiescent() bool
 }
 
 func newWriteQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) writeQueue[K, V] {
@@ -92,6 +93,17 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 			// another producer advanced head; retry with a fresh position.
 		}
 	}
+}
+
+// quiescent reports whether the queue holds no in-flight writes. head == tail
+// means every reserved slot has been consumed, so there is neither a published
+// command waiting nor a slot a producer has reserved (advanced head) but not yet
+// published. It is a single-consumer check: the caller must hold the shard drain
+// token so tail is stable. A producer may reserve a slot right after this returns;
+// that write then drains after any inline apply the caller performs, preserving
+// accept order.
+func (q *mpscQueue[K, V]) quiescent() bool {
+	return q.head.Load() == q.tail
 }
 
 func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {

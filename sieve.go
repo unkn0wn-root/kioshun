@@ -224,7 +224,7 @@ const (
 	admissionBackoffMax     = 96  // ceiling on the doubling backoff
 	adaptiveCycleMultiplier = 4
 	adaptiveMinCycleCap     = 1024
-	adaptiveMinCycle        = 32768
+	adaptiveMinCycle        = 8192
 )
 
 // admissionTuner self-selects a shard's admissionMode with no configuration. It
@@ -602,7 +602,36 @@ func (s *shard[K, V]) enforceSieveCapacity(
 		case p.probation.size > p.probationCap && !p.probation.empty():
 			admitFromProbation()
 		case (p.main.size > p.mainCap || s.overCapacity()) && !p.main.empty():
-			if s.evictMain(pool, stats, in, tie, defaultMainVictimScan, false) {
+			evictIn, evictTie := in, tie
+
+			inProbation := in != nil &&
+				in.sieveQ == &p.probation &&
+				p.probation.size <= p.probationCap
+
+			// loopish mirrors adaptSize: a cyclic workload is being pinned by, or is
+			// accumulating evidence toward, frequency admission. Checking evidence (not
+			// just the committed mode) keeps shouldKeep from churning main at a cycle
+			// boundary, where the current-cycle resurrection counter has just reset.
+			loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
+
+			shouldKeep := inProbation &&
+				p.costAdmission == CostAdmissionFrequency &&
+				s.costCap == 0 &&
+				!loopish &&
+				(p.controller.cycleMainEvicts == 0 ||
+					p.controller.resurrectionRate() < probationResurrectLow)
+
+			if shouldKeep {
+				// Probation (the recency admission window) is below target on an
+				// unweighted, non-loop, frequency-mode shard: keep the new first-touch
+				// resident and make main yield a slot instead of forcing it to beat
+				// stale sketch history before it can prove reuse. Gated off for weighted
+				// caches (costCap > 0), where keeping one large cold item would evict
+				// several main entries to free cost, and once the tuner has loop evidence
+				// or is pinning a loop, where churning main hurts the resident set.
+				evictIn, evictTie = nil, false
+			}
+			if s.evictMain(pool, stats, evictIn, evictTie, defaultMainVictimScan, false) {
 				in, tie = nil, false
 			}
 		case s.overCapacity() && !p.probation.empty():

@@ -918,6 +918,33 @@ func TestDeleteOrdersAfterPendingSet(t *testing.T) {
 	}
 }
 
+// TestSetAsyncAppliesInlineWhenUncontended verifies the opportunistic inline
+// apply: with no competing activity on the owning shard, SetAsync commits the
+// write before returning, so the key is visible without an explicit Sync.
+func TestSetAsyncAppliesInlineWhenUncontended(t *testing.T) {
+	cache := newTestCache[int, int](t, Config{
+		MaxSize:         1024,
+		ShardCount:      8,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  LRU,
+		WriteBufferSize: 16,
+		WriteBatchSize:  8,
+	})
+	defer cache.Close()
+
+	for i := 0; i < 32; i++ {
+		if err := cache.SetAsync(i, i*7, time.Hour); err != nil {
+			t.Fatalf("SetAsync(%d): %v", i, err)
+		}
+		// No Sync between the write and the read: an uncontended SetAsync must
+		// have applied inline for the key to be visible here.
+		if v, ok := cache.Get(i); !ok || v != i*7 {
+			t.Fatalf("key %d not visible after uncontended SetAsync; got %d ok=%v", i, v, ok)
+		}
+	}
+}
+
 // Basic benchmarks are in cache_bench_test.go
 
 type User struct {

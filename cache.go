@@ -252,8 +252,10 @@ func (c *Cache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	return c.setAndWait(key, value, ttl, nil)
 }
 
-// SetAsync accepts a queued insert/update command for key with TTL. A nil error
-// means the command was accepted; call Sync for committed visibility.
+// SetAsync accepts an insert/update command for key with TTL. A nil error means
+// the command was accepted. When the owning shard is uncontended the write is
+// applied inline before returning (immediate visibility, no async handoff);
+// otherwise it is queued without blocking and Sync gives committed visibility.
 func (c *Cache[K, V]) SetAsync(key K, value V, ttl time.Duration) error {
 	return c.set(key, value, ttl, nil)
 }
@@ -562,7 +564,12 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		return getResult[V]{}
 	}
 
-	if shard.sieve != nil && !shard.belowSieveWarmup() {
+	// During warmup admission is unconditional, so the frequency sketch is never
+	// consulted; skip both the visited-bit update and read sampling so a working
+	// set that fits under capacity (and therefore never leaves warmup) pays none
+	// of the sketch-feeding cost on its read hot path.
+	warmup := shard.belowSieveWarmup()
+	if shard.sieve != nil && !warmup {
 		shard.sieve.recordReadHit(item)
 	}
 
@@ -604,7 +611,9 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 	}
 	// feed the read into the frequency sketch via the per-shard read buffer so
 	// TinyLFU admission reflects read popularity, not just write traffic.
-	shard.sampleRead(kh, true)
+	if !warmup {
+		shard.sampleRead(kh, true)
+	}
 	return res
 }
 
@@ -636,14 +645,17 @@ func (c *Cache[K, V]) getSieveContended(key K, kh uint64, shard *shard[K, V]) ge
 		}
 	}
 
-	if shard.sieve != nil && !shard.belowSieveWarmup() {
+	warmup := shard.belowSieveWarmup()
+	if shard.sieve != nil && !warmup {
 		shard.sieve.recordReadHit(item)
 	}
 
 	if c.config.StatsEnabled {
 		atomic.AddInt64(&shard.hits, 1)
 	}
-	shard.sampleRead(kh, false)
+	if !warmup {
+		shard.sampleRead(kh, false)
+	}
 	return getResult[V]{
 		value:      item.value,
 		expireTime: item.expireTime,

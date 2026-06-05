@@ -71,7 +71,52 @@ func (c *Cache[K, V]) set(key K, value V, ttl time.Duration, callback func(K, V)
 	if err != nil {
 		return err
 	}
+	if c.tryApplyInline(s, &cmd) {
+		return nil
+	}
 	return c.enqueue(s, cmd)
+}
+
+// tryApplyInline opportunistically applies a Set synchronously when the shard is
+// completely uncontended: the drain token is free, the write queue is fully
+// quiescent (no slot reserved or published), and the shard lock is immediately
+// available. Applying inline gives immediate read-after-write visibility and skips
+// the async handoff, which otherwise lets a re-read miss the not-yet-applied write
+// and enqueue a redundant Set.
+//
+// Holding the drain token makes this the sole shard consumer, and quiescent rules
+// out any accepted-but-unpublished write, so applying ahead of the queue cannot
+// reorder against a queued write. It mirrors the worker's drain order - buffered
+// reads are replayed into the frequency sketch before admission - so an inline Set
+// makes the same SieveTinyLFU decision a queued one would.
+//
+// Every acquisition is non-blocking (TryLock), so this never delays SetAsync: any
+// contention - a busy drain worker, queued or in-flight writes, or an active
+// reader/writer on the shard - makes it return false and leave the write for the
+// async queue, preserving both the enqueue-only SetAsync contract and the batching
+// that amortizes eviction on write-heavy shards.
+func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bool {
+	if !s.drainMu.TryLock() {
+		return false
+	}
+	if c.isClosed() || !s.queue.quiescent() || !s.mu.TryLock() {
+		s.drainMu.Unlock()
+		return false
+	}
+
+	// Replay buffered reads into the sketch before admission so the inline apply
+	// makes the same SieveTinyLFU decision a queued write would. This runs only
+	// after winning s.mu, so a SetAsync that cannot commit inline bails to the
+	// queue cheaply; the worker drains read samples before applying it anyway.
+	s.drainReadSamples()
+	committed := c.applySet(s, cmd)
+	s.mu.Unlock()
+	s.drainMu.Unlock()
+
+	if task, ok := cmd.newCallbackTask(committed); ok {
+		c.scheduleCallback(task)
+	}
+	return true
 }
 
 func (c *Cache[K, V]) setAndWait(key K, value V, ttl time.Duration, callback func(K, V)) error {

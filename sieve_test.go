@@ -252,6 +252,62 @@ func TestSieveTinyLFURecordReadHitMarksVisitedOnly(t *testing.T) {
 	}
 }
 
+func TestSieveProbationWindowKeepsNewResidentWhenBelowTarget(t *testing.T) {
+	const capacity = 8
+	cfg := Config{
+		MaxSize:         capacity,
+		ShardCount:      1,
+		EvictionPolicy:  SieveTinyLFU,
+		DefaultTTL:      NoExpiration,
+		CleanupInterval: 0,
+		ProbationRatio:  50,
+		StatsEnabled:    true,
+	}
+	c, err := New[uint64, uint64](cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	for k := uint64(0); k < capacity; k++ {
+		if err := c.Set(k, k, NoExpiration); err != nil {
+			t.Fatalf("Set warm key %d: %v", k, err)
+		}
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatalf("Sync warm: %v", err)
+	}
+
+	// Make resident main entries look strong to TinyLFU. A new item should still
+	// get room in probation while that recency window is under target.
+	for i := 0; i < 32; i++ {
+		for k := uint64(0); k < capacity; k++ {
+			if _, ok := c.Get(k); !ok {
+				t.Fatalf("warm key %d disappeared before admission test", k)
+			}
+		}
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatalf("Sync frequency samples: %v", err)
+	}
+
+	if err := c.Set(100, 100, NoExpiration); err != nil {
+		t.Fatalf("Set new key: %v", err)
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatalf("Sync new key: %v", err)
+	}
+	if _, ok := c.Get(100); !ok {
+		t.Fatal("new probation resident was rejected before the probation window filled")
+	}
+	if rejects := c.PolicyStats().Rejects; rejects != 0 {
+		t.Fatalf("policy rejects=%d, want 0 while probation has room", rejects)
+	}
+	if size := c.Size(); size != capacity {
+		t.Fatalf("size=%d, want capped size %d", size, capacity)
+	}
+}
+
 func TestSieveTinyLFUAdaptiveResetCycleClearsCounters(t *testing.T) {
 	a := newSieveTinyLFU[int, int](100, 10, 100)
 
