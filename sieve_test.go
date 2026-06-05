@@ -6,8 +6,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/unkn0wn-root/kioshun/internal/keyhash"
 )
 
 func TestSieveQueuePushPopRemove(t *testing.T) {
@@ -50,56 +48,80 @@ func TestSieveQueuePushPopRemove(t *testing.T) {
 
 func TestGhostQueueAddRemoveOverwrite(t *testing.T) {
 	g := newGhostQueue(3)
-	g.add(1, 11)
-	g.add(2, 22)
-	if !g.contains(1, 11) || !g.contains(2, 22) {
+	g.add(1)
+	g.add(2)
+	if !g.contains(1) || !g.contains(2) {
 		t.Fatal("ghost queue missing inserted fingerprints")
 	}
 
-	if g.contains(1, 99) {
-		t.Fatal("hash match with wrong tag should not hit ghost queue")
-	}
-
-	if !g.remove(1, 11) {
+	if !g.remove(1) {
 		t.Fatal("delete returned false for present ghost fingerprint")
 	}
-	if g.contains(1, 11) {
+	if g.contains(1) {
 		t.Fatal("deleted fingerprint still present")
 	}
 
-	g.add(3, 33)
-	g.add(4, 44)
-	g.add(5, 55)
-	if g.contains(2, 22) {
+	g.add(3)
+	g.add(4)
+	g.add(5)
+	if g.contains(2) {
 		t.Fatal("oldest fingerprint should be overwritten")
 	}
-	for _, x := range []ghostEntry{{3, 33}, {4, 44}, {5, 55}} {
-		if !g.contains(x.hash, x.tag) {
-			t.Fatalf("fingerprint %v missing after overwrite", x)
+	for _, h := range []uint64{3, 4, 5} {
+		if !g.contains(h) {
+			t.Fatalf("fingerprint %d missing after overwrite", h)
 		}
 	}
 
 	g.clear()
-	if len(g.index) != 0 || g.contains(3, 33) || g.contains(4, 44) || g.contains(5, 55) {
+	if len(g.index) != 0 || g.contains(3) || g.contains(4) || g.contains(5) {
 		t.Fatal("clear did not reset ghost queue")
+	}
+}
+
+// hash 0 is a real fingerprint (empty-string and integer-zero keys both hash to
+// 0), so it must be tracked distinctly from the empty ring-slot sentinel.
+func TestGhostQueueZeroHashFingerprint(t *testing.T) {
+	g := newGhostQueue(2)
+	g.add(0)
+	if !g.contains(0) {
+		t.Fatal("zero-hash fingerprint not tracked")
+	}
+
+	g.add(9)
+	if !g.contains(0) || !g.contains(9) {
+		t.Fatal("zero-hash fingerprint lost after a second add")
+	}
+
+	// ring size 2: adding a third entry evicts the oldest (the zero hash).
+	g.add(8)
+	if g.contains(0) {
+		t.Fatal("oldest (zero-hash) fingerprint should have been evicted")
+	}
+	if !g.contains(9) || !g.contains(8) {
+		t.Fatal("recent fingerprints missing after eviction")
+	}
+
+	if !g.remove(8) || g.contains(8) {
+		t.Fatal("removing fingerprint adjacent to a cleared slot failed")
 	}
 }
 
 func TestGhostQueueDeleteMissingReturnsFalse(t *testing.T) {
 	g := newGhostQueue(2)
-	g.add(7, 77)
-	if g.remove(8, 88) {
+	g.add(7)
+	if g.remove(8) {
 		t.Fatal("delete returned true for missing ghost fingerprint")
 	}
-	if !g.contains(7, 77) {
+	if !g.contains(7) {
 		t.Fatal("missing delete removed existing ghost fingerprint")
 	}
 }
 
 func TestGhostQueueDuplicateDoesNotGrow(t *testing.T) {
 	g := newGhostQueue(2)
-	g.add(7, 77)
-	g.add(7, 77)
+	g.add(7)
+	g.add(7)
 	if len(g.index) != 1 {
 		t.Fatalf("n=%d, want 1", len(g.index))
 	}
@@ -168,14 +190,14 @@ func TestDoorkeeperFiltersFirstFrequencyIncrement(t *testing.T) {
 
 func TestNewSieveTinyLFUDefaults(t *testing.T) {
 	a := newSieveTinyLFU[int, int](100, 0, 0)
-	if a.probationCap != 10 || a.mainCap != 90 || a.ghostCap != 90 {
-		t.Fatalf("caps pc=%d mc=%d gc=%d, want 10/90/90", a.probationCap, a.mainCap, a.ghostCap)
+	if a.probationCap != 1 || a.mainCap != 99 || a.ghostCap != 99 {
+		t.Fatalf("caps pc=%d mc=%d gc=%d, want 1/99/99", a.probationCap, a.mainCap, a.ghostCap)
 	}
 	if a.probation.size != 0 || a.main.size != 0 || !a.probation.empty() || !a.main.empty() {
 		t.Fatal("new admission queues should be empty")
 	}
-	if len(a.ghost.entries) != 90 {
-		t.Fatalf("ghost cap=%d, want 90", len(a.ghost.entries))
+	if len(a.ghost.entries) != 99 {
+		t.Fatalf("ghost cap=%d, want 99", len(a.ghost.entries))
 	}
 	if len(a.sketch.counters) == 0 {
 		t.Fatal("sketch was not initialized")
@@ -258,7 +280,7 @@ func TestSieveTinyLFUAdaptiveShrinkUsesMainSurvivals(t *testing.T) {
 	a.controller.probationEvictions = 3
 	a.controller.promotions = 1
 	a.controller.mainSurvivals = 2
-	a.controller.observationsInCycle = uint64(a.capacity*10 - 1)
+	a.controller.observationsInCycle = uint64(a.capacity*adaptiveCycleMultiplier - 1)
 
 	a.tick()
 
@@ -285,12 +307,51 @@ func TestSieveTinyLFUAdaptiveShrinkBlockedWhenMainCold(t *testing.T) {
 	a.controller.probationEvictions = 3
 	a.controller.promotions = 1
 	a.controller.mainSurvivals = 1
-	a.controller.observationsInCycle = uint64(a.capacity*10 - 1)
+	a.controller.observationsInCycle = uint64(a.capacity*adaptiveCycleMultiplier - 1)
 
 	a.tick()
 
 	if a.probationCap != start {
 		t.Fatalf("probationCap=%d, want unchanged %d when main is cold", a.probationCap, start)
+	}
+}
+
+func TestSieveTinyLFUAdaptiveGrowBlockedByResurrection(t *testing.T) {
+	a := newSieveTinyLFU[int, int](100, 10, 100)
+	start := a.probationCap
+
+	// B1 ghost hits alone would grow probation, but B2 resurrection means main
+	// victims are still needed. The fallback grow path must honor the loop guard.
+	a.controller.ghostHits = 10
+	a.controller.probationEvictions = 4
+	a.controller.cycleMainEvicts = 10
+	a.controller.cycleB2Hits = 5
+	a.controller.observationsInCycle = uint64(a.capacity*adaptiveCycleMultiplier - 1)
+
+	a.tick()
+
+	if a.probationCap != start {
+		t.Fatalf("probationCap=%d, want unchanged %d when main victims resurrect", a.probationCap, start)
+	}
+}
+
+func TestSieveTinyLFUAdaptiveWindowFloor(t *testing.T) {
+	a := newSieveTinyLFU[int, int](2000, 1, 100)
+	start := a.probationCap
+
+	a.controller.ghostHits = 10
+	a.controller.cycleMainEvicts = 10
+	a.controller.observationsInCycle = uint64(a.capacity*adaptiveCycleMultiplier - 1)
+
+	a.tick()
+	if a.probationCap != start {
+		t.Fatalf("probationCap=%d, want unchanged before min cycle %d", a.probationCap, start)
+	}
+
+	a.controller.observationsInCycle = adaptiveMinCycle - 1
+	a.tick()
+	if a.probationCap <= start {
+		t.Fatalf("probationCap=%d, want growth after min cycle from %d", a.probationCap, start)
 	}
 }
 
@@ -342,14 +403,12 @@ func TestSieveTinyLFUExpiredFastPathDoesNotCountMainSurvival(t *testing.T) {
 		value:      1,
 		expireTime: now - int64(time.Second),
 		hash:       expiredHash,
-		tag:        keyhash.TagFromHash(expiredHash),
 	}
 	other := &cacheItem[int, int]{
 		key:        2,
 		value:      2,
 		expireTime: now + int64(time.Hour),
 		hash:       otherHash,
-		tag:        keyhash.TagFromHash(otherHash),
 	}
 
 	shard.mu.Lock()
@@ -485,8 +544,7 @@ func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
 
 	s := c.shards[0]
 	h := c.hasher.Sum(1)
-	tag := c.hasher.Tag(1)
-	if !s.sieve.ghost.contains(h, tag) {
+	if !s.sieve.ghost.contains(h) {
 		t.Fatal("expected cold eviction to leave a ghost entry")
 	}
 
@@ -515,7 +573,7 @@ func TestSieveTinyLFUGhostHitDoesNotResizeImmediately(t *testing.T) {
 	a := newSieveTinyLFU[int, int](100, 10, 100)
 	start := a.probationCap
 	it := &cacheItem[int, int]{hash: 1}
-	a.ghost.add(it.hash, 0)
+	a.ghost.add(it.hash)
 
 	a.insert(it, true)
 

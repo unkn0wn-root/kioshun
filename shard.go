@@ -6,9 +6,10 @@ import (
 )
 
 type shard[K comparable, V any] struct {
-	mu   sync.RWMutex
-	data map[K]*cacheItem[K, V]
-	cap  int64 // resident item limit for this shard; 0 => unlimited
+	mu      sync.RWMutex
+	data    map[K]*cacheItem[K, V]
+	cap     int64 // resident item limit for this shard; 0 => unlimited
+	costCap int64 // same
 
 	queue writeQueue[K, V] // async mutation transport consumed by this shard's worker
 
@@ -16,7 +17,7 @@ type shard[K comparable, V any] struct {
 	// write and read sampling pings it when a stripe fills. Buffered size 1.
 	wake chan struct{}
 
-	// keeps the MPSC queue single-consumer while allowing synchronous
+	// keeps the MPSC queue single consumer while allowing synchronous
 	// callers to help drain their own shard instead of always waiting for the
 	// background worker to run.
 	drainMu    sync.Mutex
@@ -35,6 +36,7 @@ type shard[K comparable, V any] struct {
 	lfuList *lfuList[K, V] // Allocated only for pure LFU policy.
 
 	size        int64 // live items
+	cost        int64 // live item cost
 	hits        int64 // per-shard hits
 	misses      int64 // per-shard misses
 	evictions   int64 // per-shard evictions
@@ -104,6 +106,9 @@ func (s *shard[K, V]) dropItem(
 		s.removePending.Store(true)
 		signal(s.removeWake)
 	}
+	if item.cost != 0 {
+		atomic.AddInt64(&s.cost, -item.cost)
+	}
 	releaseCacheItem(itemPool, item)
 	atomic.AddInt64(&s.size, -1)
 	if statsEnabled && reason == RemovedCapacity {
@@ -133,10 +138,10 @@ func (s *shard[K, V]) ownsItem(item *cacheItem[K, V]) bool {
 	return ok && s.data[key] == item
 }
 
-// belowSieveWarmupLocked reports the initial fill phase for bounded
-// SieveTinyLFU shards. During warmup admission is unconditional so the cache can
-// seed resident state before the frequency sketch starts rejecting candidates.
-func (s *shard[K, V]) belowSieveWarmupLocked() bool {
+// belowSieveWarmup reports the initial fill phase for bounded SieveTinyLFU
+// shards. During warmup admission is unconditional so the cache can seed resident
+// state before the frequency sketch starts rejecting candidates.
+func (s *shard[K, V]) belowSieveWarmup() bool {
 	return s.cap > 0 && s.size*2 < s.cap
 }
 
@@ -146,10 +151,6 @@ func (s *shard[K, V]) belowSieveWarmupLocked() bool {
 // can claim the single consumer token without blocking, bounding inline work to
 // a single stripe; otherwise it wakes the worker. Below that backlog this is
 // just the buffer append.
-//
-// drainInline must be false when the caller holds s.mu: the synchronous write
-// path locks drainMu before s.mu, so draining under s.mu would invert that
-// order and it would also extend an exclusive hold with sketch work. The
 func (s *shard[K, V]) sampleRead(h uint64, drainInline bool) {
 	if s.wake == nil {
 		return
@@ -272,6 +273,9 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool
 				s.sieve.remove(item)
 			default:
 				s.removeFromLRU(item)
+			}
+			if item.cost != 0 {
+				atomic.AddInt64(&s.cost, -item.cost)
 			}
 			releaseCacheItem(itemPool, item)
 			atomic.AddInt64(&s.size, -1)

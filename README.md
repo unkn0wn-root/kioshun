@@ -88,6 +88,7 @@ func main() {
 ```go
 config := kioshun.Config{
     MaxSize:         100000,               // Maximum number of items
+    MaxCost:         0,                    // Optional weighted capacity budget
     ShardCount:      16,                   // Number of shards (0 = auto-detect)
     CleanupInterval: 5 * time.Minute,      // Cleanup frequency
     DefaultTTL:      30 * time.Minute,     // Default expiration time
@@ -109,6 +110,30 @@ if err != nil {
 > Each cache runs one write-worker goroutine per shard (plus a cleanup goroutine when `CleanupInterval > 0`),
 > so `ShardCount` sets the number of background goroutines - default `min(NumCPU*4, 256)`.
 > If you create many caches (e.g. via the cache `Manager`), set `ShardCount` explicitly to bound the total.
+
+### Weighted Capacity
+
+`MaxSize` limits resident entry count. `MaxCost` optionally adds a weighted
+resident budget. Without a custom weigher every entry costs `1`; with
+`WithWeigher`, the cache can enforce byte-like or domain-specific weights.
+
+```go
+config := kioshun.DefaultConfig()
+config.MaxSize = 100000
+config.MaxCost = 256 << 20
+config.CostAdmission = kioshun.CostAdmissionBalanced
+
+c, err := kioshun.New[string, []byte](config, kioshun.WithWeigher(
+    func(_ string, value []byte) int64 {
+        return int64(len(value))
+    },
+))
+```
+
+`CostAdmissionFrequency` preserves TinyLFU frequency admission. For weighted
+SieveTinyLFU caches, `CostAdmissionBalanced` compares frequency divided by
+sqrt(cost), while `CostAdmissionDensity` compares frequency divided by cost.
+Use the balanced mode when request hit ratio and byte pressure both matter.
 
 ## API
 
@@ -148,7 +173,9 @@ type Stats struct {
     Evictions   int64
     Expirations int64
     Size        int64
+    Cost        int64
     Capacity    int64
+    MaxCost     int64
     HitRatio    float64
     Shards      int
 }

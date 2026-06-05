@@ -26,8 +26,7 @@ func signal(ch chan struct{}) {
 	}
 }
 
-// mpscCell is one ring slot. seq sequences ownership between producers and the
-// consumer (Vyukov bounded queue); cmd carries the payload in place.
+// mpscCell is one ring slot. seq sequences ownership between producers and the consumer
 type mpscCell[K comparable, V any] struct {
 	seq atomic.Uint64
 	cmd writeCommand[K, V]

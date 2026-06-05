@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	defaultProbationRatio = 10
+	defaultProbationRatio = 1
 	defaultGhostRatio     = 100
 )
 
@@ -150,7 +150,7 @@ type adaptiveController struct {
 	mainSurvivals       uint64
 	observationsInCycle uint64
 
-	// churn cost for the admission tuner: evictions are residents displaced to
+	// cost for the admission tuner: evictions are residents displaced to
 	// stay in capacity, rejects are admitted candidates dropped again. Their sum
 	// falls when admission keeps a stable working set and rises when it thrashes,
 	// so it is the maintenance path proxy the admission tuner watches.
@@ -215,13 +215,16 @@ const (
 )
 
 const (
-	admissionEntryEvidence = 3.0
-	admissionResurrectHigh = 0.5 // per-cycle resurrection rate that counts as evidence
-	admissionCommitFactor  = 0.9 // trial commits if churn < recency baseline * this
-	admissionRevertFactor  = 1.5 // committed reverts if churn > committed low * this
-	admissionChurnEWMA     = 0.5 // churn baseline smoothing
-	admissionBackoffStart  = 3   // recency cooldown cycles after a reverted trial
-	admissionBackoffMax    = 96  // ceiling on the doubling backoff
+	admissionEntryEvidence  = 1.0
+	admissionResurrectHigh  = 0.5 // per-cycle resurrection rate that counts as evidence
+	admissionCommitFactor   = 0.9 // trial commits if churn < recency baseline * this
+	admissionRevertFactor   = 1.5 // committed reverts if churn > committed low * this
+	admissionChurnEWMA      = 0.5 // churn baseline smoothing
+	admissionBackoffStart   = 3   // recency cooldown cycles after a reverted trial
+	admissionBackoffMax     = 96  // ceiling on the doubling backoff
+	adaptiveCycleMultiplier = 4
+	adaptiveMinCycleCap     = 1024
+	adaptiveMinCycle        = 32768
 )
 
 // admissionTuner self-selects a shard's admissionMode with no configuration. It
@@ -276,14 +279,19 @@ type sieveTinyLFU[K comparable, V any] struct {
 	minProbationCap int64
 	maxProbationCap int64
 	adaptStep       int64
+	costAdmission   CostAdmission
 }
 
 // newSieveTinyLFU builds the per-shard admission state for a bounded shard.
 // Probation is clamped between 1% and 60% of capacity so main has room for
 // protected entries when capacity permits, while the ghost queue is sized as a
 // fraction of main.
-func newSieveTinyLFU[K comparable, V any](c int64, pr, gr uint8) *sieveTinyLFU[K, V] {
-	p := &sieveTinyLFU[K, V]{capacity: c}
+func newSieveTinyLFU[K comparable, V any](c int64, pr, gr uint8, modes ...CostAdmission) *sieveTinyLFU[K, V] {
+	mode := CostAdmissionFrequency
+	if len(modes) > 0 {
+		mode = modes[0]
+	}
+	p := &sieveTinyLFU[K, V]{capacity: c, costAdmission: mode}
 	p.probation.init()
 	p.main.init()
 
@@ -402,13 +410,13 @@ func (p *sieveTinyLFU[K, V]) insert(it *cacheItem[K, V], gh bool) {
 	// A key that was a recent main eviction victim is "resurrecting": the cache
 	// evicted it too soon. The admission tuner counts resurrections to detect a
 	// loop-like workload (see tuneAdmission); placement itself is unchanged.
-	if p.mghost.contains(it.hash, it.tag) {
-		p.mghost.remove(it.hash, it.tag)
+	if p.mghost.contains(it.hash) {
+		p.mghost.remove(it.hash)
 		p.controller.cycleB2Hits++
 	}
 
 	if gh && p.mainCap > 0 {
-		p.ghost.remove(it.hash, it.tag)
+		p.ghost.remove(it.hash)
 		p.controller.ghostHits++
 		p.stats.GhostHits++
 		p.insertMain(it)
@@ -492,14 +500,14 @@ func (p *sieveTinyLFU[K, V]) promote(it *cacheItem[K, V]) {
 // possible ghost hit readmission.
 func (s *shard[K, V]) dropProbationVictim(it *cacheItem[K, V], pool *sync.Pool, stats bool) bool {
 	p := s.sieve
-	h, tag := it.hash, it.tag
+	h := it.hash
 	if !s.dropSieveItem(it, pool, stats, RemovedCapacity) {
 		return false
 	}
 	p.controller.probationEvictions++
 	p.controller.cycleEvictions++
 	p.stats.ProbationEvictions++
-	p.ghost.add(h, tag)
+	p.ghost.add(h)
 	return true
 }
 
@@ -558,11 +566,11 @@ func (s *shard[K, V]) evictMain(
 		return s.dropSieveItem(in, pool, stats, RemovedRejected)
 	}
 
-	vh, vtag := v.hash, v.tag // capture before drop zeroes the item for B2
+	vh := v.hash // capture before drop zeroes the item for B2
 	if s.dropSieveItem(v, pool, stats, RemovedCapacity) {
 		p.controller.cycleEvictions++
 		p.controller.cycleMainEvicts++
-		p.mghost.add(vh, vtag) // record for resurrection detection
+		p.mghost.add(vh) // record for resurrection detection
 		p.stats.MainEvictions++
 		return true
 	}
@@ -618,15 +626,27 @@ func (s *shard[K, V]) enforceSieveCapacity(
 	if (p.main.size > p.mainCap || s.overCapacity()) && !p.main.empty() {
 		s.evictMain(pool, stats, in, tie, defaultMainVictimScan, true)
 	}
-	if s.overCapacity() {
-		s.forceDropSieveItem(pool, stats)
+	for s.overCapacity() && len(s.data) > 0 {
+		if !s.forceDropSieveItem(pool, stats) {
+			return
+		}
 	}
 }
 
 func (s *shard[K, V]) overCapacity() bool {
 	// warm fill to the shard cap; enforce probation/main pressure only after a
 	// new admission would exceed resident capacity.
-	return atomic.LoadInt64(&s.size) > s.cap
+	if s.cap > 0 && atomic.LoadInt64(&s.size) > s.cap {
+		return true
+	}
+	return s.costCap > 0 && atomic.LoadInt64(&s.cost) > s.costCap
+}
+
+func (s *shard[K, V]) wouldOverCapacity(addCost int64) bool {
+	if s.cap > 0 && atomic.LoadInt64(&s.size) >= s.cap {
+		return true
+	}
+	return s.costCap > 0 && atomic.LoadInt64(&s.cost)+addCost > s.costCap
 }
 
 // mainCandidate normalizes a traversal cursor to a live main node: it falls back
@@ -680,12 +700,12 @@ func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K
 	}
 
 	if force {
-		it, ok := p.mainCandidate(it)
+		cit, ok := p.mainCandidate(it)
 		if !ok {
 			return nil
 		}
-		p.hand = p.previousMainItem(it)
-		return it
+		p.hand = p.previousMainItem(cit)
+		return cit
 	}
 
 	p.hand = it
@@ -717,7 +737,7 @@ func (p *sieveTinyLFU[K, V]) previousMainItem(it *cacheItem[K, V]) *cacheItem[K,
 func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool {
 	if p.tuner.mode == admitFrequency {
 		// plain TinyLFU: incumbent wins ties, pinning a stable set for loops.
-		return p.estimate(in.hash) > p.estimate(v.hash)
+		return p.compareAdmissionScore(in, v) > 0
 	}
 
 	// ghost hit or probation promotion has already proven short-term reuse.
@@ -727,18 +747,92 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 		return true
 	}
 
-	cf := p.estimate(in.hash)
-	vf := p.estimate(v.hash)
-	if cf > vf {
+	cmp := p.compareAdmissionScore(in, v)
+	if cmp > 0 {
 		return true
 	}
-	if cf < vf {
-		if tie && cf+1 >= vf {
+	if cmp < 0 {
+		if tie && p.closeAdmissionScore(in, v) {
 			return true
 		}
 		return false
 	}
 	return tie || (!sieveItemVisited(v) && v.reuse == 0)
+}
+
+// compareAdmissionScore orders candidate against victim. Frequency mode is a
+// plain frequency comparison and pays no cost overhead. Cost-aware modes weight
+// each frequency by the other item's cost denominator, cross-multiplied to
+// compare the ratios frequency/cost without dividing.
+func (p *sieveTinyLFU[K, V]) compareAdmissionScore(in, v *cacheItem[K, V]) int {
+	cf := uint64(p.estimate(in.hash))
+	vf := uint64(p.estimate(v.hash))
+	if p.costAdmission == CostAdmissionFrequency {
+		return compareUint64(cf, vf)
+	}
+	return compareUint64(mulScore(cf, p.costDenom(v)), mulScore(vf, p.costDenom(in)))
+}
+
+// closeAdmissionScore reports whether the candidate is within one frequency
+// step of the victim, the tie-break used when SIEVE has already proven reuse.
+func (p *sieveTinyLFU[K, V]) closeAdmissionScore(in, v *cacheItem[K, V]) bool {
+	cf := uint64(p.estimate(in.hash))
+	vf := uint64(p.estimate(v.hash))
+	if p.costAdmission == CostAdmissionFrequency {
+		return cf+1 >= vf
+	}
+	return mulScore(cf+1, p.costDenom(v)) >= mulScore(vf, p.costDenom(in))
+}
+
+// costDenom is the admission denominator for an item under a cost-aware mode.
+// It is only reached when costAdmission is not Frequency. Density uses the
+// clamped cost directly; Balanced takes its integer square root and is the only
+// mode that pays a per-comparison square root.
+func (p *sieveTinyLFU[K, V]) costDenom(it *cacheItem[K, V]) uint64 {
+	if p.costAdmission == CostAdmissionBalanced {
+		return isqrt64(scoreCost(it.cost))
+	}
+	return scoreCost(it.cost)
+}
+
+// scoreCost clamps a raw cost to a positive admission weight so a zero- or
+// unit-cost item never zeroes the cross-multiplied comparison.
+func scoreCost(cost int64) uint64 {
+	if cost <= 1 {
+		return 1
+	}
+	return uint64(cost)
+}
+
+func compareUint64(a, b uint64) int {
+	switch {
+	case a > b:
+		return 1
+	case a < b:
+		return -1
+	default:
+		return 0
+	}
+}
+
+func mulScore(a, b uint64) uint64 {
+	if a != 0 && b > ^uint64(0)/a {
+		return ^uint64(0)
+	}
+	return a * b
+}
+
+func isqrt64(n uint64) uint64 {
+	if n <= 1 {
+		return 1
+	}
+	x := n
+	y := (x + 1) >> 1
+	for y < x {
+		x = y
+		y = (x + n/x) >> 1
+	}
+	return x
 }
 
 // tick advances the self-tuning controllers once per window of observations. The
@@ -747,7 +841,10 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 // so they run together before the cycle resets.
 func (p *sieveTinyLFU[K, V]) tick() {
 	p.controller.observationsInCycle++
-	win := uint64(p.capacity * 10)
+	win := uint64(p.capacity * adaptiveCycleMultiplier)
+	if p.capacity >= adaptiveMinCycleCap {
+		win = max(win, uint64(adaptiveMinCycle))
+	}
 	if win == 0 || p.controller.observationsInCycle < win {
 		return
 	}
@@ -775,13 +872,14 @@ func (p *sieveTinyLFU[K, V]) tick() {
 // frequency - on a small probation.
 //
 // Otherwise it falls back to the original recency heuristic: grow modestly when
-// B1 ghost hits dominate probation evictions (probation too small, the loop grow
-// path included), shrink when probation churns far more than it promotes while
-// main keeps earning its keep (probation too large for a stationary workload).
+// B1 ghost hits dominate probation evictions and the dual-ghost signal says
+// main victims are not resurrecting, shrink when probation churns far more than
+// it promotes while main keeps earning its keep (probation too large for a
+// stationary workload).
 func (p *sieveTinyLFU[K, V]) adaptSize() {
 	c := &p.controller
 	resurrect := c.resurrectionRate()
-	// A cyclic ("loop") workload is identified by the admission tuner accumulating
+	// cyclic ("loop") workload is identified by the admission tuner accumulating
 	// resurrection evidence (or already committed to frequency); while that
 	// signature is present probation stays small so the pinned set holds.
 	loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
@@ -789,13 +887,13 @@ func (p *sieveTinyLFU[K, V]) adaptSize() {
 	switch {
 	case !loopish && c.cycleMainEvicts > c.promotions &&
 		resurrect < probationResurrectLow && c.ghostHits > c.promotions:
-		// Shifting hot set: grow the recency window quickly so newly hot entries
+		// shifting hot set: grow the recency window quickly so newly hot entries
 		// survive to their reuse instead of being evicted from a tiny probation.
 		if p.probationCap < p.maxProbationCap {
 			step := max(int64(1), p.capacity*probationGrowStepPct/100)
 			p.setProbationCap(p.probationCap + step)
 		}
-	case c.ghostHits > c.probationEvictions/4:
+	case !loopish && resurrect < probationResurrectLow && c.ghostHits > c.probationEvictions/4:
 		if p.probationCap < p.maxProbationCap {
 			p.setProbationCap(p.probationCap + p.adaptStep)
 		}
@@ -827,10 +925,10 @@ func (p *sieveTinyLFU[K, V]) tuneAdmission() {
 			t.cooldown--
 			return
 		}
-		// Accumulate resurrection evidence weighted by strength: a pure loop
-		// (resurrection ~1.0) reaches the threshold in ~3 cycles; a workload whose
-		// victims are abandoned (shifting/bursty, resurrection ~0) never does, so it
-		// never trials frequency and never regresses.
+		// accumulate resurrection evidence weighted by strength: a pure loop
+		// (resurrection ~1.0) reaches the threshold in one strong cycle; a workload
+		// whose victims are abandoned (shifting/bursty, resurrection ~0) never does,
+		// so it never trials frequency and never regresses.
 		if resurrect >= admissionResurrectHigh {
 			t.evidence += resurrect
 		} else {
@@ -852,7 +950,7 @@ func (p *sieveTinyLFU[K, V]) tuneAdmission() {
 		}
 
 	case tunerFrequency:
-		// Escape when churn climbs above the pinned low reference (the workload
+		// escape when climbs above the pinned low reference (the workload
 		// shifted out from under the pinned set) or back toward the recency
 		// baseline (frequency stopped helping).
 		if churn > t.lowChurn*admissionRevertFactor || churn > t.baseChurn*admissionCommitFactor {

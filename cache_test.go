@@ -464,6 +464,25 @@ func TestNewValidatesConfig(t *testing.T) {
 			value:  -1,
 			reason: "must be >= 0",
 		},
+		{
+			name: "sieve cost budget without max size",
+			config: Config{
+				EvictionPolicy: SieveTinyLFU,
+				MaxCost:        5,
+			},
+			field:  "MaxSize",
+			value:  int64(0),
+			reason: "must be > 0 for SieveTinyLFU when MaxCost is set",
+		},
+		{
+			name: "default policy cost budget without max size",
+			config: Config{
+				MaxCost: 5, // EvictionPolicy unset resolves to SieveTinyLFU
+			},
+			field:  "MaxSize",
+			value:  int64(0),
+			reason: "must be > 0 for SieveTinyLFU when MaxCost is set",
+		},
 	}
 
 	for _, tt := range tests {
@@ -504,6 +523,61 @@ func TestManagerRegisterValidatesConfig(t *testing.T) {
 	}
 	if configErr.Field != "MaxSize" {
 		t.Fatalf("ConfigError.Field = %q, want MaxSize", configErr.Field)
+	}
+}
+
+func TestRegisterCacheAppliesTypedOptions(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	cfg := DefaultConfig()
+	cfg.MaxSize = 100
+	cfg.MaxCost = 10
+	cfg.ShardCount = 1
+	cfg.CleanupInterval = 0
+	cfg.EvictionPolicy = LRU
+
+	err := RegisterCache[string, []byte](manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
+		return int64(len(value))
+	}))
+	if err != nil {
+		t.Fatalf("RegisterCache() error = %v", err)
+	}
+
+	cache, err := GetCache[string, []byte](manager, "weighted")
+	if err != nil {
+		t.Fatalf("GetCache() error = %v", err)
+	}
+	if err := cache.Set("small", []byte("1234"), NoExpiration); err != nil {
+		t.Fatalf("Set small error = %v", err)
+	}
+	if got := cache.Cost(); got != 4 {
+		t.Fatalf("Cost() = %d, want weighted cost 4", got)
+	}
+	if err := cache.Set("large", make([]byte, 11), NoExpiration); !errors.Is(err, ErrItemTooLarge) {
+		t.Fatalf("Set large error = %v, want ErrItemTooLarge", err)
+	}
+}
+
+func TestRegisterCacheTypeMismatchDoesNotCreateInstance(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	cfg := DefaultConfig()
+	cfg.CleanupInterval = 0
+	if err := RegisterCache[int, int](manager, "typed", cfg); err != nil {
+		t.Fatalf("RegisterCache() error = %v", err)
+	}
+
+	if _, err := GetCache[string, int](manager, "typed"); !errors.Is(err, ErrTypeMismatch) {
+		t.Fatalf("GetCache() mismatch error = %v, want ErrTypeMismatch", err)
+	}
+	if stats := manager.Stats(); len(stats) != 0 {
+		t.Fatalf("type mismatch created a cache instance; stats=%v", stats)
+	}
+
+	if _, err := GetCache[int, int](manager, "typed"); err != nil {
+		t.Fatalf("GetCache() with registered type error = %v", err)
 	}
 }
 
@@ -573,6 +647,38 @@ func TestManagerCloseAllPreservesConfigs(t *testing.T) {
 	}
 }
 
+func TestManagerCloseAllPreservesTypedRegistration(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	cfg := DefaultConfig()
+	cfg.MaxSize = 100
+	cfg.MaxCost = 5
+	cfg.ShardCount = 1
+	cfg.CleanupInterval = 0
+	cfg.EvictionPolicy = LRU
+
+	if err := RegisterCache[string, []byte](manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
+		return int64(len(value))
+	})); err != nil {
+		t.Fatalf("RegisterCache() error = %v", err)
+	}
+	if _, err := GetCache[string, []byte](manager, "weighted"); err != nil {
+		t.Fatalf("GetCache() error = %v", err)
+	}
+	if err := manager.CloseAll(); err != nil {
+		t.Fatalf("CloseAll() error = %v", err)
+	}
+
+	cache, err := GetCache[string, []byte](manager, "weighted")
+	if err != nil {
+		t.Fatalf("GetCache() after CloseAll error = %v", err)
+	}
+	if err := cache.Set("large", make([]byte, 6), NoExpiration); !errors.Is(err, ErrItemTooLarge) {
+		t.Fatalf("Set large error = %v, want ErrItemTooLarge after CloseAll rebuild", err)
+	}
+}
+
 func TestGetCacheWithConfig(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(func() { manager.CloseAll() })
@@ -608,6 +714,34 @@ func TestGetCacheWithConfig(t *testing.T) {
 	// Type mismatch is reported, mirroring GetCache.
 	if _, err := GetCacheWithConfig[string, string](manager, "c", cfg); !errors.Is(err, ErrTypeMismatch) {
 		t.Fatalf("GetCacheWithConfig() type mismatch error = %v, want ErrTypeMismatch", err)
+	}
+}
+
+func TestGetCacheWithConfigAppliesTypedOptions(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	cfg := DefaultConfig()
+	cfg.MaxSize = 100
+	cfg.MaxCost = 8
+	cfg.ShardCount = 1
+	cfg.CleanupInterval = 0
+	cfg.EvictionPolicy = LRU
+
+	cache, err := GetCacheWithConfig[string, []byte](manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
+		return int64(len(value))
+	}))
+	if err != nil {
+		t.Fatalf("GetCacheWithConfig() error = %v", err)
+	}
+	if err := cache.Set("small", []byte("12345"), NoExpiration); err != nil {
+		t.Fatalf("Set small error = %v", err)
+	}
+	if got := cache.Cost(); got != 5 {
+		t.Fatalf("Cost() = %d, want weighted cost 5", got)
+	}
+	if err := cache.Set("large", make([]byte, 9), NoExpiration); !errors.Is(err, ErrItemTooLarge) {
+		t.Fatalf("Set large error = %v, want ErrItemTooLarge", err)
 	}
 }
 

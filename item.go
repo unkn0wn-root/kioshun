@@ -10,12 +10,12 @@ type cacheItem[K comparable, V any] struct {
 	expireTime int64 // absolute ns; 0 => no expiration
 	lastAccess int64 // last touch time (ns) for policies that use it
 	lfuFreq    int64 // exact LFU counter
+	cost       int64 // weigher-reported capacity cost;
 	prev       *cacheItem[K, V]
 	next       *cacheItem[K, V]
 	sieveQ     *sieveQueue[K, V]
 	key        K // original key for deletions
 	hash       uint64
-	tag        uint16
 	queue      sieveQueueID
 	reuse      uint8
 	visited    uint32

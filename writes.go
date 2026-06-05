@@ -3,8 +3,6 @@ package kioshun
 import (
 	"sync/atomic"
 	"time"
-
-	"github.com/unkn0wn-root/kioshun/internal/keyhash"
 )
 
 type writeOp uint8
@@ -27,7 +25,7 @@ type writeCommand[K comparable, V any] struct {
 	hash       uint64
 	expireTime int64
 	now        int64
-	tag        uint16
+	cost       int64
 	op         writeOp
 	result     chan struct{}
 	extra      *writeExtra[K, V]
@@ -69,16 +67,22 @@ func (cmd *writeCommand[K, V]) newCallbackTask(committed bool) (callbackTask[K, 
 }
 
 func (c *Cache[K, V]) set(key K, value V, ttl time.Duration, callback func(K, V)) error {
-	s, cmd := c.setCommand(key, value, ttl, callback)
+	s, cmd, err := c.setCommand(key, value, ttl, callback)
+	if err != nil {
+		return err
+	}
 	return c.enqueue(s, cmd)
 }
 
 func (c *Cache[K, V]) setAndWait(key K, value V, ttl time.Duration, callback func(K, V)) error {
-	s, cmd := c.setCommand(key, value, ttl, callback)
+	s, cmd, err := c.setCommand(key, value, ttl, callback)
+	if err != nil {
+		return err
+	}
 	return c.applySetSync(s, cmd)
 }
 
-func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback func(K, V)) (*shard[K, V], writeCommand[K, V]) {
+func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback func(K, V)) (*shard[K, V], writeCommand[K, V], error) {
 	if ttl == DefaultExpiration {
 		ttl = c.config.DefaultTTL
 	}
@@ -90,19 +94,44 @@ func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback fun
 	}
 
 	kh := c.hasher.Sum(key)
+	cost, err := c.itemCost(key, value)
+	if err != nil {
+		return nil, writeCommand[K, V]{}, err
+	}
+	shard := c.shardByHash(kh)
+	if shard.costCap > 0 && cost > shard.costCap {
+		return nil, writeCommand[K, V]{}, ErrItemTooLarge
+	}
 	cmd := writeCommand[K, V]{
 		op:         writeSet,
 		key:        key,
 		value:      value,
 		hash:       kh,
-		tag:        keyhash.TagFromHash(kh),
 		now:        now,
 		expireTime: expireTime,
+		cost:       cost,
 	}
 	if callback != nil {
 		cmd.extra = &writeExtra[K, V]{callback: callback}
 	}
-	return c.shardByHash(kh), cmd
+	return shard, cmd, nil
+}
+
+func (c *Cache[K, V]) itemCost(key K, value V) (int64, error) {
+	if !c.trackCost {
+		return 0, nil
+	}
+	cost := int64(1)
+	if c.weigher != nil {
+		cost = c.weigher(key, value)
+	}
+	if cost < 0 {
+		return 0, ErrInvalidCost
+	}
+	if cost == 0 {
+		return 0, nil
+	}
+	return cost, nil
 }
 
 // enqueue is the async producer boundary: closed caches fail immediately and a
@@ -154,7 +183,7 @@ func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 		return ErrCacheClosed
 	}
 
-	c.drainShardLocked(s)
+	c.drainShardQueue(s)
 
 	s.mu.Lock()
 	apply()
@@ -166,7 +195,7 @@ func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error
 	var task callbackTask[K, V]
 	var hasTask bool
 	err := c.syncMutate(s, func() {
-		committed := c.applySetLocked(s, &cmd)
+		committed := c.applySet(s, &cmd)
 		task, hasTask = cmd.newCallbackTask(committed)
 	})
 	if err != nil {
@@ -181,7 +210,7 @@ func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error
 func (c *Cache[K, V]) deleteSync(s *shard[K, V], key K) (bool, error) {
 	var deleted bool
 	err := c.syncMutate(s, func() {
-		deleted = c.deleteLocked(s, key)
+		deleted = c.deleteKey(s, key)
 	})
 	return deleted, err
 }
@@ -236,7 +265,7 @@ func (c *Cache[K, V]) enqueueBarrierAll(op writeOp) error {
 func (c *Cache[K, V]) clearDirect() {
 	for _, s := range c.shards {
 		s.mu.Lock()
-		c.clearShardLocked(s)
+		c.clearShard(s)
 		s.mu.Unlock()
 	}
 }
@@ -263,17 +292,19 @@ func (c *Cache[K, V]) tryDrainShard(s *shard[K, V]) {
 	if !s.drainMu.TryLock() {
 		return
 	}
-	c.drainShardLocked(s)
+	c.drainShardQueue(s)
 	s.drainMu.Unlock()
 }
 
 func (c *Cache[K, V]) drainShard(s *shard[K, V]) {
 	s.drainMu.Lock()
-	c.drainShardLocked(s)
+	c.drainShardQueue(s)
 	s.drainMu.Unlock()
 }
 
-func (c *Cache[K, V]) drainShardLocked(s *shard[K, V]) {
+// drainShardQueue consumes read samples and queued writes. The caller must hold
+// s.drainMu so there is only one shard consumer.
+func (c *Cache[K, V]) drainShardQueue(s *shard[K, V]) {
 	batch := s.writeBatch
 
 	s.drainReadSamples()
@@ -297,7 +328,7 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 		cmd := &batch[i]
 		switch cmd.op {
 		case writeSet:
-			committed := c.applySetLocked(s, cmd)
+			committed := c.applySet(s, cmd)
 			if t, ok := cmd.newCallbackTask(committed); ok {
 				callbacks = append(callbacks, t)
 			}
@@ -305,7 +336,7 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 				acks = append(acks, ch)
 			}
 		case writeClear:
-			c.clearShardLocked(s)
+			c.clearShard(s)
 			if ch := cmd.resultChan(); ch != nil {
 				acks = append(acks, ch)
 			}
@@ -333,18 +364,24 @@ func (c *Cache[K, V]) newItem(cmd *writeCommand[K, V]) *cacheItem[K, V] {
 	item.lastAccess = cmd.now
 	item.key = cmd.key
 	item.hash = cmd.hash
-	item.tag = cmd.tag
 	item.expireTime = cmd.expireTime
+	item.cost = cmd.cost
 	return item
 }
 
-func (c *Cache[K, V]) applySetLocked(s *shard[K, V], cmd *writeCommand[K, V]) bool {
+// applySet mutates shard contents and policy state. The caller must hold s.mu.
+func (c *Cache[K, V]) applySet(s *shard[K, V], cmd *writeCommand[K, V]) bool {
+	cmdCost := cmd.cost
 	if ex, exists := s.data[cmd.key]; exists {
+		costDelta := cmdCost - ex.cost
 		ex.value = cmd.value
 		ex.lastAccess = cmd.now
 		ex.expireTime = cmd.expireTime
 		ex.hash = cmd.hash
-		ex.tag = cmd.tag
+		if costDelta != 0 {
+			ex.cost = cmdCost
+			atomic.AddInt64(&s.cost, costDelta)
+		}
 
 		switch c.config.EvictionPolicy {
 		case LRU:
@@ -355,15 +392,16 @@ func (c *Cache[K, V]) applySetLocked(s *shard[K, V], cmd *writeCommand[K, V]) bo
 			s.lfuList.add(ex)
 		case SieveTinyLFU:
 			ex.lfuFreq = 0
-			if s.sieve != nil && !s.belowSieveWarmupLocked() {
+			if s.sieve != nil && !s.belowSieveWarmup() {
 				s.sieve.recordUpdate(ex)
 			}
 		}
+		c.enforcePostUpdateCapacity(s)
 		return true
 	}
 
 	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
-		warmup := s.belowSieveWarmupLocked()
+		warmup := s.belowSieveWarmup()
 		if !warmup {
 			s.sieve.recordAccess(cmd.hash)
 		}
@@ -371,10 +409,13 @@ func (c *Cache[K, V]) applySetLocked(s *shard[K, V], cmd *writeCommand[K, V]) bo
 		item := c.newItem(cmd)
 		s.data[cmd.key] = item
 		atomic.AddInt64(&s.size, 1)
+		if item.cost != 0 {
+			atomic.AddInt64(&s.cost, item.cost)
+		}
 
-		ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash, cmd.tag)
+		ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash)
 		s.sieve.insert(item, ghostHit)
-		if !warmup {
+		if !warmup || s.overCapacity() {
 			s.enforceSieveCapacity(&c.itemPool, c.config.StatsEnabled, item, ghostHit)
 		}
 		if _, ok := s.data[cmd.key]; ok {
@@ -386,7 +427,7 @@ func (c *Cache[K, V]) applySetLocked(s *shard[K, V], cmd *writeCommand[K, V]) bo
 	}
 
 	// non-Sieve policies evict before inserting so the new item is not selected.
-	if s.cap > 0 && atomic.LoadInt64(&s.size) >= s.cap {
+	for s.wouldOverCapacity(cmdCost) && len(s.data) > 0 {
 		c.evictor.evict(s, &c.itemPool, c.config.StatsEnabled)
 	}
 
@@ -399,10 +440,29 @@ func (c *Cache[K, V]) applySetLocked(s *shard[K, V], cmd *writeCommand[K, V]) bo
 	}
 
 	atomic.AddInt64(&s.size, 1)
+	if item.cost != 0 {
+		atomic.AddInt64(&s.cost, item.cost)
+	}
 	return true
 }
 
-func (c *Cache[K, V]) deleteLocked(s *shard[K, V], key K) bool {
+// enforcePostUpdateCapacity restores capacity after updating an existing item.
+// The caller must hold s.mu.
+func (c *Cache[K, V]) enforcePostUpdateCapacity(s *shard[K, V]) {
+	if !s.overCapacity() {
+		return
+	}
+	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
+		s.enforceSieveCapacity(&c.itemPool, c.config.StatsEnabled, nil, false)
+		return
+	}
+	for s.overCapacity() && len(s.data) > 0 {
+		c.evictor.evict(s, &c.itemPool, c.config.StatsEnabled)
+	}
+}
+
+// deleteKey removes key from a shard. The caller must hold s.mu.
+func (c *Cache[K, V]) deleteKey(s *shard[K, V], key K) bool {
 	item, exists := s.data[key]
 	if !exists {
 		return false
@@ -411,7 +471,8 @@ func (c *Cache[K, V]) deleteLocked(s *shard[K, V], key K) bool {
 	return true
 }
 
-func (c *Cache[K, V]) clearShardLocked(s *shard[K, V]) {
+// clearShard resets a shard's contents and policy state. The caller must hold s.mu.
+func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 	for _, item := range s.data {
 		releaseCacheItem(&c.itemPool, item)
 	}
@@ -424,6 +485,7 @@ func (c *Cache[K, V]) clearShardLocked(s *shard[K, V]) {
 		s.sieve.reset()
 	}
 	atomic.StoreInt64(&s.size, 0)
+	atomic.StoreInt64(&s.cost, 0)
 }
 
 func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {

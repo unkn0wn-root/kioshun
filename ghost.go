@@ -1,18 +1,17 @@
 package kioshun
 
-// ghostEntry stores a compact item identity. The tag is kept with the hash to
-// reduce false ghost hits without retaining full keys after eviction.
-type ghostEntry struct {
-	hash uint64
-	tag  uint16
-}
-
-// ghostQueue is a fixed size FIFO of recently evicted probation fingerprints.
-// A hit is evidence that probation was too small for the current workload, so
-// SieveTinyLFU readmits the item directly into main and may grow probation.
+// ghostQueue is a fixed size FIFO of recently evicted item fingerprints. A hit
+// is evidence that the queue the item came from was too small for the current
+// workload, so SieveTinyLFU readmits the item directly into main and may grow
+// probation.
+//
+// A fingerprint is the full 64-bit key hash, which identifies an item as
+// precisely as the cache can. contains and add touch the ghost on every
+// admission along the SIEVE eviction path so each entry is kept minimal
+// a bare uint64 mapped to the ring slot that holds it.
 type ghostQueue struct {
-	entries []ghostEntry
-	index   map[ghostEntry]int
+	entries []uint64       // FIFO ring of fingerprints; the index map owns membership
+	index   map[uint64]int // fingerprint -> ring slot for membership
 	next    int
 }
 
@@ -24,33 +23,30 @@ func newGhostQueue(n int) ghostQueue {
 	}
 
 	return ghostQueue{
-		entries: make([]ghostEntry, n),
-		index:   make(map[ghostEntry]int, n),
+		entries: make([]uint64, n),
+		index:   make(map[uint64]int, n),
 	}
 }
 
-func (g *ghostQueue) contains(h uint64, t uint16) bool {
+func (g *ghostQueue) contains(h uint64) bool {
 	if g.index == nil {
 		return false
 	}
 
-	_, ok := g.index[ghostEntry{hash: h, tag: t}]
+	_, ok := g.index[h]
 	return ok
 }
 
 // add records a fingerprint unless it is already present.
 // The ring and index are kept in sync by deleting the overwritten entry only
-// when the index still points at the slot being reused.
-func (g *ghostQueue) add(h uint64, t uint16) {
+// when the index still points at the slot being reused (the entry may have been
+// removed on a ghost hit and re-added at a newer slot since).
+func (g *ghostQueue) add(h uint64) {
 	if len(g.entries) == 0 {
 		return
 	}
 
-	e := ghostEntry{hash: h, tag: t}
-	if g.index == nil {
-		g.index = make(map[ghostEntry]int, len(g.entries))
-	}
-	if _, ok := g.index[e]; ok {
+	if _, ok := g.index[h]; ok {
 		return
 	}
 
@@ -59,27 +55,26 @@ func (g *ghostQueue) add(h uint64, t uint16) {
 		delete(g.index, old)
 	}
 
-	g.entries[g.next] = e
-	g.index[e] = g.next
+	g.entries[g.next] = h
+	g.index[h] = g.next
 	g.next = (g.next + 1) % len(g.entries)
 }
 
-// remove deletes a fingerprint from the index and clears its slot if the slot
-// still contains that exact entry. The FIFO cursor is not rewound.
-func (g *ghostQueue) remove(h uint64, t uint16) bool {
+// remove deletes a fingerprint from the index and clears its ring slot if the
+// slot still holds it. The FIFO cursor is not rewound.
+func (g *ghostQueue) remove(h uint64) bool {
 	if g.index == nil {
 		return false
 	}
 
-	e := ghostEntry{hash: h, tag: t}
-	i, ok := g.index[e]
+	i, ok := g.index[h]
 	if !ok {
 		return false
 	}
 
-	delete(g.index, e)
-	if i >= 0 && i < len(g.entries) && g.entries[i] == e {
-		g.entries[i] = ghostEntry{}
+	delete(g.index, h)
+	if i >= 0 && i < len(g.entries) && g.entries[i] == h {
+		g.entries[i] = 0
 	}
 	return true
 }
