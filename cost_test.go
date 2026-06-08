@@ -51,7 +51,7 @@ func TestDefaultCacheDoesNotTrackCostMetadata(t *testing.T) {
 	}
 	defer cache.Close()
 
-	for key := 0; key < 4; key++ {
+	for key := range 4 {
 		if err := cache.Set(key, key, time.Hour); err != nil {
 			t.Fatalf("Set(%d) error = %v", key, err)
 		}
@@ -65,13 +65,19 @@ func TestDefaultCacheDoesNotTrackCostMetadata(t *testing.T) {
 	}
 	for _, shard := range cache.shards {
 		shard.mu.RLock()
-		for key, item := range shard.data {
+		var badKey, badCost int64
+		bad := false
+		shard.tab.forEach(func(item *cacheItem[int, int]) bool {
 			if item.cost != 0 {
-				shard.mu.RUnlock()
-				t.Fatalf("key %d carries cost metadata cost=%d in default cache", key, item.cost)
+				badKey, badCost, bad = int64(item.key), item.cost, true
+				return false
 			}
-		}
+			return true
+		})
 		shard.mu.RUnlock()
+		if bad {
+			t.Fatalf("key %d carries cost metadata cost=%d in default cache", badKey, badCost)
+		}
 	}
 }
 
@@ -124,7 +130,7 @@ func TestUnboundedSieveAllowsNoEviction(t *testing.T) {
 	if cache.shards[0].sieve != nil {
 		t.Fatal("unbounded Sieve shard allocated policy state")
 	}
-	for key := 0; key < 50; key++ {
+	for key := range 50 {
 		if err := cache.Set(key, key, time.Hour); err != nil {
 			t.Fatalf("Set(%d) error = %v", key, err)
 		}
@@ -218,21 +224,21 @@ func TestSieveCostAdmissionScores(t *testing.T) {
 	in := &cacheItem[int, int]{key: 1, hash: 1, cost: 1}
 	victim := &cacheItem[int, int]{key: 2, hash: 2, cost: 64}
 
-	frequency := newSieveTinyLFU[int, int](8, 25, 100, CostAdmissionFrequency)
+	frequency := newSieveTinyLFU[int, int](8, 0, 25, 100, CostAdmissionFrequency)
 	incrementSieveFrequency(frequency, in.hash, 2)
 	incrementSieveFrequency(frequency, victim.hash, 3)
 	if frequency.shouldAdmit(in, victim, false) {
 		t.Fatal("frequency-only admission should keep the higher-frequency victim")
 	}
 
-	density := newSieveTinyLFU[int, int](8, 25, 100, CostAdmissionDensity)
+	density := newSieveTinyLFU[int, int](8, 0, 25, 100, CostAdmissionDensity)
 	incrementSieveFrequency(density, in.hash, 2)
 	incrementSieveFrequency(density, victim.hash, 3)
 	if !density.shouldAdmit(in, victim, false) {
 		t.Fatal("density admission should admit the smaller dense candidate")
 	}
 
-	balanced := newSieveTinyLFU[int, int](8, 25, 100, CostAdmissionBalanced)
+	balanced := newSieveTinyLFU[int, int](8, 0, 25, 100, CostAdmissionBalanced)
 	incrementSieveFrequency(balanced, in.hash, 2)
 	incrementSieveFrequency(balanced, victim.hash, 3)
 	if !balanced.shouldAdmit(in, victim, false) {
@@ -241,7 +247,7 @@ func TestSieveCostAdmissionScores(t *testing.T) {
 }
 
 func incrementSieveFrequency[K comparable, V any](p *sieveTinyLFU[K, V], h uint64, n int) {
-	for i := 0; i < n; i++ {
+	for range n {
 		p.incrementFrequency(h)
 	}
 }

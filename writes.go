@@ -24,7 +24,6 @@ type writeCommand[K comparable, V any] struct {
 	value      V
 	hash       uint64
 	expireTime int64
-	now        int64
 	cost       int64
 	op         writeOp
 	result     chan struct{}
@@ -152,7 +151,6 @@ func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback fun
 		key:        key,
 		value:      value,
 		hash:       kh,
-		now:        now,
 		expireTime: expireTime,
 		cost:       cost,
 	}
@@ -214,8 +212,7 @@ func (c *Cache[K, V]) releaseWriteWaiter(waiter *writeWaiter) {
 // syncMutate is the synchronous write path shared by Set and Delete. It
 // takes drainMu (the queue's single-consumer token), flushes queued writes so
 // the direct mutation observes prior writes in order, then mutates under the
-// shard lock. The closed-check is repeated after drainMu is held so a concurrent
-// Close cannot race past the barrier into a shard being torn down.
+// shard lock.
 func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 	if c.isClosed() {
 		return ErrCacheClosed
@@ -252,10 +249,10 @@ func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error
 	return nil
 }
 
-func (c *Cache[K, V]) deleteSync(s *shard[K, V], key K) (bool, error) {
+func (c *Cache[K, V]) deleteSync(s *shard[K, V], kh uint64, key K) (bool, error) {
 	var deleted bool
 	err := c.syncMutate(s, func() {
-		deleted = c.deleteKey(s, key)
+		deleted = c.deleteKey(s, kh, key)
 	})
 	return deleted, err
 }
@@ -286,7 +283,6 @@ func (c *Cache[K, V]) enqueueBarrierAll(op writeOp) error {
 		waiter := c.acquireWriteWaiter()
 		cmd := writeCommand[K, V]{
 			op:     op,
-			now:    time.Now().UnixNano(),
 			result: waiter.ch,
 		}
 		if err := s.queue.enqueue(cmd); err != nil {
@@ -347,6 +343,23 @@ func (c *Cache[K, V]) drainShard(s *shard[K, V]) {
 	s.drainMu.Unlock()
 }
 
+// drainMissAndLookup restores read-after-write visibility for the lock-free read
+// path. A SieveTinyLFU read takes no lock, so it never waits for the write
+// worker; a miss may therefore be a Set still sitting in this shard's async
+// queue. When the queue is non-empty this drains it (without blocking - it only
+// helps when it can claim the single-consumer token) and re-checks, so a Get that
+// races a Set of the same key still observes it. This keeps writes batched (the
+// async pipeline is untouched) while paying the catch-up cost only on the miss
+// path, where a stale miss would otherwise re-enqueue a redundant Set.
+func (c *Cache[K, V]) drainMissAndLookup(s *shard[K, V], kh uint64, key K) (*cacheItem[K, V], bool) {
+	if s.queue.quiescent() || !s.drainMu.TryLock() {
+		return nil, false
+	}
+	c.drainShardQueue(s)
+	s.drainMu.Unlock()
+	return s.tab.lookup(kh, key)
+}
+
 // drainShardQueue consumes read samples and queued writes. The caller must hold
 // s.drainMu so there is only one shard consumer.
 func (c *Cache[K, V]) drainShardQueue(s *shard[K, V]) {
@@ -401,93 +414,118 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 	}
 }
 
-// newItem returns a pooled, populated item for cmd. acquireCacheItem zeroes the
-// node, so list links and lfuFreq start clean.
+// newItem allocates a populated item for cmd. Items are not pooled: lock-free
+// reads may hold an evicted item, so the GC owns reclamation. Zero-valued fields
+// (list links, visited) start clean.
 func (c *Cache[K, V]) newItem(cmd *writeCommand[K, V]) *cacheItem[K, V] {
-	item := acquireCacheItem[K, V](&c.itemPool)
-	item.value = cmd.value
-	item.lastAccess = cmd.now
-	item.key = cmd.key
-	item.hash = cmd.hash
-	item.expireTime = cmd.expireTime
-	item.cost = cmd.cost
-	return item
+	return &cacheItem[K, V]{
+		value:      cmd.value,
+		key:        cmd.key,
+		hash:       cmd.hash,
+		expireTime: cmd.expireTime,
+		cost:       cmd.cost,
+	}
 }
 
 // applySet mutates shard contents and policy state. The caller must hold s.mu.
 func (c *Cache[K, V]) applySet(s *shard[K, V], cmd *writeCommand[K, V]) bool {
-	cmdCost := cmd.cost
-	if ex, exists := s.data[cmd.key]; exists {
-		costDelta := cmdCost - ex.cost
-		ex.value = cmd.value
-		ex.lastAccess = cmd.now
-		ex.expireTime = cmd.expireTime
-		ex.hash = cmd.hash
-		if costDelta != 0 {
-			ex.cost = cmdCost
-			atomic.AddInt64(&s.cost, costDelta)
-		}
+	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
+		return c.applySieve(s, cmd)
+	}
 
-		switch c.config.EvictionPolicy {
-		case LRU:
-			s.moveToLRUHead(ex)
-		case LFU:
-			s.lfuList.remove(ex)
-			ex.lfuFreq = 1
-			s.lfuList.add(ex)
-		case SieveTinyLFU:
-			ex.lfuFreq = 0
-			if s.sieve != nil && !s.belowSieveWarmup() {
-				s.sieve.recordUpdate(ex)
-			}
+	// non-Sieve policies look up first so an existing key updates in place, and
+	// evict before inserting so the new item is not selected.
+	if ex, exists := s.tab.lookup(cmd.hash, cmd.key); exists {
+		return c.applyUpdate(s, cmd, ex)
+	}
+	for s.wouldOverCapacity(cmd.cost) && s.tab.length() > 0 {
+		c.evictor.evict(s, c.config.StatsEnabled)
+	}
+
+	item := c.newItem(cmd)
+	s.tab.store(item)
+	s.addToLRUHead(item)
+	if c.config.EvictionPolicy == LFU {
+		s.lfuList.add(item)
+	}
+	atomic.AddInt64(&s.size, 1)
+	if item.cost != 0 {
+		atomic.AddInt64(&s.cost, item.cost)
+	}
+	return true
+}
+
+// applySieve is the SieveTinyLFU write path. probe makes the insert/update
+// decision in one walk: an update swaps the new immutable item in place, while an
+// insert is published late. A new candidate runs admission while it is live in
+// the policy queues but absent from the table, so a rejected candidate is
+// unlinked policy-only and never touches the table (no store, no removeExact, no
+// tombstone) and is never visible to a lock-free Get. Only an admitted candidate
+// is published, at the slot probe located. Caller must hold s.mu.
+func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
+	warmup := s.belowSieveWarmup()
+	item := c.newItem(cmd)
+	prev, cur := s.tab.probe(item)
+
+	if prev != nil {
+		// update: probe already swapped the slot to item; carry policy state across.
+		if d := cmd.cost - prev.cost; d != 0 {
+			atomic.AddInt64(&s.cost, d)
+		}
+		s.sieve.replaceNode(prev, item)
+		if !warmup {
+			s.sieve.recordUpdate(item)
 		}
 		c.enforcePostUpdateCapacity(s)
 		return true
 	}
 
-	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
-		warmup := s.belowSieveWarmup()
-		if !warmup {
-			s.sieve.recordAccess(cmd.hash)
-		}
-
-		item := c.newItem(cmd)
-		s.data[cmd.key] = item
-		atomic.AddInt64(&s.size, 1)
-		if item.cost != 0 {
-			atomic.AddInt64(&s.cost, item.cost)
-		}
-
-		ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash)
-		s.sieve.insert(item, ghostHit)
-		if !warmup || s.overCapacity() {
-			s.enforceSieveCapacity(&c.itemPool, c.config.StatsEnabled, item, ghostHit)
-		}
-		if _, ok := s.data[cmd.key]; ok {
-			s.sieve.stats.Admits++
-			return true
-		}
-		s.sieve.stats.Rejects++
-		return false
+	// insert: hold the candidate out of the table until admission decides its fate.
+	item.unpublished = true
+	if !warmup {
+		s.sieve.recordAccess(cmd.hash)
 	}
-
-	// non-Sieve policies evict before inserting so the new item is not selected.
-	for s.wouldOverCapacity(cmdCost) && len(s.data) > 0 {
-		c.evictor.evict(s, &c.itemPool, c.config.StatsEnabled)
-	}
-
-	item := c.newItem(cmd)
-	s.data[cmd.key] = item
-	s.addToLRUHead(item)
-
-	if c.config.EvictionPolicy == LFU {
-		s.lfuList.add(item)
-	}
-
 	atomic.AddInt64(&s.size, 1)
 	if item.cost != 0 {
 		atomic.AddInt64(&s.cost, item.cost)
 	}
+	ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash)
+	s.sieve.insert(item, ghostHit)
+	if !warmup || s.overCapacity() {
+		s.enforceSieveCapacity(c.config.StatsEnabled, item, ghostHit)
+	}
+	if s.sieve.owns(item) {
+		item.unpublished = false
+		s.tab.publish(item, cur)
+		s.sieve.stats.Admits++
+		return true
+	}
+	// rejected: enforceSieveCapacity already unlinked the candidate from policy and
+	// decremented size via the unpublished-aware drop; nothing was ever stored.
+	s.sieve.stats.Rejects++
+	return false
+}
+
+// applyUpdate updates an existing resident in place for LRU/LFU/FIFO, whose reads
+// hold the shard lock. SieveTinyLFU updates go through applySieve, which must
+// publish a fresh immutable item instead (a lock-free reader may hold the old
+// one). The caller must hold s.mu.
+func (c *Cache[K, V]) applyUpdate(s *shard[K, V], cmd *writeCommand[K, V], ex *cacheItem[K, V]) bool {
+	costDelta := cmd.cost - ex.cost
+	ex.value = cmd.value
+	ex.expireTime = cmd.expireTime
+	if costDelta != 0 {
+		ex.cost = cmd.cost
+		atomic.AddInt64(&s.cost, costDelta)
+	}
+	switch c.config.EvictionPolicy {
+	case LRU:
+		s.moveToLRUHead(ex)
+	case LFU:
+		s.lfuList.remove(ex)
+		s.lfuList.add(ex)
+	}
+	c.enforcePostUpdateCapacity(s)
 	return true
 }
 
@@ -498,17 +536,17 @@ func (c *Cache[K, V]) enforcePostUpdateCapacity(s *shard[K, V]) {
 		return
 	}
 	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
-		s.enforceSieveCapacity(&c.itemPool, c.config.StatsEnabled, nil, false)
+		s.enforceSieveCapacity(c.config.StatsEnabled, nil, false)
 		return
 	}
-	for s.overCapacity() && len(s.data) > 0 {
-		c.evictor.evict(s, &c.itemPool, c.config.StatsEnabled)
+	for s.overCapacity() && s.tab.length() > 0 {
+		c.evictor.evict(s, c.config.StatsEnabled)
 	}
 }
 
 // deleteKey removes key from a shard. The caller must hold s.mu.
-func (c *Cache[K, V]) deleteKey(s *shard[K, V], key K) bool {
-	item, exists := s.data[key]
+func (c *Cache[K, V]) deleteKey(s *shard[K, V], kh uint64, key K) bool {
+	item, exists := s.tab.lookup(kh, key)
 	if !exists {
 		return false
 	}
@@ -518,11 +556,10 @@ func (c *Cache[K, V]) deleteKey(s *shard[K, V], key K) bool {
 
 // clearShard resets a shard's contents and policy state. The caller must hold s.mu.
 func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
-	for _, item := range s.data {
-		releaseCacheItem(&c.itemPool, item)
+	s.tab.clear()
+	if s.sieve == nil {
+		s.initLRU()
 	}
-	s.data = make(map[K]*cacheItem[K, V])
-	s.initLRU()
 	if c.config.EvictionPolicy == LFU {
 		s.lfuList = newLFUList[K, V]()
 	}
@@ -542,9 +579,10 @@ func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
 
 		select {
 		case <-timer.C:
-			s := c.getShard(task.key)
+			kh := c.hasher.Sum(task.key)
+			s := c.shardByHash(kh)
 			s.mu.RLock()
-			item, exists := s.data[task.key]
+			item, exists := s.tab.lookup(kh, task.key)
 			if exists && item.expireTime > 0 && time.Now().UnixNano() > item.expireTime {
 				s.mu.RUnlock()
 				task.callback(task.key, task.value)

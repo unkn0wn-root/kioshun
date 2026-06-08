@@ -212,11 +212,11 @@ func TestCacheConcurrency(t *testing.T) {
 	numOperations := 100
 
 	// Concurrent writes
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
+			for j := range numOperations {
 				key := fmt.Sprintf("key:%d:%d", id, j)
 				cache.Set(key, id*numOperations+j, 1*time.Minute)
 			}
@@ -228,7 +228,7 @@ func TestCacheConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
+			for j := range numOperations {
 				key := fmt.Sprintf("key:%d:%d", id, j)
 				cache.Get(key)
 			}
@@ -809,7 +809,7 @@ func TestSetAsyncReturnsAfterEnqueueBeforeCommit(t *testing.T) {
 		t.Fatal("set blocked until commit; expected enqueue-only return")
 	}
 
-	if _, ok := shard.data["key"]; ok {
+	if _, ok := shard.tab.lookup(cache.hasher.Sum("key"), "key"); ok {
 		t.Fatal("set committed while shard lock was held")
 	}
 
@@ -854,7 +854,7 @@ func TestSetWaitsForCommit(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	if _, ok := shard.data["key"]; ok {
+	if _, ok := shard.tab.lookup(cache.hasher.Sum("key"), "key"); ok {
 		t.Fatal("set committed while shard lock was held")
 	}
 
@@ -918,9 +918,6 @@ func TestDeleteOrdersAfterPendingSet(t *testing.T) {
 	}
 }
 
-// TestSetAsyncAppliesInlineWhenUncontended verifies the opportunistic inline
-// apply: with no competing activity on the owning shard, SetAsync commits the
-// write before returning, so the key is visible without an explicit Sync.
 func TestSetAsyncAppliesInlineWhenUncontended(t *testing.T) {
 	cache := newTestCache[int, int](t, Config{
 		MaxSize:         1024,
@@ -933,7 +930,7 @@ func TestSetAsyncAppliesInlineWhenUncontended(t *testing.T) {
 	})
 	defer cache.Close()
 
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		if err := cache.SetAsync(i, i*7, time.Hour); err != nil {
 			t.Fatalf("SetAsync(%d): %v", i, err)
 		}
@@ -945,8 +942,6 @@ func TestSetAsyncAppliesInlineWhenUncontended(t *testing.T) {
 	}
 }
 
-// Basic benchmarks are in cache_bench_test.go
-
 type User struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -954,7 +949,6 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Test that verifies the new Set method's in-place update behavior
 func TestSetInPlaceUpdate(t *testing.T) {
 	config := Config{
 		MaxSize:         100,
@@ -979,7 +973,7 @@ func TestSetInPlaceUpdate(t *testing.T) {
 	// Get the item pointer before update (if we could access it)
 	shard := cache.getShard("key1")
 	shard.mu.RLock()
-	originalItem := shard.data["key1"]
+	originalItem, _ := shard.tab.lookup(cache.hasher.Sum("key1"), "key1")
 	shard.mu.RUnlock()
 
 	// Update the same key - should reuse the item
@@ -993,7 +987,7 @@ func TestSetInPlaceUpdate(t *testing.T) {
 
 	// Check that item was reused (same pointer)
 	shard.mu.RLock()
-	updatedItem := shard.data["key1"]
+	updatedItem, _ := shard.tab.lookup(cache.hasher.Sum("key1"), "key1")
 	shard.mu.RUnlock()
 
 	if originalItem != updatedItem {
@@ -1007,7 +1001,6 @@ func TestSetInPlaceUpdate(t *testing.T) {
 	}
 }
 
-// Test LFU frequency reset behavior on Set
 func TestSetLFUFrequencyReset(t *testing.T) {
 	config := Config{
 		MaxSize:         3,
@@ -1027,7 +1020,7 @@ func TestSetLFUFrequencyReset(t *testing.T) {
 	waitForWrites(t, cache)
 
 	// Access "a" multiple times to increase frequency
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		cache.Get("a")
 	}
 

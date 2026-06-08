@@ -141,7 +141,7 @@ func createCache[K comparable, V any](
 	}
 
 	if actual, loaded := m.caches.LoadOrStore(name, cache); loaded {
-		cache.Close()
+		_ = cache.Close()
 		return assertCache[K, V](name, actual)
 	}
 	return cache, nil

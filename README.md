@@ -17,7 +17,7 @@
 > <b>v1</b> is a complete redesign, not a drop-in upgrade from earlier releases!
 >
 > The biggest change is that clustering has been removed - the old peer-to-peer features are no longer part of the project. The focus is now on continuously improving cache performance and correctness.
-> The cache core was also rebuilt - `AdmissionLFU` default has been replaced by `SieveTinyLFU` with probation/main queues, ghost entries, TinyLFU sketching, adaptive segment sizing and queued/batched writes.
+> The cache core was also rebuilt - `AdmissionLFU` default has been replaced by a self-adapting `SieveTinyLFU` with probation/main queues, ghost entries, TinyLFU sketching, adaptive segment sizing, lock-free bounded Sieve reads and queued/batched writes.
 >
 > Public APIs changed as part of the redesign, including `New` and `NewDefault` replacing `NewWithDefaults`, cache policy/config names changing and HTTP middleware moving to the `httpcache` package.
 
@@ -30,7 +30,7 @@
 - [Configuration](#configuration)
 - [API](#api)
 - [HTTP Middleware](MIDDLEWARE.md)
-- [Benchmark Results](#benchmark-results)
+- [Benchmarks](#benchmarks)
 
 ## What is Kioshun?
 
@@ -67,10 +67,11 @@ func main() {
     // Set commits the write before returning so the key is immediately readable.
     c.Set("user:456", "John", kioshun.NoExpiration)
 
-    // SetAsync queues the write and returns early.
+    // SetAsync returns early. It may commit inline when the shard is idle
+    // otherwise it queues the write for that shard's worker.
     c.SetAsync("user:789", "Paul", 5*time.Minute)
 
-    // Optional: call Sync() if you want to wait for value back.
+    // Optional: call Sync() when committed visibility is required.
     c.Sync()
 
     // Get value
@@ -94,8 +95,8 @@ config := kioshun.Config{
     DefaultTTL:      30 * time.Minute,     // Default expiration time
     EvictionPolicy:  kioshun.SieveTinyLFU, // Eviction algorithm (default)
     // StatsEnabled records cache activity metrics such as hits, misses and
-    // evictions. Tracking those counters adds runtime cost, so enable it for
-    // tests, diagnostics or deployments where throughput performance is less critical.
+    // evictions. Tracking those counters adds runtime cost so enable it only
+    // if you can accept runtime performance tradeoff.
     StatsEnabled:    true,
     WriteBufferSize: 1024,                 // Per-shard async write queue
     WriteBatchSize:  64,                   // Max commands applied per worker batch
@@ -156,8 +157,9 @@ c.Close() error
 ```
 
 > `Set` is synchronous and gives immediate read-after-write visibility for the key.
-> `SetAsync` is optional and only accepts the write into the shard queue meaning that the value
-> becomes visible after a background worker commits it.
+> `SetAsync` is optional. A nil error means the write was accepted - it may have
+> committed inline already or it may still be queued. Use `Sync` when committed
+> visibility is required.
 
 > Create with `kioshun.New(config, kioshun.WithOnRemove(func(key K, value V, reason kioshun.RemovalReason) { ... }))`
 > to receive a callback for every key removed by capacity eviction,
@@ -214,7 +216,7 @@ http.Handle("/api/users", middleware.Wrap(usersHandler))
 ## Benchmarks
 
 You can find comparison tests in [benchmarks](benchmarks/).
-Those compares Kioshun with Ristretto, BigCache, FreeCache, and go-cache using
+These compare Kioshun with Ristretto, BigCache, FreeCache, and go-cache using
 pre-generated workloads, with async and strict write modes reported separately.
 
 You can rerun the suite on your machine:
@@ -225,18 +227,3 @@ GOCACHE=/tmp/kioshun-go-build go test -run=TestBenchmarkComparisonGetSetup -coun
 GOCACHE=/tmp/kioshun-go-build go test -bench='BenchmarkCacheComparison' -benchmem -run=^$ -benchtime=1s .
 GOCACHE=/tmp/kioshun-go-build go test -bench=. -benchmem -run=^$ -benchtime=1s -timeout=30m .
 ```
-
-Latest checked-in Kioshun snapshot from the comparison suite
-(`2026-06-02`, Apple M4 Max, Go `go1.26.0 darwin/arm64`):
-
-`Measured ops` is the Go benchmark iteration count for that timed workload, not
-the number of unique cache entries.
-
-| Workload | Measured ops | ns/op | B/op | allocs/op |
-| --- | ---: | ---: | ---: | ---: |
-| Set async | 39,253,849 | 40.44 | 0 | 0 |
-| Set strict | 18,755,151 | 67.31 | 0 | 0 |
-| Get TTL | 52,658,330 | 23.53 | 0 | 0 |
-| Get no TTL | 83,651,143 | 15.26 | 0 | 0 |
-| 70% read / 30% write async | 27,072,325 | 44.70 | 0 | 0 |
-| Real-world strict | 22,050,884 | 56.33 | 0 | 0 |

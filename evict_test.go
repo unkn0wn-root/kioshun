@@ -7,7 +7,6 @@ import (
 	"time"
 )
 
-// evictRecorder is a concurrency-safe sink for OnRemove notifications.
 type evictRecorder struct {
 	mu      sync.Mutex
 	seen    map[int]string
@@ -87,8 +86,6 @@ func (r *capacityEvictRecorder) value(k int) (string, bool) {
 	return v, ok
 }
 
-// waitFor polls cond until it holds or the deadline passes; removal
-// notifications are delivered asynchronously, so tests cannot assert immediately.
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -188,8 +185,6 @@ func TestOnRemoveAndOnEvict_BothFireForCapacity(t *testing.T) {
 	}
 }
 
-// Every distinct key inserted must end up either resident or reported exactly
-// once to OnRemove; the two sets never overlap and never lose a key.
 func TestOnRemove_CapacityEvictionAccounting(t *testing.T) {
 	for _, policy := range []EvictionPolicy{LRU, LFU, FIFO, SieveTinyLFU} {
 		t.Run(policyName(policy), func(t *testing.T) {
@@ -336,8 +331,6 @@ func TestOnRemove_ExpirationOnAccess(t *testing.T) {
 	}
 }
 
-// Replacing an existing key's value keeps the key resident, so it must not
-// produce an eviction notification.
 func TestOnRemove_NotFiredOnOverwrite(t *testing.T) {
 	rec := newEvictRecorder()
 	c, err := New(
@@ -364,7 +357,6 @@ func TestOnRemove_NotFiredOnOverwrite(t *testing.T) {
 	}
 }
 
-// Clear drops every entry in bulk and must not deliver per-key notifications.
 func TestOnRemove_NotFiredOnClear(t *testing.T) {
 	rec := newEvictRecorder()
 	c, err := New(

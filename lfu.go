@@ -29,7 +29,6 @@ func newLFUList[K comparable, V any]() *lfuList[K, V] {
 }
 
 func (l *lfuList[K, V]) add(item *cacheItem[K, V]) {
-	item.lfuFreq = 1
 	node := l.ensureIndex(l.head, 1)
 	node.items[item] = struct{}{}
 	l.itemFreq[item] = node
@@ -55,7 +54,6 @@ func (l *lfuList[K, V]) increment(item *cacheItem[K, V]) {
 	}
 	target.items[item] = struct{}{}
 	l.itemFreq[item] = target
-	item.lfuFreq = newFreq
 
 	if len(cur.items) == 0 && cur.freq != 0 {
 		l.removeFreqNode(cur)

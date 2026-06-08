@@ -1,48 +1,44 @@
 package kioshun
 
-import (
-	"sync"
-)
-
 // evictor removes one resident item from a bounded shard.
 // Callers hold the shard lock; only choose the victim and leave
-// map removal, policy unlinking, pooling and statistics to shard.dropItem.
+// table removal, policy unlinking and statistics to shard.dropItem.
 type evictor[K comparable, V any] interface {
-	evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool)
+	evict(s *shard[K, V], statsEnabled bool)
 }
 
 type lruEvictor[K comparable, V any] struct{}
 
-func (e lruEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) {
+func (e lruEvictor[K, V]) evict(s *shard[K, V], statsEnabled bool) {
 	if s.tail.prev == s.head {
 		return
 	}
 
-	s.dropItem(s.tail.prev, itemPool, statsEnabled, RemovedCapacity, dropLRU)
+	s.dropItem(s.tail.prev, statsEnabled, RemovedCapacity, dropLRU)
 }
 
 type lfuEvictor[K comparable, V any] struct{}
 
-func (e lfuEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) {
+func (e lfuEvictor[K, V]) evict(s *shard[K, V], statsEnabled bool) {
 	lfu := s.lfuList.removeLFU()
 	if lfu == nil {
 		return
 	}
 	// removeLFU already unlinked the LFU bucket; dropLRU unlinks the shared LRU
-	// list and map without a redundant lookup.
-	s.dropItem(lfu, itemPool, statsEnabled, RemovedCapacity, dropLRU)
+	// list and table without a redundant lookup.
+	s.dropItem(lfu, statsEnabled, RemovedCapacity, dropLRU)
 }
 
 type fifoEvictor[K comparable, V any] struct{}
 
 // evict removes the tail entry from the shared LRU list. FIFO reads never move
 // entries, so tail.prev remains the oldest inserted resident for this policy.
-func (e fifoEvictor[K, V]) evict(s *shard[K, V], itemPool *sync.Pool, statsEnabled bool) {
+func (e fifoEvictor[K, V]) evict(s *shard[K, V], statsEnabled bool) {
 	if s.tail.prev == s.head {
 		return
 	}
 
-	s.dropItem(s.tail.prev, itemPool, statsEnabled, RemovedCapacity, dropLRU)
+	s.dropItem(s.tail.prev, statsEnabled, RemovedCapacity, dropLRU)
 }
 
 // createEvictor returns the non-Sieve replacement policy for a shard.
