@@ -6,13 +6,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/unkn0wn-root/kioshun/internal/keyhash"
 )
 
 func TestSieveQueuePushPopRemove(t *testing.T) {
 	var q sieveQueue[int, int]
-	q.init()
+	q.init(mainQueue, 0)
 	if !q.empty() {
 		t.Fatal("new segment should be empty")
 	}
@@ -27,11 +25,13 @@ func TestSieveQueuePushPopRemove(t *testing.T) {
 	if q.size != 3 {
 		t.Fatalf("n=%d, want 3", q.size)
 	}
-	if got := q.popBack(); got != a {
-		t.Fatalf("pop got=%v, want oldest item", got)
+	// The policy evicts the oldest entry as tail.prev + remove (see
+	// evictProbation/findMainVictim); exercise that pattern directly.
+	if oldest := q.tail.prev; oldest != a || !q.remove(oldest) {
+		t.Fatalf("oldest=%v, want oldest item a", oldest)
 	}
 	if a.prev != nil || a.next != nil {
-		t.Fatal("popped item links were not cleared")
+		t.Fatal("removed item links were not cleared")
 	}
 
 	if !q.remove(b) {
@@ -40,68 +40,116 @@ func TestSieveQueuePushPopRemove(t *testing.T) {
 	if q.size != 1 {
 		t.Fatalf("n=%d, want 1", q.size)
 	}
-	if got := q.popBack(); got != c {
-		t.Fatalf("pop got=%v, want remaining item", got)
+	if last := q.tail.prev; last != c || !q.remove(last) {
+		t.Fatalf("last=%v, want remaining item c", last)
 	}
 	if !q.empty() {
-		t.Fatal("segment should be empty after final pop")
+		t.Fatal("segment should be empty after final removal")
+	}
+}
+
+func TestSieveQueueOwnerIsolation(t *testing.T) {
+	var qa, qb sieveQueue[int, int]
+	qa.init(probationQueue, 1) // shard 1 probation
+	qb.init(probationQueue, 2) // shard 2 probation: same role, different owner
+
+	it := &cacheItem[int, int]{value: 1}
+	qa.pushFront(it)
+
+	if qb.holds(it) {
+		t.Fatal("queue B claims an item owned by queue A (same role, different owner)")
+	}
+	if qb.remove(it) {
+		t.Fatal("queue B removed an item owned by queue A - corruption guard failed")
+	}
+	if qb.size != 0 {
+		t.Fatalf("queue B size=%d after rejected remove, want 0", qb.size)
+	}
+	// Queue A still owns the item and can remove it.
+	if !qa.holds(it) || qa.size != 1 {
+		t.Fatal("item should remain linked in queue A")
+	}
+	if !qa.remove(it) {
+		t.Fatal("queue A failed to remove its own item")
 	}
 }
 
 func TestGhostQueueAddRemoveOverwrite(t *testing.T) {
 	g := newGhostQueue(3)
-	g.add(1, 11)
-	g.add(2, 22)
-	if !g.contains(1, 11) || !g.contains(2, 22) {
+	g.add(1)
+	g.add(2)
+	if !g.contains(1) || !g.contains(2) {
 		t.Fatal("ghost queue missing inserted fingerprints")
 	}
 
-	if g.contains(1, 99) {
-		t.Fatal("hash match with wrong tag should not hit ghost queue")
-	}
-
-	if !g.remove(1, 11) {
+	if !g.remove(1) {
 		t.Fatal("delete returned false for present ghost fingerprint")
 	}
-	if g.contains(1, 11) {
+	if g.contains(1) {
 		t.Fatal("deleted fingerprint still present")
 	}
 
-	g.add(3, 33)
-	g.add(4, 44)
-	g.add(5, 55)
-	if g.contains(2, 22) {
+	g.add(3)
+	g.add(4)
+	g.add(5)
+	if g.contains(2) {
 		t.Fatal("oldest fingerprint should be overwritten")
 	}
-	for _, x := range []ghostEntry{{3, 33}, {4, 44}, {5, 55}} {
-		if !g.contains(x.hash, x.tag) {
-			t.Fatalf("fingerprint %v missing after overwrite", x)
+	for _, h := range []uint64{3, 4, 5} {
+		if !g.contains(h) {
+			t.Fatalf("fingerprint %d missing after overwrite", h)
 		}
 	}
 
 	g.clear()
-	if len(g.index) != 0 || g.contains(3, 33) || g.contains(4, 44) || g.contains(5, 55) {
+	if g.count() != 0 || g.contains(3) || g.contains(4) || g.contains(5) {
 		t.Fatal("clear did not reset ghost queue")
+	}
+}
+
+func TestGhostQueueZeroHashFingerprint(t *testing.T) {
+	g := newGhostQueue(2)
+	g.add(0)
+	if !g.contains(0) {
+		t.Fatal("zero-hash fingerprint not tracked")
+	}
+
+	g.add(9)
+	if !g.contains(0) || !g.contains(9) {
+		t.Fatal("zero-hash fingerprint lost after a second add")
+	}
+
+	// ring size 2: adding a third entry evicts the oldest (the zero hash).
+	g.add(8)
+	if g.contains(0) {
+		t.Fatal("oldest (zero-hash) fingerprint should have been evicted")
+	}
+	if !g.contains(9) || !g.contains(8) {
+		t.Fatal("recent fingerprints missing after eviction")
+	}
+
+	if !g.remove(8) || g.contains(8) {
+		t.Fatal("removing fingerprint adjacent to a cleared slot failed")
 	}
 }
 
 func TestGhostQueueDeleteMissingReturnsFalse(t *testing.T) {
 	g := newGhostQueue(2)
-	g.add(7, 77)
-	if g.remove(8, 88) {
+	g.add(7)
+	if g.remove(8) {
 		t.Fatal("delete returned true for missing ghost fingerprint")
 	}
-	if !g.contains(7, 77) {
+	if !g.contains(7) {
 		t.Fatal("missing delete removed existing ghost fingerprint")
 	}
 }
 
 func TestGhostQueueDuplicateDoesNotGrow(t *testing.T) {
 	g := newGhostQueue(2)
-	g.add(7, 77)
-	g.add(7, 77)
-	if len(g.index) != 1 {
-		t.Fatalf("n=%d, want 1", len(g.index))
+	g.add(7)
+	g.add(7)
+	if g.count() != 1 {
+		t.Fatalf("n=%d, want 1", g.count())
 	}
 }
 
@@ -140,7 +188,7 @@ func TestCountMinSketchIncrementEstimateAgeClear(t *testing.T) {
 }
 
 func TestDoorkeeperFiltersFirstFrequencyIncrement(t *testing.T) {
-	a := newSieveTinyLFU[int, int](32, 10, 100)
+	a := newSieveTinyLFU[int, int](32, 0, 10, 100)
 	h := uint64(12345)
 
 	a.recordAccess(h)
@@ -167,15 +215,15 @@ func TestDoorkeeperFiltersFirstFrequencyIncrement(t *testing.T) {
 }
 
 func TestNewSieveTinyLFUDefaults(t *testing.T) {
-	a := newSieveTinyLFU[int, int](100, 0, 0)
-	if a.probationCap != 10 || a.mainCap != 90 || a.ghostCap != 90 {
-		t.Fatalf("caps pc=%d mc=%d gc=%d, want 10/90/90", a.probationCap, a.mainCap, a.ghostCap)
+	a := newSieveTinyLFU[int, int](100, 0, 0, 0)
+	if a.probationCap != 1 || a.mainCap != 99 || a.ghostCap != 74 {
+		t.Fatalf("caps pc=%d mc=%d gc=%d, want 1/99/74", a.probationCap, a.mainCap, a.ghostCap)
 	}
 	if a.probation.size != 0 || a.main.size != 0 || !a.probation.empty() || !a.main.empty() {
 		t.Fatal("new admission queues should be empty")
 	}
-	if len(a.ghost.entries) != 90 {
-		t.Fatalf("ghost cap=%d, want 90", len(a.ghost.entries))
+	if len(a.ghost.entries) != 74 {
+		t.Fatalf("ghost cap=%d, want 74", len(a.ghost.entries))
 	}
 	if len(a.sketch.counters) == 0 {
 		t.Fatal("sketch was not initialized")
@@ -186,7 +234,7 @@ func TestNewSieveTinyLFUDefaults(t *testing.T) {
 }
 
 func TestNewSieveTinyLFUAdaptiveBounds(t *testing.T) {
-	a := newSieveTinyLFU[int, int](100, 10, 100)
+	a := newSieveTinyLFU[int, int](100, 0, 10, 100)
 	if a.minProbationCap != 1 || a.maxProbationCap != 60 || a.adaptStep != 1 {
 		t.Fatalf("bounds lo=%d hi=%d st=%d, want 1/60/1", a.minProbationCap, a.maxProbationCap, a.adaptStep)
 	}
@@ -203,7 +251,7 @@ func TestNewSieveTinyLFUAdaptiveBounds(t *testing.T) {
 }
 
 func TestSieveTinyLFURecordReadHitMarksVisitedOnly(t *testing.T) {
-	a := newSieveTinyLFU[int, int](16, 10, 100)
+	a := newSieveTinyLFU[int, int](16, 0, 10, 100)
 	probationItem := &cacheItem[int, int]{key: 1}
 	mainItem := &cacheItem[int, int]{key: 2}
 
@@ -230,8 +278,64 @@ func TestSieveTinyLFURecordReadHitMarksVisitedOnly(t *testing.T) {
 	}
 }
 
+func TestSieveProbationWindowKeepsNewResidentWhenBelowTarget(t *testing.T) {
+	const capacity = 8
+	cfg := Config{
+		MaxSize:         capacity,
+		ShardCount:      1,
+		EvictionPolicy:  SieveTinyLFU,
+		DefaultTTL:      NoExpiration,
+		CleanupInterval: 0,
+		ProbationRatio:  50,
+		StatsEnabled:    true,
+	}
+	c, err := New[uint64, uint64](cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	for k := range uint64(capacity) {
+		if err := c.Set(k, k, NoExpiration); err != nil {
+			t.Fatalf("Set warm key %d: %v", k, err)
+		}
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatalf("Sync warm: %v", err)
+	}
+
+	// Make resident main entries look strong to TinyLFU. A new item should still
+	// get room in probation while that recency window is under target.
+	for range 32 {
+		for k := range uint64(capacity) {
+			if _, ok := c.Get(k); !ok {
+				t.Fatalf("warm key %d disappeared before admission test", k)
+			}
+		}
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatalf("Sync frequency samples: %v", err)
+	}
+
+	if err := c.Set(100, 100, NoExpiration); err != nil {
+		t.Fatalf("Set new key: %v", err)
+	}
+	if err := c.Sync(); err != nil {
+		t.Fatalf("Sync new key: %v", err)
+	}
+	if _, ok := c.Get(100); !ok {
+		t.Fatal("new probation resident was rejected before the probation window filled")
+	}
+	if rejects := c.PolicyStats().Rejects; rejects != 0 {
+		t.Fatalf("policy rejects=%d, want 0 while probation has room", rejects)
+	}
+	if size := c.Size(); size != capacity {
+		t.Fatalf("size=%d, want capped size %d", size, capacity)
+	}
+}
+
 func TestSieveTinyLFUAdaptiveResetCycleClearsCounters(t *testing.T) {
-	a := newSieveTinyLFU[int, int](100, 10, 100)
+	a := newSieveTinyLFU[int, int](100, 0, 10, 100)
 
 	// Every adaptive signal lives on the single-consumer maintenance path now,
 	// so resetCycle clears them all with plain assignment, mainSurvivals included.
@@ -250,7 +354,7 @@ func TestSieveTinyLFUAdaptiveResetCycleClearsCounters(t *testing.T) {
 }
 
 func TestSieveTinyLFUAdaptiveShrinkUsesMainSurvivals(t *testing.T) {
-	a := newSieveTinyLFU[int, int](100, 10, 100)
+	a := newSieveTinyLFU[int, int](100, 0, 10, 100)
 	start := a.probationCap
 
 	// Probation churns (evictions > 2x promotions) and main is warm
@@ -258,7 +362,7 @@ func TestSieveTinyLFUAdaptiveShrinkUsesMainSurvivals(t *testing.T) {
 	a.controller.probationEvictions = 3
 	a.controller.promotions = 1
 	a.controller.mainSurvivals = 2
-	a.controller.observationsInCycle = uint64(a.capacity*10 - 1)
+	a.controller.observationsInCycle = uint64(a.capacity*adaptiveCycleMultiplier - 1)
 
 	a.tick()
 
@@ -277,7 +381,7 @@ func TestSieveTinyLFUAdaptiveShrinkUsesMainSurvivals(t *testing.T) {
 }
 
 func TestSieveTinyLFUAdaptiveShrinkBlockedWhenMainCold(t *testing.T) {
-	a := newSieveTinyLFU[int, int](100, 10, 100)
+	a := newSieveTinyLFU[int, int](100, 0, 10, 100)
 	start := a.probationCap
 
 	// Probation churns, but main earns nothing (survivals <= promotions): the
@@ -285,7 +389,7 @@ func TestSieveTinyLFUAdaptiveShrinkBlockedWhenMainCold(t *testing.T) {
 	a.controller.probationEvictions = 3
 	a.controller.promotions = 1
 	a.controller.mainSurvivals = 1
-	a.controller.observationsInCycle = uint64(a.capacity*10 - 1)
+	a.controller.observationsInCycle = uint64(a.capacity*adaptiveCycleMultiplier - 1)
 
 	a.tick()
 
@@ -294,8 +398,47 @@ func TestSieveTinyLFUAdaptiveShrinkBlockedWhenMainCold(t *testing.T) {
 	}
 }
 
+func TestSieveTinyLFUAdaptiveGrowBlockedByResurrection(t *testing.T) {
+	a := newSieveTinyLFU[int, int](100, 0, 10, 100)
+	start := a.probationCap
+
+	// B1 ghost hits alone would grow probation, but B2 resurrection means main
+	// victims are still needed. The fallback grow path must honor the loop guard.
+	a.controller.ghostHits = 10
+	a.controller.probationEvictions = 4
+	a.controller.cycleMainEvicts = 10
+	a.controller.cycleB2Hits = 5
+	a.controller.observationsInCycle = uint64(a.capacity*adaptiveCycleMultiplier - 1)
+
+	a.tick()
+
+	if a.probationCap != start {
+		t.Fatalf("probationCap=%d, want unchanged %d when main victims resurrect", a.probationCap, start)
+	}
+}
+
+func TestSieveTinyLFUAdaptiveWindowFloor(t *testing.T) {
+	a := newSieveTinyLFU[int, int](2000, 0, 1, 100)
+	start := a.probationCap
+
+	a.controller.ghostHits = 10
+	a.controller.cycleMainEvicts = 10
+	a.controller.observationsInCycle = uint64(a.capacity*adaptiveCycleMultiplier - 1)
+
+	a.tick()
+	if a.probationCap != start {
+		t.Fatalf("probationCap=%d, want unchanged before min cycle %d", a.probationCap, start)
+	}
+
+	a.controller.observationsInCycle = adaptiveMinCycle - 1
+	a.tick()
+	if a.probationCap <= start {
+		t.Fatalf("probationCap=%d, want growth after min cycle from %d", a.probationCap, start)
+	}
+}
+
 func TestSieveTinyLFUMainSweepCountsSurvivals(t *testing.T) {
-	a := newSieveTinyLFU[int, int](16, 10, 100)
+	a := newSieveTinyLFU[int, int](16, 0, 10, 100)
 	spared := &cacheItem[int, int]{key: 1}
 	victim := &cacheItem[int, int]{key: 2}
 	a.insertMain(spared)
@@ -342,19 +485,17 @@ func TestSieveTinyLFUExpiredFastPathDoesNotCountMainSurvival(t *testing.T) {
 		value:      1,
 		expireTime: now - int64(time.Second),
 		hash:       expiredHash,
-		tag:        keyhash.TagFromHash(expiredHash),
 	}
 	other := &cacheItem[int, int]{
 		key:        2,
 		value:      2,
 		expireTime: now + int64(time.Hour),
 		hash:       otherHash,
-		tag:        keyhash.TagFromHash(otherHash),
 	}
 
 	shard.mu.Lock()
-	shard.data[1] = expired
-	shard.data[2] = other
+	shard.tab.store(expired)
+	shard.tab.store(other)
 	atomic.StoreInt64(&shard.size, 2)
 	shard.sieve.insertMain(expired)
 	shard.sieve.insert(other, false)
@@ -436,7 +577,7 @@ func TestNonAdmissionPolicyDoesNotInitializeAdmissionState(t *testing.T) {
 }
 
 func TestSieveTinyLFUBoundedVictimNeedsForce(t *testing.T) {
-	a := newSieveTinyLFU[int, int](8, 25, 100)
+	a := newSieveTinyLFU[int, int](8, 0, 25, 100)
 	for k := 1; k <= 4; k++ {
 		a.insertMain(&cacheItem[int, int]{
 			key:     k,
@@ -485,8 +626,7 @@ func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
 
 	s := c.shards[0]
 	h := c.hasher.Sum(1)
-	tag := c.hasher.Tag(1)
-	if !s.sieve.ghost.contains(h, tag) {
+	if !s.sieve.ghost.contains(h) {
 		t.Fatal("expected cold eviction to leave a ghost entry")
 	}
 
@@ -494,7 +634,7 @@ func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
 	waitForWrites(t, c)
 
 	s.mu.RLock()
-	it, ok := s.data[1]
+	it, ok := s.tab.lookup(c.hasher.Sum(1), 1)
 	if !ok {
 		s.mu.RUnlock()
 		t.Fatal("ghost hit candidate was not resident")
@@ -512,10 +652,10 @@ func TestSieveTinyLFUGhostHitEntersMain(t *testing.T) {
 }
 
 func TestSieveTinyLFUGhostHitDoesNotResizeImmediately(t *testing.T) {
-	a := newSieveTinyLFU[int, int](100, 10, 100)
+	a := newSieveTinyLFU[int, int](100, 0, 10, 100)
 	start := a.probationCap
 	it := &cacheItem[int, int]{hash: 1}
-	a.ghost.add(it.hash, 0)
+	a.ghost.add(it.hash)
 
 	a.insert(it, true)
 
@@ -531,11 +671,8 @@ func TestSieveTinyLFUGhostHitDoesNotResizeImmediately(t *testing.T) {
 }
 
 func TestSieveTinyLFUMaintainForcesCapacityAfterBoundedScan(t *testing.T) {
-	s := &shard[int, int]{data: make(map[int]*cacheItem[int, int]), cap: 3}
-	s.initLRU()
-	s.sieve = newSieveTinyLFU[int, int](3, 25, 100)
-	var p sync.Pool
-	p.New = func() any { return &cacheItem[int, int]{} }
+	s := &shard[int, int]{tab: newHtable[int, int](3), cap: 3, stats: newStats(1)}
+	s.sieve = newSieveTinyLFU[int, int](3, 0, 25, 100)
 
 	var in *cacheItem[int, int]
 	for k := 1; k <= 4; k++ {
@@ -546,7 +683,7 @@ func TestSieveTinyLFUMaintainForcesCapacityAfterBoundedScan(t *testing.T) {
 			reuse:   1,
 			visited: sieveVisited,
 		}
-		s.data[k] = it
+		s.tab.store(it)
 		s.sieve.insertMain(it)
 		atomic.AddInt64(&s.size, 1)
 		if k == 4 {
@@ -554,7 +691,7 @@ func TestSieveTinyLFUMaintainForcesCapacityAfterBoundedScan(t *testing.T) {
 		}
 	}
 
-	s.enforceSieveCapacity(&p, true, in, true)
+	s.enforceSieveCapacity(true, in, true)
 
 	if sz := atomic.LoadInt64(&s.size); sz > s.cap {
 		t.Fatalf("size=%d exceeds cap=%d", sz, s.cap)
@@ -657,7 +794,7 @@ func TestSieveTinyLFUExistingUpdatePromotesProbation(t *testing.T) {
 
 	s := c.shards[0]
 	s.mu.RLock()
-	it := s.data[1]
+	it, _ := s.tab.lookup(c.hasher.Sum(1), 1)
 	q := it.queue
 	v := it.value
 	s.mu.RUnlock()
@@ -694,7 +831,7 @@ func TestSieveTinyLFUDeleteUnlinksQueue(t *testing.T) {
 	s.mu.RLock()
 	n := s.sieve.probation.size + s.sieve.main.size
 	sz := atomic.LoadInt64(&s.size)
-	_, ok := s.data[1]
+	_, ok := s.tab.lookup(c.hasher.Sum(1), 1)
 	s.mu.RUnlock()
 
 	if ok {
@@ -725,8 +862,8 @@ func TestSieveTinyLFUClearResetsPolicyState(t *testing.T) {
 	if atomic.LoadInt64(&s.size) != 0 {
 		t.Fatalf("size=%d, want 0", atomic.LoadInt64(&s.size))
 	}
-	if s.sieve.probation.size != 0 || s.sieve.main.size != 0 || len(s.sieve.ghost.index) != 0 {
-		t.Fatalf("policy state not cleared: p=%d m=%d g=%d", s.sieve.probation.size, s.sieve.main.size, len(s.sieve.ghost.index))
+	if s.sieve.probation.size != 0 || s.sieve.main.size != 0 || s.sieve.ghost.count() != 0 {
+		t.Fatalf("policy state not cleared: p=%d m=%d g=%d", s.sieve.probation.size, s.sieve.main.size, s.sieve.ghost.count())
 	}
 }
 
@@ -764,11 +901,8 @@ func TestSieveTinyLFUCleanupRemovesExpiredQueueItem(t *testing.T) {
 }
 
 func TestSieveTinyLFUMainSieveEvictionClearsVisited(t *testing.T) {
-	s := &shard[int, int]{data: make(map[int]*cacheItem[int, int])}
-	s.initLRU()
-	s.sieve = newSieveTinyLFU[int, int](4, 25, 100)
-	var p sync.Pool
-	p.New = func() any { return &cacheItem[int, int]{} }
+	s := &shard[int, int]{tab: newHtable[int, int](4), stats: newStats(1)}
+	s.sieve = newSieveTinyLFU[int, int](4, 0, 25, 100)
 
 	for k := 1; k <= 3; k++ {
 		it := &cacheItem[int, int]{
@@ -778,19 +912,19 @@ func TestSieveTinyLFUMainSieveEvictionClearsVisited(t *testing.T) {
 			reuse:   1,
 			visited: sieveVisited,
 		}
-		s.data[k] = it
+		s.tab.store(it)
 		s.sieve.insertMain(it)
 		atomic.AddInt64(&s.size, 1)
 	}
 
-	if ok := s.evictMain(&p, true, nil, false, s.sieve.main.size+1, true); !ok {
+	if ok := s.evictMain(true, nil, false, s.sieve.main.size+1, true); !ok {
 		t.Fatal("main eviction returned false")
 	}
-	if _, ok := s.data[1]; ok {
+	if _, ok := s.tab.lookup(1, 1); ok {
 		t.Fatal("expected oldest hand item to be evicted after visited-bit sweep")
 	}
 	for _, k := range []int{2, 3} {
-		it := s.data[k]
+		it, _ := s.tab.lookup(uint64(k), k)
 		if it == nil {
 			t.Fatalf("item %d missing", k)
 		}
@@ -801,8 +935,8 @@ func TestSieveTinyLFUMainSieveEvictionClearsVisited(t *testing.T) {
 	if s.sieve.main.size != 2 {
 		t.Fatalf("main size=%d, want 2", s.sieve.main.size)
 	}
-	if atomic.LoadInt64(&s.evictions) != 1 {
-		t.Fatalf("evictions=%d, want 1", atomic.LoadInt64(&s.evictions))
+	if _, _, ev, _ := s.stats.aggregate(); ev != 1 {
+		t.Fatalf("evictions=%d, want 1", ev)
 	}
 	if s.sieve.stats.MainEvictions != 1 {
 		t.Fatalf("main evictions=%d, want 1", s.sieve.stats.MainEvictions)
@@ -810,7 +944,7 @@ func TestSieveTinyLFUMainSieveEvictionClearsVisited(t *testing.T) {
 }
 
 func TestSieveTinyLFUEqualFrequencyTieRejection(t *testing.T) {
-	a := newSieveTinyLFU[int, int](4, 25, 100)
+	a := newSieveTinyLFU[int, int](4, 0, 25, 100)
 	in := &cacheItem[int, int]{hash: 11}
 	v := &cacheItem[int, int]{hash: 22, queue: mainQueue, reuse: 1}
 
@@ -831,6 +965,134 @@ func TestSieveTinyLFUEqualFrequencyTieRejection(t *testing.T) {
 	if !a.shouldAdmit(in, v, false) {
 		t.Fatal("unvisited zero-reuse victim should lose equal-frequency tie")
 	}
+}
+
+// TestSieveDropUnpublishedCandidateIsTableFreeAndIdempotent locks down the
+// late-publication drop contract. A rejected candidate is live in policy but was
+// never stored, so the drop must unlink it policy-only without touching the table,
+// and a redundant second drop must be a no-op - the cleared unpublished flag falls
+// through to removeExact, which fails because nothing was ever stored, so there is
+// no double policy-unlink and no size underflow.
+func TestSieveDropUnpublishedCandidateIsTableFreeAndIdempotent(t *testing.T) {
+	s := &shard[int, int]{tab: newHtable[int, int](4), cap: 4, stats: newStats(1)}
+	s.sieve = newSieveTinyLFU[int, int](4, 0, 25, 100)
+
+	// A published resident the candidate drop must leave untouched.
+	resident := &cacheItem[int, int]{key: 1, value: 1, hash: 1}
+	s.tab.store(resident)
+	s.sieve.insertMain(resident)
+	atomic.AddInt64(&s.size, 1)
+
+	// An unpublished candidate: linked into policy, deliberately absent from the
+	// table, exactly as applySieve holds a candidate during admission.
+	cand := &cacheItem[int, int]{key: 2, value: 2, hash: 2, unpublished: true}
+	s.sieve.insert(cand, false)
+	atomic.AddInt64(&s.size, 1)
+	if _, ok := s.tab.lookup(cand.hash, cand.key); ok {
+		t.Fatal("candidate must not be in the table before any drop")
+	}
+
+	if !s.dropSieveItem(cand, false, RemovedRejected) {
+		t.Fatal("dropping an unpublished candidate returned false")
+	}
+	if cand.unpublished {
+		t.Fatal("drop did not clear the unpublished flag")
+	}
+	if s.sieve.owns(cand) {
+		t.Fatal("drop left the candidate linked in a policy queue")
+	}
+	if _, ok := s.tab.lookup(cand.hash, cand.key); ok {
+		t.Fatal("drop published a candidate that was never stored")
+	}
+	if sz := atomic.LoadInt64(&s.size); sz != 1 {
+		t.Fatalf("size=%d after reject, want 1 (only the resident)", sz)
+	}
+
+	// Self-healing: re-dropping the same pointer is a no-op via removeExact.
+	if s.dropSieveItem(cand, false, RemovedRejected) {
+		t.Fatal("re-dropping a rejected candidate must be a no-op")
+	}
+	if sz := atomic.LoadInt64(&s.size); sz != 1 {
+		t.Fatalf("size=%d after redundant drop, want 1", sz)
+	}
+
+	// The resident is untouched: still in the table and still policy-owned.
+	if _, ok := s.tab.lookup(resident.hash, resident.key); !ok {
+		t.Fatal("resident vanished after dropping the candidate")
+	}
+	if !s.sieve.owns(resident) {
+		t.Fatal("resident lost its policy linkage")
+	}
+	if n := s.tab.length(); n != 1 {
+		t.Fatalf("table length=%d, want 1", n)
+	}
+}
+
+// TestSieveRejectedCandidateNeverPublished drives the real applySieve insert path
+// and forces a reject (a cold candidate under frequency admission cannot beat hot
+// incumbents). The rejected candidate must never reach the table - invisible to a
+// lock-free Get - and leave size and the policy queues consistent.
+func TestSieveRejectedCandidateNeverPublished(t *testing.T) {
+	c := newTestCache[int, int](t, Config{
+		MaxSize:         2,
+		ShardCount:      1,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  SieveTinyLFU,
+		StatsEnabled:    true,
+	})
+	defer c.Close()
+
+	s := c.shards[0]
+	p := s.sieve
+
+	// Seed two hot, evictable main residents and pin frequency admission so a
+	// never-seen candidate is rejected deterministically.
+	s.mu.Lock()
+	for _, k := range []int{1, 2} {
+		it := &cacheItem[int, int]{key: k, value: k, hash: c.hasher.Sum(k)}
+		s.tab.store(it)
+		p.insertMain(it)
+		clearSieveItemVisited(it) // no second chance: the hand evicts on first pass
+		it.reuse = 0
+		atomic.AddInt64(&s.size, 1)
+		for range 8 {
+			p.sketch.increment(it.hash) // make the incumbents look hot
+		}
+	}
+	p.tuner.mode = admitFrequency
+	s.mu.Unlock()
+
+	_, cmd, err := c.setCommand(99, 99, time.Hour, nil)
+	if err != nil {
+		t.Fatalf("setCommand: %v", err)
+	}
+	s.mu.Lock()
+	committed := c.applySieve(s, &cmd)
+	s.mu.Unlock()
+
+	if committed {
+		t.Fatal("cold candidate was admitted under frequency mode, want reject")
+	}
+	if _, ok := c.Get(99); ok {
+		t.Fatal("rejected candidate is visible to Get; it must never be published")
+	}
+
+	s.mu.RLock()
+	_, inTable := s.tab.lookup(cmd.hash, 99)
+	sz := atomic.LoadInt64(&s.size)
+	s.mu.RUnlock()
+
+	if inTable {
+		t.Fatal("rejected candidate left a slot in the table")
+	}
+	if sz != 2 {
+		t.Fatalf("size=%d after reject, want 2 (insert increment was undone)", sz)
+	}
+	if rejects := c.PolicyStats().Rejects; rejects != 1 {
+		t.Fatalf("policy rejects=%d, want 1", rejects)
+	}
+	assertSieveShardConsistent(t, s)
 }
 
 func TestSieveTinyLFUQueueSizeMatchesShardSizeAfterMixedOps(t *testing.T) {
@@ -1010,26 +1272,25 @@ func assertSieveShardConsistent[K comparable, V any](t *testing.T, s *shard[K, V
 	if s.sieve == nil {
 		t.Fatal("missing sieve policy state")
 	}
-	if int64(len(s.data)) != atomic.LoadInt64(&s.size) {
-		t.Fatalf("map size=%d, shard size=%d", len(s.data), atomic.LoadInt64(&s.size))
+	n := s.tab.length()
+	if int64(n) != atomic.LoadInt64(&s.size) {
+		t.Fatalf("table size=%d, shard size=%d", n, atomic.LoadInt64(&s.size))
 	}
 
-	seen := make(map[*cacheItem[K, V]]struct{}, len(s.data))
-	pn := assertSieveQueueConsistent(t, &s.sieve.probation, probationQueue, len(s.data), seen)
-	mn := assertSieveQueueConsistent(t, &s.sieve.main, mainQueue, len(s.data), seen)
+	seen := make(map[*cacheItem[K, V]]struct{}, n)
+	pn := assertSieveQueueConsistent(t, &s.sieve.probation, probationQueue, n, seen)
+	mn := assertSieveQueueConsistent(t, &s.sieve.main, mainQueue, n, seen)
 	total := pn + mn
 	if total != atomic.LoadInt64(&s.size) {
 		t.Fatalf("queue size=%d, shard size=%d", total, atomic.LoadInt64(&s.size))
 	}
 
-	for key, item := range s.data {
+	s.tab.forEach(func(item *cacheItem[K, V]) bool {
 		if _, ok := seen[item]; !ok {
-			t.Fatalf("resident key %v is not linked in any Sieve queue", key)
+			t.Fatalf("resident key %v is not linked in any Sieve queue", item.key)
 		}
-		if item.key != key {
-			t.Fatalf("resident key %v stored item key=%v", key, item.key)
-		}
-	}
+		return true
+	})
 }
 
 func assertSieveQueueConsistent[K comparable, V any](
@@ -1063,11 +1324,8 @@ func assertSieveQueueConsistent[K comparable, V any](
 		if it.next == nil || it.next.prev != it {
 			t.Fatal("queue next/prev linkage is inconsistent")
 		}
-		if it.sieveQ != q {
-			t.Fatalf("item queue owner mismatch: got %p want %p", it.sieveQ, q)
-		}
-		if it.queue != id {
-			t.Fatalf("item queue id=%d, want %d", it.queue, id)
+		if it.queue != id || it.queue != q.id {
+			t.Fatalf("item queue id=%d, want %d (q.id=%d)", it.queue, id, q.id)
 		}
 		if _, ok := seen[it]; ok {
 			t.Fatal("item is linked in multiple Sieve queues")

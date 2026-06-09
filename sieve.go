@@ -1,13 +1,13 @@
 package kioshun
 
-import (
-	"sync"
-	"sync/atomic"
-)
+import "sync/atomic"
 
 const (
-	defaultProbationRatio = 10
-	defaultGhostRatio     = 100
+	defaultProbationRatio = 1
+	// defaultGhostRatio sizes the B1 ghost as a percent of main capacity.
+	// A smaller B1 narrows the frequency core gap on stable hot set workloads
+	// (its readmissions stop repromoting cooling items).
+	defaultGhostRatio = 75
 )
 
 const (
@@ -24,18 +24,19 @@ const (
 	probationResurrectLow = 0.10
 
 	// probationGrowStepPct is how much of total capacity the probation window
-	// grows per maintenance window when a shifting hot set is detected. Larger
-	// than adaptStep (1%) so the window reaches a useful size within the short
-	// adaptation budget a shifting workload allows.
+	// grows per maintenance window when a shifting hot set is detected.
 	probationGrowStepPct = 10
 )
 
-// sieveQueueID mirrors queue ownership on cacheItem for cheap state inspection.
-// the authoritative ownership pointer is cacheItem.sieveQ.
+// sieveQueueID is the authoritative SIEVE queue ownership tag stored on each
+// cacheItem. It replaces an 8-byte owning-queue pointer with a single byte;
+// queueNone (the zero value, so a freshly allocated item starts unlinked) means
+// the item is in neither queue.
 type sieveQueueID uint8
 
 const (
-	probationQueue sieveQueueID = iota
+	queueNone sieveQueueID = iota
+	probationQueue
 	mainQueue
 )
 
@@ -59,20 +60,27 @@ func clearSieveItemVisited[K comparable, V any](it *cacheItem[K, V]) {
 	}
 }
 
-// sieveQueue is an FIFO queue backed by cacheItem links.
+// sieveQueue is a FIFO queue backed by cacheItem links. (id, owner) is the
+// queue's instance identity - the role (probation/main) and the owning shard -
+// stamped onto every item it links so holds/remove recognize membership of this
+// exact queue from the item's two one-byte tags instead of a back-pointer.
 type sieveQueue[K comparable, V any] struct {
-	head cacheItem[K, V]
-	tail cacheItem[K, V]
-	size int64
+	head  cacheItem[K, V]
+	tail  cacheItem[K, V]
+	size  int64
+	id    sieveQueueID
+	owner uint8 // shard index that owns this queue instance
 }
 
-func (q *sieveQueue[K, V]) init() {
+func (q *sieveQueue[K, V]) init(id sieveQueueID, owner uint8) {
+	q.id = id
+	q.owner = owner
 	q.head.prev = nil
 	q.head.next = &q.tail
-	q.head.sieveQ = nil
+	q.head.queue = queueNone
 	q.tail.prev = &q.head
 	q.tail.next = nil
-	q.tail.sieveQ = nil
+	q.tail.queue = queueNone
 	q.size = 0
 }
 
@@ -81,23 +89,18 @@ func (q *sieveQueue[K, V]) pushFront(it *cacheItem[K, V]) {
 	q.head.next = it
 	it.prev = &q.head
 	it.next = n
-	it.sieveQ = q
+	it.queue = q.id
+	it.queueOwner = q.owner
 	n.prev = it
 	q.size++
 }
 
-func (q *sieveQueue[K, V]) popBack() *cacheItem[K, V] {
-	if q.empty() {
-		return nil
-	}
-
-	it := q.tail.prev
-	q.remove(it)
-	return it
+func (q *sieveQueue[K, V]) ownsTag(it *cacheItem[K, V]) bool {
+	return it != nil && it.queue == q.id && it.queueOwner == q.owner
 }
 
 func (q *sieveQueue[K, V]) remove(it *cacheItem[K, V]) bool {
-	if it == nil || it.sieveQ != q || it.prev == nil || it.next == nil {
+	if !q.ownsTag(it) || it.prev == nil || it.next == nil {
 		return false
 	}
 	if it.prev.next != it || it.next.prev != it {
@@ -108,7 +111,7 @@ func (q *sieveQueue[K, V]) remove(it *cacheItem[K, V]) bool {
 	it.next.prev = it.prev
 	it.prev = nil
 	it.next = nil
-	it.sieveQ = nil
+	it.queue = queueNone
 	if q.size > 0 {
 		q.size--
 	}
@@ -123,12 +126,8 @@ func (q *sieveQueue[K, V]) isSentinel(it *cacheItem[K, V]) bool {
 	return it == &q.head || it == &q.tail
 }
 
-// holds reports whether it is a live, non-sentinel node currently linked into q.
-// remove clears sieveQ on eviction and the head/tail guards never carry a queue
-// pointer so this one check subsumes the nil/guard/ownership tests the policy
-// would otherwise spell out at each call site.
 func (q *sieveQueue[K, V]) holds(it *cacheItem[K, V]) bool {
-	return it != nil && it.sieveQ == q && it != &q.head && it != &q.tail
+	return q.ownsTag(it) && it != &q.head && it != &q.tail
 }
 
 // adaptiveController accumulates the per-cycle signals that drive probation/main
@@ -138,7 +137,7 @@ func (q *sieveQueue[K, V]) holds(it *cacheItem[K, V]) bool {
 //
 // mainSurvivals counts main queue residents the SIEVE hand spared during
 // eviction sweeps (a set visited bit buys a second chance). It is the
-// maintenance path proxy for "the main cache is earning its capacity" annd
+// maintenance path proxy for "the main cache is earning its capacity" and
 // replaces a per-read main hit counter whose increment contended on the
 // read hot path. Counting survivors instead of raw hits also tracks how many
 // distinct main items reads keep alive, rather than being skewed by a single
@@ -150,7 +149,7 @@ type adaptiveController struct {
 	mainSurvivals       uint64
 	observationsInCycle uint64
 
-	// churn cost for the admission tuner: evictions are residents displaced to
+	// cost for the admission tuner: evictions are residents displaced to
 	// stay in capacity, rejects are admitted candidates dropped again. Their sum
 	// falls when admission keeps a stable working set and rises when it thrashes,
 	// so it is the maintenance path proxy the admission tuner watches.
@@ -161,7 +160,7 @@ type adaptiveController struct {
 	// this cycle; cycleB2Hits counts inserts whose key was a recent main victim
 	// (a resurrection). The rate cycleB2Hits/cycleMainEvicts is high
 	// on loops (we keep evicting items we still need) and near zero on
-	// shifting/bursty/zipf workloads which is what the addmision tuner keys on.
+	// shifting/bursty/zipf workloads which is what the admission tuner keys on.
 	cycleMainEvicts uint64
 	cycleB2Hits     uint64
 }
@@ -215,13 +214,16 @@ const (
 )
 
 const (
-	admissionEntryEvidence = 3.0
-	admissionResurrectHigh = 0.5 // per-cycle resurrection rate that counts as evidence
-	admissionCommitFactor  = 0.9 // trial commits if churn < recency baseline * this
-	admissionRevertFactor  = 1.5 // committed reverts if churn > committed low * this
-	admissionChurnEWMA     = 0.5 // churn baseline smoothing
-	admissionBackoffStart  = 3   // recency cooldown cycles after a reverted trial
-	admissionBackoffMax    = 96  // ceiling on the doubling backoff
+	admissionEntryEvidence  = 1.0
+	admissionResurrectHigh  = 0.5 // per-cycle resurrection rate that counts as evidence
+	admissionCommitFactor   = 0.9 // trial commits if churn < recency baseline * this
+	admissionRevertFactor   = 1.5 // committed reverts if churn > committed low * this
+	admissionChurnEWMA      = 0.5 // churn baseline smoothing
+	admissionBackoffStart   = 3   // recency cooldown cycles after a reverted trial
+	admissionBackoffMax     = 96  // ceiling on the doubling backoff
+	adaptiveCycleMultiplier = 4
+	adaptiveMinCycleCap     = 1024
+	adaptiveMinCycle        = 8192
 )
 
 // admissionTuner self-selects a shard's admissionMode with no configuration. It
@@ -276,16 +278,22 @@ type sieveTinyLFU[K comparable, V any] struct {
 	minProbationCap int64
 	maxProbationCap int64
 	adaptStep       int64
+	costAdmission   CostAdmission
+	owner           uint8 // shard index stamped onto this shard's queue instances
 }
 
 // newSieveTinyLFU builds the per-shard admission state for a bounded shard.
 // Probation is clamped between 1% and 60% of capacity so main has room for
 // protected entries when capacity permits, while the ghost queue is sized as a
 // fraction of main.
-func newSieveTinyLFU[K comparable, V any](c int64, pr, gr uint8) *sieveTinyLFU[K, V] {
-	p := &sieveTinyLFU[K, V]{capacity: c}
-	p.probation.init()
-	p.main.init()
+func newSieveTinyLFU[K comparable, V any](c int64, owner uint8, pr, gr uint8, modes ...CostAdmission) *sieveTinyLFU[K, V] {
+	mode := CostAdmissionFrequency
+	if len(modes) > 0 {
+		mode = modes[0]
+	}
+	p := &sieveTinyLFU[K, V]{capacity: c, costAdmission: mode, owner: owner}
+	p.probation.init(probationQueue, owner)
+	p.main.init(mainQueue, owner)
 
 	if pr == 0 {
 		pr = defaultProbationRatio
@@ -360,29 +368,28 @@ func (p *sieveTinyLFU[K, V]) owns(it *cacheItem[K, V]) bool {
 }
 
 func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
-	// Reads only set the visited bit; queue ownership is maintained by the write.
-	// markSieveItemVisited is a conditional atomic store (skipped once the bit is
-	// set), so a hot item costs at most one shared-state load here. The adaptive
-	// controller's "main is useful" signal is gathered on the maintenance path
-	// (see findMainVictim), so the read path stays free of contended writes.
-	if p.owns(it) {
-		markSieveItemVisited(it)
-	}
+	// reads only set the visited bit. markSieveItemVisited is a conditional atomic
+	// store (skipped once the bit is set) so a hot item costs at most one
+	// shared-state load here. The read is lock-free, so it must not inspect queue
+	// ownership (it.queue is writer-only and would race the maintenance path); a
+	// resident table hit is in a SIEVE queue by construction, and setting the bit
+	// on an item the writer is concurrently moving or evicting is harmless. The
+	// adaptive controller's "main is useful" signal is gathered on the maintenance
+	// path (see findMainVictim), so the read path stays free of contended writes.
+	markSieveItemVisited(it)
 }
 
 // recordUpdate handles Set on an existing resident. Updates are treated as
 // reuse signals: main entries get another SIEVE chance, while probation entries
 // can be promoted before they reach the probation tail.
 func (p *sieveTinyLFU[K, V]) recordUpdate(it *cacheItem[K, V]) {
-	switch it.sieveQ {
-	case &p.main:
-		it.queue = mainQueue
+	switch it.queue {
+	case mainQueue:
 		markSieveItemVisited(it)
 		if it.reuse < maxItemReuse {
 			it.reuse++
 		}
-	case &p.probation:
-		it.queue = probationQueue
+	case probationQueue:
 		wasVisited := sieveItemVisited(it)
 		if it.reuse < maxItemReuse {
 			it.reuse++
@@ -399,16 +406,13 @@ func (p *sieveTinyLFU[K, V]) recordUpdate(it *cacheItem[K, V]) {
 // already shown that the item was evicted too soon; ghost hits bypass probation
 // and enter main as protected entries.
 func (p *sieveTinyLFU[K, V]) insert(it *cacheItem[K, V], gh bool) {
-	// A key that was a recent main eviction victim is "resurrecting": the cache
-	// evicted it too soon. The admission tuner counts resurrections to detect a
-	// loop-like workload (see tuneAdmission); placement itself is unchanged.
-	if p.mghost.contains(it.hash, it.tag) {
-		p.mghost.remove(it.hash, it.tag)
+	if p.mghost.contains(it.hash) {
+		p.mghost.remove(it.hash)
 		p.controller.cycleB2Hits++
 	}
 
 	if gh && p.mainCap > 0 {
-		p.ghost.remove(it.hash, it.tag)
+		p.ghost.remove(it.hash)
 		p.controller.ghostHits++
 		p.stats.GhostHits++
 		p.insertMain(it)
@@ -440,13 +444,13 @@ func (p *sieveTinyLFU[K, V]) remove(it *cacheItem[K, V]) bool {
 	}
 
 	removed := false
-	switch it.sieveQ {
-	case &p.main:
+	switch it.queue {
+	case mainQueue:
 		if p.hand == it {
 			p.hand = p.previousMainItem(it)
 		}
 		removed = p.main.remove(it)
-	case &p.probation:
+	case probationQueue:
 		removed = p.probation.remove(it)
 	default:
 		if p.hand == it {
@@ -457,16 +461,15 @@ func (p *sieveTinyLFU[K, V]) remove(it *cacheItem[K, V]) bool {
 		return false
 	}
 
-	it.queue = probationQueue
-	it.sieveQ = nil
+	// queue was reset to queueNone by the queue's remove; just clear recency.
 	it.reuse = 0
 	clearSieveItemVisited(it)
 	return true
 }
 
 func (p *sieveTinyLFU[K, V]) reset() {
-	p.probation.init()
-	p.main.init()
+	p.probation.init(probationQueue, p.owner)
+	p.main.init(mainQueue, p.owner)
 	p.ghost.clear()
 	p.mghost.clear()
 	p.sketch.clear()
@@ -478,7 +481,7 @@ func (p *sieveTinyLFU[K, V]) reset() {
 }
 
 func (p *sieveTinyLFU[K, V]) promote(it *cacheItem[K, V]) {
-	if it == nil || it.sieveQ != &p.probation || p.mainCap <= 0 {
+	if it == nil || it.queue != probationQueue || p.mainCap <= 0 {
 		return
 	}
 
@@ -488,25 +491,53 @@ func (p *sieveTinyLFU[K, V]) promote(it *cacheItem[K, V]) {
 	p.stats.Promotions++
 }
 
+// replaceNode swaps a resident's node identity in place: new takes old's exact
+// SIEVE queue position and recency state. A value update allocates a fresh
+// immutable item so lock-free readers never observe a torn value; keeping the
+// new node where the old one sat means the update is not mistaken for a fresh
+// insertion (recency is preserved).
+func (p *sieveTinyLFU[K, V]) replaceNode(old, new *cacheItem[K, V]) {
+	new.queue = old.queue
+	new.queueOwner = old.queueOwner
+	new.reuse = old.reuse
+	new.prev = old.prev
+	new.next = old.next
+	if old.prev != nil {
+		old.prev.next = new
+	}
+	if old.next != nil {
+		old.next.prev = new
+	}
+	if sieveItemVisited(old) {
+		markSieveItemVisited(new)
+	}
+	if p.hand == old {
+		p.hand = new
+	}
+	old.prev = nil
+	old.next = nil
+	old.queue = queueNone
+}
+
 // dropProbationVictim records a probation eviction and remembers the key for
 // possible ghost hit readmission.
-func (s *shard[K, V]) dropProbationVictim(it *cacheItem[K, V], pool *sync.Pool, stats bool) bool {
+func (s *shard[K, V]) dropProbationVictim(it *cacheItem[K, V], stats bool) bool {
 	p := s.sieve
-	h, tag := it.hash, it.tag
-	if !s.dropSieveItem(it, pool, stats, RemovedCapacity) {
+	h := it.hash
+	if !s.dropSieveItem(it, stats, RemovedCapacity) {
 		return false
 	}
 	p.controller.probationEvictions++
 	p.controller.cycleEvictions++
 	p.stats.ProbationEvictions++
-	p.ghost.add(h, tag)
+	p.ghost.add(h)
 	return true
 }
 
 // evictProbation inspects the oldest probation entry. A recently reused entry
 // is promoted and returned as an in-flight main candidate; a cold entry is
 // evicted and recorded in the ghost queue.
-func (s *shard[K, V]) evictProbation(pool *sync.Pool, stats bool) *cacheItem[K, V] {
+func (s *shard[K, V]) evictProbation(stats bool) *cacheItem[K, V] {
 	p := s.sieve
 	if p.probation.empty() {
 		return nil
@@ -521,7 +552,7 @@ func (s *shard[K, V]) evictProbation(pool *sync.Pool, stats bool) *cacheItem[K, 
 		return it
 	}
 
-	s.dropProbationVictim(it, pool, stats)
+	s.dropProbationVictim(it, stats)
 	return nil
 }
 
@@ -530,7 +561,6 @@ func (s *shard[K, V]) evictProbation(pool *sync.Pool, stats bool) *cacheItem[K, 
 // candidate is not counted as an eviction because the policy rejected the
 // candidate rather than selecting a replacement victim.
 func (s *shard[K, V]) evictMain(
-	pool *sync.Pool,
 	stats bool,
 	in *cacheItem[K, V],
 	tie bool,
@@ -538,7 +568,15 @@ func (s *shard[K, V]) evictMain(
 	force bool,
 ) bool {
 	p := s.sieve
-	if in != nil && (!s.ownsItem(in) || !p.owns(in)) {
+	// policy ownership is the liveness signal for the in-flight candidate, and a
+	// table-identity check would be both redundant and wrong here. At a writer
+	// decision point under s.mu the invariant holds: a published, policy-owned item
+	// is table-resident (eviction resets queue in lockstep with the table removal,
+	// so owns can never outlive the slot), so re-checking the table would only
+	// confirm what owns already implies; while an unpublished insert is
+	// intentionally table-absent until admission, so looking it up would wrongly
+	// reject it.
+	if in != nil && !p.owns(in) {
 		in = nil
 		tie = false
 	}
@@ -547,7 +585,7 @@ func (s *shard[K, V]) evictMain(
 	if v == nil {
 		if force && in != nil {
 			p.controller.cycleRejects++
-			s.dropSieveItem(in, pool, stats, RemovedRejected)
+			s.dropSieveItem(in, stats, RemovedRejected)
 			return true
 		}
 		return false
@@ -555,14 +593,14 @@ func (s *shard[K, V]) evictMain(
 
 	if in != nil && in != v && !p.shouldAdmit(in, v, tie) {
 		p.controller.cycleRejects++
-		return s.dropSieveItem(in, pool, stats, RemovedRejected)
+		return s.dropSieveItem(in, stats, RemovedRejected)
 	}
 
-	vh, vtag := v.hash, v.tag // capture before drop zeroes the item for B2
-	if s.dropSieveItem(v, pool, stats, RemovedCapacity) {
+	vh := v.hash // capture the victim hash for the B2 ghost before it is unlinked
+	if s.dropSieveItem(v, stats, RemovedCapacity) {
 		p.controller.cycleEvictions++
 		p.controller.cycleMainEvicts++
-		p.mghost.add(vh, vtag) // record for resurrection detection
+		p.mghost.add(vh) // record for resurrection detection
 		p.stats.MainEvictions++
 		return true
 	}
@@ -574,16 +612,13 @@ func (s *shard[K, V]) evictMain(
 // forced pass is a last-resort repair so promotions cannot leave the shard over
 // capacity.
 func (s *shard[K, V]) enforceSieveCapacity(
-	pool *sync.Pool,
 	stats bool,
 	in *cacheItem[K, V],
 	tie bool,
 ) {
 	p := s.sieve
-	// evicts the probation tail; a promoted survivor becomes
-	// the in-flight candidate weighed against the next main victim.
 	admitFromProbation := func() {
-		if it := s.evictProbation(pool, stats); it != nil {
+		if it := s.evictProbation(stats); it != nil {
 			in, tie = it, true
 		}
 	}
@@ -594,7 +629,36 @@ func (s *shard[K, V]) enforceSieveCapacity(
 		case p.probation.size > p.probationCap && !p.probation.empty():
 			admitFromProbation()
 		case (p.main.size > p.mainCap || s.overCapacity()) && !p.main.empty():
-			if s.evictMain(pool, stats, in, tie, defaultMainVictimScan, false) {
+			evictIn, evictTie := in, tie
+
+			inProbation := in != nil &&
+				in.queue == probationQueue &&
+				p.probation.size <= p.probationCap
+
+			// loopish mirrors adaptSize: a cyclic workload is being pinned by, or is
+			// accumulating evidence toward, frequency admission. Checking evidence (not
+			// just the committed mode) keeps shouldKeep from churning main at a cycle
+			// boundary, where the current-cycle resurrection counter has just reset.
+			loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
+
+			shouldKeep := inProbation &&
+				p.costAdmission == CostAdmissionFrequency &&
+				s.costCap == 0 &&
+				!loopish &&
+				(p.controller.cycleMainEvicts == 0 ||
+					p.controller.resurrectionRate() < probationResurrectLow)
+
+			if shouldKeep {
+				// probation (the recency admission window) is below target on an
+				// unweighted, non-loop, frequency-mode shard: keep the new first-touch
+				// resident and make main yield a slot instead of forcing it to beat
+				// stale sketch history before it can prove reuse. Gated off for weighted
+				// caches (costCap > 0), where keeping one large cold item would evict
+				// several main entries to free cost, and once the tuner has loop evidence
+				// or is pinning a loop, where churning main hurts the resident set.
+				evictIn, evictTie = nil, false
+			}
+			if s.evictMain(stats, evictIn, evictTie, defaultMainVictimScan, false) {
 				in, tie = nil, false
 			}
 		case s.overCapacity() && !p.probation.empty():
@@ -616,17 +680,29 @@ func (s *shard[K, V]) enforceSieveCapacity(
 		admitFromProbation()
 	}
 	if (p.main.size > p.mainCap || s.overCapacity()) && !p.main.empty() {
-		s.evictMain(pool, stats, in, tie, defaultMainVictimScan, true)
+		s.evictMain(stats, in, tie, defaultMainVictimScan, true)
 	}
-	if s.overCapacity() {
-		s.forceDropSieveItem(pool, stats)
+	for s.overCapacity() && s.tab.length() > 0 {
+		if !s.forceDropSieveItem(stats) {
+			return
+		}
 	}
 }
 
 func (s *shard[K, V]) overCapacity() bool {
 	// warm fill to the shard cap; enforce probation/main pressure only after a
 	// new admission would exceed resident capacity.
-	return atomic.LoadInt64(&s.size) > s.cap
+	if s.cap > 0 && atomic.LoadInt64(&s.size) > s.cap {
+		return true
+	}
+	return s.costCap > 0 && atomic.LoadInt64(&s.cost) > s.costCap
+}
+
+func (s *shard[K, V]) wouldOverCapacity(addCost int64) bool {
+	if s.cap > 0 && atomic.LoadInt64(&s.size) >= s.cap {
+		return true
+	}
+	return s.costCap > 0 && atomic.LoadInt64(&s.cost)+addCost > s.costCap
 }
 
 // mainCandidate normalizes a traversal cursor to a live main node: it falls back
@@ -680,12 +756,12 @@ func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K
 	}
 
 	if force {
-		it, ok := p.mainCandidate(it)
+		cit, ok := p.mainCandidate(it)
 		if !ok {
 			return nil
 		}
-		p.hand = p.previousMainItem(it)
-		return it
+		p.hand = p.previousMainItem(cit)
+		return cit
 	}
 
 	p.hand = it
@@ -717,7 +793,7 @@ func (p *sieveTinyLFU[K, V]) previousMainItem(it *cacheItem[K, V]) *cacheItem[K,
 func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool {
 	if p.tuner.mode == admitFrequency {
 		// plain TinyLFU: incumbent wins ties, pinning a stable set for loops.
-		return p.estimate(in.hash) > p.estimate(v.hash)
+		return p.compareAdmissionScore(in, v) > 0
 	}
 
 	// ghost hit or probation promotion has already proven short-term reuse.
@@ -727,18 +803,92 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 		return true
 	}
 
-	cf := p.estimate(in.hash)
-	vf := p.estimate(v.hash)
-	if cf > vf {
+	cmp := p.compareAdmissionScore(in, v)
+	if cmp > 0 {
 		return true
 	}
-	if cf < vf {
-		if tie && cf+1 >= vf {
+	if cmp < 0 {
+		if tie && p.closeAdmissionScore(in, v) {
 			return true
 		}
 		return false
 	}
 	return tie || (!sieveItemVisited(v) && v.reuse == 0)
+}
+
+// compareAdmissionScore orders candidate against victim. Frequency mode is a
+// plain frequency comparison and pays no cost overhead. Cost-aware modes weight
+// each frequency by the other item's cost denominator, cross-multiplied to
+// compare the ratios frequency/cost without dividing.
+func (p *sieveTinyLFU[K, V]) compareAdmissionScore(in, v *cacheItem[K, V]) int {
+	cf := uint64(p.estimate(in.hash))
+	vf := uint64(p.estimate(v.hash))
+	if p.costAdmission == CostAdmissionFrequency {
+		return compareUint64(cf, vf)
+	}
+	return compareUint64(mulScore(cf, p.costDenom(v)), mulScore(vf, p.costDenom(in)))
+}
+
+// closeAdmissionScore reports whether the candidate is within one frequency
+// step of the victim, the tie-break used when SIEVE has already proven reuse.
+func (p *sieveTinyLFU[K, V]) closeAdmissionScore(in, v *cacheItem[K, V]) bool {
+	cf := uint64(p.estimate(in.hash))
+	vf := uint64(p.estimate(v.hash))
+	if p.costAdmission == CostAdmissionFrequency {
+		return cf+1 >= vf
+	}
+	return mulScore(cf+1, p.costDenom(v)) >= mulScore(vf, p.costDenom(in))
+}
+
+// costDenom is the admission denominator for an item under a cost-aware mode.
+// It is only reached when costAdmission is not Frequency. Density uses the
+// clamped cost directly; Balanced takes its integer square root and is the only
+// mode that pays a per-comparison square root.
+func (p *sieveTinyLFU[K, V]) costDenom(it *cacheItem[K, V]) uint64 {
+	if p.costAdmission == CostAdmissionBalanced {
+		return isqrt64(scoreCost(it.cost))
+	}
+	return scoreCost(it.cost)
+}
+
+// scoreCost clamps a raw cost to a positive admission weight so a zero- or
+// unit-cost item never zeroes the cross-multiplied comparison.
+func scoreCost(cost int64) uint64 {
+	if cost <= 1 {
+		return 1
+	}
+	return uint64(cost)
+}
+
+func compareUint64(a, b uint64) int {
+	switch {
+	case a > b:
+		return 1
+	case a < b:
+		return -1
+	default:
+		return 0
+	}
+}
+
+func mulScore(a, b uint64) uint64 {
+	if a != 0 && b > ^uint64(0)/a {
+		return ^uint64(0)
+	}
+	return a * b
+}
+
+func isqrt64(n uint64) uint64 {
+	if n <= 1 {
+		return 1
+	}
+	x := n
+	y := (x + 1) >> 1
+	for y < x {
+		x = y
+		y = (x + n/x) >> 1
+	}
+	return x
 }
 
 // tick advances the self-tuning controllers once per window of observations. The
@@ -747,7 +897,10 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 // so they run together before the cycle resets.
 func (p *sieveTinyLFU[K, V]) tick() {
 	p.controller.observationsInCycle++
-	win := uint64(p.capacity * 10)
+	win := uint64(p.capacity * adaptiveCycleMultiplier)
+	if p.capacity >= adaptiveMinCycleCap {
+		win = max(win, uint64(adaptiveMinCycle))
+	}
 	if win == 0 || p.controller.observationsInCycle < win {
 		return
 	}
@@ -775,13 +928,14 @@ func (p *sieveTinyLFU[K, V]) tick() {
 // frequency - on a small probation.
 //
 // Otherwise it falls back to the original recency heuristic: grow modestly when
-// B1 ghost hits dominate probation evictions (probation too small, the loop grow
-// path included), shrink when probation churns far more than it promotes while
-// main keeps earning its keep (probation too large for a stationary workload).
+// B1 ghost hits dominate probation evictions and the dual-ghost signal says
+// main victims are not resurrecting, shrink when probation churns far more than
+// it promotes while main keeps earning its keep (probation too large for a
+// stationary workload).
 func (p *sieveTinyLFU[K, V]) adaptSize() {
 	c := &p.controller
 	resurrect := c.resurrectionRate()
-	// A cyclic ("loop") workload is identified by the admission tuner accumulating
+	// cyclic ("loop") workload is identified by the admission tuner accumulating
 	// resurrection evidence (or already committed to frequency); while that
 	// signature is present probation stays small so the pinned set holds.
 	loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
@@ -789,13 +943,13 @@ func (p *sieveTinyLFU[K, V]) adaptSize() {
 	switch {
 	case !loopish && c.cycleMainEvicts > c.promotions &&
 		resurrect < probationResurrectLow && c.ghostHits > c.promotions:
-		// Shifting hot set: grow the recency window quickly so newly hot entries
+		// shifting hot set: grow the recency window quickly so newly hot entries
 		// survive to their reuse instead of being evicted from a tiny probation.
 		if p.probationCap < p.maxProbationCap {
 			step := max(int64(1), p.capacity*probationGrowStepPct/100)
 			p.setProbationCap(p.probationCap + step)
 		}
-	case c.ghostHits > c.probationEvictions/4:
+	case !loopish && resurrect < probationResurrectLow && c.ghostHits > c.probationEvictions/4:
 		if p.probationCap < p.maxProbationCap {
 			p.setProbationCap(p.probationCap + p.adaptStep)
 		}
@@ -827,10 +981,10 @@ func (p *sieveTinyLFU[K, V]) tuneAdmission() {
 			t.cooldown--
 			return
 		}
-		// Accumulate resurrection evidence weighted by strength: a pure loop
-		// (resurrection ~1.0) reaches the threshold in ~3 cycles; a workload whose
-		// victims are abandoned (shifting/bursty, resurrection ~0) never does, so it
-		// never trials frequency and never regresses.
+		// accumulate resurrection evidence weighted by strength: a pure loop
+		// (resurrection ~1.0) reaches the threshold in one strong cycle; a workload
+		// whose victims are abandoned (shifting/bursty, resurrection ~0) never does,
+		// so it never trials frequency and never regresses.
 		if resurrect >= admissionResurrectHigh {
 			t.evidence += resurrect
 		} else {
@@ -852,7 +1006,7 @@ func (p *sieveTinyLFU[K, V]) tuneAdmission() {
 		}
 
 	case tunerFrequency:
-		// Escape when churn climbs above the pinned low reference (the workload
+		// escape when climbs above the pinned low reference (the workload
 		// shifted out from under the pinned set) or back toward the recency
 		// baseline (frequency stopped helping).
 		if churn > t.lowChurn*admissionRevertFactor || churn > t.baseChurn*admissionCommitFactor {
@@ -882,21 +1036,21 @@ func (p *sieveTinyLFU[K, V]) setProbationCap(n int64) {
 
 // forceDropSieveItem is the final capacity repair path. It removes the
 // probation tail first, then a forced main victim if probation is empty.
-func (s *shard[K, V]) forceDropSieveItem(pool *sync.Pool, stats bool) bool {
+func (s *shard[K, V]) forceDropSieveItem(stats bool) bool {
 	p := s.sieve
 	if !p.probation.empty() {
 		it := p.probation.tail.prev
 		if !p.probation.holds(it) {
 			return false
 		}
-		return s.dropProbationVictim(it, pool, stats)
+		return s.dropProbationVictim(it, stats)
 	}
 	if !p.main.empty() {
 		it := p.findMainVictim(1, true)
 		if it == nil {
 			return false
 		}
-		if s.dropSieveItem(it, pool, stats, RemovedCapacity) {
+		if s.dropSieveItem(it, stats, RemovedCapacity) {
 			p.controller.cycleEvictions++
 			p.stats.MainEvictions++
 			return true
@@ -905,6 +1059,6 @@ func (s *shard[K, V]) forceDropSieveItem(pool *sync.Pool, stats bool) bool {
 	return false
 }
 
-func (s *shard[K, V]) dropSieveItem(it *cacheItem[K, V], pool *sync.Pool, stats bool, reason RemovalReason) bool {
-	return s.dropItem(it, pool, stats, reason, dropSieve)
+func (s *shard[K, V]) dropSieveItem(it *cacheItem[K, V], stats bool, reason RemovalReason) bool {
+	return s.dropItem(it, stats, reason, dropSieve)
 }

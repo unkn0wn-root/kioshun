@@ -4,16 +4,9 @@ package kioshun
 type RemovalReason uint8
 
 const (
-	// RemovedCapacity: an established resident was displaced to keep the shard
-	// within capacity. Only this reason is counted in Stats().Evictions.
 	RemovedCapacity RemovalReason = iota
-	// RemovedRejected: SieveTinyLFU declined to keep an admitted candidate, such
-	// as a just Set key or a promoted probation entry.
 	RemovedRejected
-	// RemovedExpired: the entry passed its TTL and was reclaimed, either by the
-	// background sweeper or lazily on access. Counted in Stats().Expirations.
 	RemovedExpired
-	// RemovedDeleted: the entry was removed by an explicit Delete.
 	RemovedDeleted
 )
 
@@ -107,9 +100,6 @@ func (c *Cache[K, V]) removeNotifyWorker() {
 		case <-c.removeWake:
 			c.drainRemovals()
 		case <-c.closeCh:
-			// deliver whatever was staged before shutdown, then exit. Close waits
-			// on this worker before clearing shards, so no removal can be staged
-			// after this final drain returns.
 			c.drainRemovals()
 			return
 		}

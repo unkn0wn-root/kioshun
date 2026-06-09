@@ -6,17 +6,19 @@ import (
 )
 
 type shard[K comparable, V any] struct {
-	mu   sync.RWMutex
-	data map[K]*cacheItem[K, V]
-	cap  int64 // resident item limit for this shard; 0 => unlimited
+	mu      sync.RWMutex // serializes writers (and cold scans); reads of tab are lock-free
+	tab     *htable[K, V]
+	stats   *stats // shared per-P telemetry
+	cap     int64  // resident item limit for this shard; 0 => unlimited
+	costCap int64  // same
 
-	queue writeQueue[K, V] // async mutation transport consumed by this shard's worker
+	queue *mpscQueue[K, V] // async mutation transport consumed by this shard's worker
 
 	// worker's wake-up: producers ping it after enqueuing a
 	// write and read sampling pings it when a stripe fills. Buffered size 1.
 	wake chan struct{}
 
-	// keeps the MPSC queue single-consumer while allowing synchronous
+	// keeps the MPSC queue single consumer while allowing synchronous
 	// callers to help drain their own shard instead of always waiting for the
 	// background worker to run.
 	drainMu    sync.Mutex
@@ -32,13 +34,10 @@ type shard[K comparable, V any] struct {
 	head *cacheItem[K, V]
 	tail *cacheItem[K, V]
 
-	lfuList *lfuList[K, V] // Allocated only for pure LFU policy.
+	lfuList *lfuList[K, V] // allocated only for pure LFU policy.
 
-	size        int64 // live items
-	hits        int64 // per-shard hits
-	misses      int64 // per-shard misses
-	evictions   int64 // per-shard evictions
-	expirations int64 // per-shard TTL expirations
+	size int64 // live items
+	cost int64 // live item cost
 
 	sieve *sieveTinyLFU[K, V]
 
@@ -64,22 +63,28 @@ const (
 	dropSieve
 )
 
-// dropItem removes a resident item from data, unlinks its policy metadata, and
-// returns the cacheItem to the pool. The data check rejects stale queue or hand
-// pointers that may still reference an item after another path already removed
-// or replaced it.
+// dropItem removes a resident item from the table and unlinks its policy
+// metadata. removeExact both rejects stale queue or hand pointers (it only
+// removes when the slot still holds exactly this item) and frees the slot in a
+// single probe, so the downstream unlinks always operate on a confirmed resident.
+// The item itself is not recycled: a lock-free reader may still hold it, so the
+// GC reclaims it.
 func (s *shard[K, V]) dropItem(
 	item *cacheItem[K, V],
-	itemPool *sync.Pool,
 	statsEnabled bool,
 	reason RemovalReason,
 	mode itemDropMode,
 ) bool {
-	key, ok := s.itemKey(item)
-	if !ok {
+	if item == nil {
 		return false
 	}
-	if s.data[key] != item {
+	// an unpublished SieveTinyLFU candidate is live in the policy queues but was
+	// never stored, so it has no table slot to reclaim; unlink policy-only. Every
+	// other item is a confirmed resident and removeExact both rejects stale
+	// queue/hand pointers and frees the slot.
+	if item.unpublished {
+		item.unpublished = false
+	} else if !s.tab.removeExact(item) {
 		return false
 	}
 
@@ -89,9 +94,7 @@ func (s *shard[K, V]) dropItem(
 		s.removeFromLRU(item)
 	case dropSieve:
 		if s.sieve != nil {
-			if !s.sieve.remove(item) {
-				return false
-			}
+			s.sieve.remove(item)
 		} else {
 			s.removeFromLRU(item)
 		}
@@ -99,15 +102,16 @@ func (s *shard[K, V]) dropItem(
 		s.removeFromLRU(item)
 	}
 
-	delete(s.data, key)
-	if s.stageRemoval(key, item.value, reason) {
+	if s.stageRemoval(item.key, item.value, reason) {
 		s.removePending.Store(true)
 		signal(s.removeWake)
 	}
-	releaseCacheItem(itemPool, item)
+	if item.cost != 0 {
+		atomic.AddInt64(&s.cost, -item.cost)
+	}
 	atomic.AddInt64(&s.size, -1)
 	if statsEnabled && reason == RemovedCapacity {
-		atomic.AddInt64(&s.evictions, 1)
+		s.stats.recordEviction()
 	}
 	return true
 }
@@ -120,37 +124,19 @@ func (s *shard[K, V]) stageRemoval(key K, value V, reason RemovalReason) bool {
 	return true
 }
 
-func (s *shard[K, V]) itemKey(item *cacheItem[K, V]) (K, bool) {
-	if item == nil {
-		var zero K
-		return zero, false
-	}
-	return item.key, true
-}
-
-func (s *shard[K, V]) ownsItem(item *cacheItem[K, V]) bool {
-	key, ok := s.itemKey(item)
-	return ok && s.data[key] == item
-}
-
-// belowSieveWarmupLocked reports the initial fill phase for bounded
-// SieveTinyLFU shards. During warmup admission is unconditional so the cache can
-// seed resident state before the frequency sketch starts rejecting candidates.
-func (s *shard[K, V]) belowSieveWarmupLocked() bool {
-	return s.cap > 0 && s.size*2 < s.cap
+// belowSieveWarmup reports the initial fill phase for bounded SieveTinyLFU
+// shards. During warmup admission is unconditional so the cache can seed resident
+// state before the frequency sketch starts rejecting candidates.
+func (s *shard[K, V]) belowSieveWarmup() bool {
+	return s.cap > 0 && atomic.LoadInt64(&s.size)*2 < s.cap
 }
 
 // sampleRead records a read access into the per-shard read buffer. sample()
-// reports backlog when the consumer has fallen a full window behind. When that
-// happens and drainInline is set, the reader drains that one stripe itself if it
-// can claim the single consumer token without blocking, bounding inline work to
-// a single stripe; otherwise it wakes the worker. Below that backlog this is
-// just the buffer append.
-//
-// drainInline must be false when the caller holds s.mu: the synchronous write
-// path locks drainMu before s.mu, so draining under s.mu would invert that
-// order and it would also extend an exclusive hold with sketch work. The
-func (s *shard[K, V]) sampleRead(h uint64, drainInline bool) {
+// reports backlog when the consumer has fallen a full window behind; the reader
+// then drains that one stripe itself if it can claim the single-consumer token
+// without blocking (bounding inline work to a single stripe), otherwise it wakes
+// the worker. Below that backlog this is just the buffer append.
+func (s *shard[K, V]) sampleRead(h uint64) {
 	if s.wake == nil {
 		return
 	}
@@ -158,7 +144,7 @@ func (s *shard[K, V]) sampleRead(h uint64, drainInline bool) {
 	if !needDrain {
 		return
 	}
-	if drainInline && s.sieve != nil && s.drainMu.TryLock() {
+	if s.sieve != nil && s.drainMu.TryLock() {
 		s.drainStripe(s.sieve, &s.readBuf.stripes[stripe])
 		s.drainMu.Unlock()
 		return
@@ -167,8 +153,7 @@ func (s *shard[K, V]) sampleRead(h uint64, drainInline bool) {
 }
 
 // drainReadSamples replays every stripe's buffered read fingerprints into the
-// frequency sketch. Queue drains are serialized by drainMu so policy maintenance
-// remains single consumer even when synchronous callers help drain their shard.
+// frequency sketch.
 func (s *shard[K, V]) drainReadSamples() {
 	p := s.sieve
 	if p == nil {
@@ -179,9 +164,9 @@ func (s *shard[K, V]) drainReadSamples() {
 	}
 }
 
-// drainStripe replays one stripe's fingerprints into the sketch. The caller must
-// hold drainMu (the single consumer token). When producers have lapped the
-// consumer only the most recent window survives; older samples are dropped.
+// drainStripe replays one stripe's fingerprints into the sketch.
+// When producers have lapped the consumer only the most recent window survives.
+// Older samples are dropped.
 func (s *shard[K, V]) drainStripe(p *sieveTinyLFU[K, V], st *readStripe) {
 	t := st.tail.Load()
 	h := st.head.Load()
@@ -244,40 +229,43 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[K, V]) {
 }
 
 // cleanup expires items under the shard lock and mirrors the same policy unlink
-// rules used by normal deletion. It gathers keys first so the scan phase stays
-// separate from unlinking and item pooling.
-func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, itemPool *sync.Pool, statsEnabled bool) {
+// rules used by normal deletion. It collects the expired items first so the scan
+// phase stays separate from unlinking and removal.
+func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, statsEnabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var keysToDelete []K
-	for key, item := range s.data {
+	var expired []*cacheItem[K, V]
+	s.tab.forEach(func(item *cacheItem[K, V]) bool {
 		if item.expireTime > 0 && now > item.expireTime {
-			keysToDelete = append(keysToDelete, key)
+			expired = append(expired, item)
 		}
-	}
+		return true
+	})
 
 	staged := false
-	for _, key := range keysToDelete {
-		if item, exists := s.data[key]; exists {
-			delete(s.data, key)
-			if s.stageRemoval(key, item.value, RemovedExpired) {
-				staged = true
-			}
-			switch {
-			case evictionPolicy == LFU:
-				s.lfuList.remove(item)
-				s.removeFromLRU(item)
-			case evictionPolicy == SieveTinyLFU && s.sieve != nil:
-				s.sieve.remove(item)
-			default:
-				s.removeFromLRU(item)
-			}
-			releaseCacheItem(itemPool, item)
-			atomic.AddInt64(&s.size, -1)
-			if statsEnabled {
-				atomic.AddInt64(&s.expirations, 1)
-			}
+	for _, item := range expired {
+		if !s.tab.removeExact(item) {
+			continue
+		}
+		if s.stageRemoval(item.key, item.value, RemovedExpired) {
+			staged = true
+		}
+		switch {
+		case evictionPolicy == LFU:
+			s.lfuList.remove(item)
+			s.removeFromLRU(item)
+		case evictionPolicy == SieveTinyLFU && s.sieve != nil:
+			s.sieve.remove(item)
+		default:
+			s.removeFromLRU(item)
+		}
+		if item.cost != 0 {
+			atomic.AddInt64(&s.cost, -item.cost)
+		}
+		atomic.AddInt64(&s.size, -1)
+		if statsEnabled {
+			s.stats.recordExpiration()
 		}
 	}
 

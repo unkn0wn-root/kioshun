@@ -212,11 +212,11 @@ func TestCacheConcurrency(t *testing.T) {
 	numOperations := 100
 
 	// Concurrent writes
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
+			for j := range numOperations {
 				key := fmt.Sprintf("key:%d:%d", id, j)
 				cache.Set(key, id*numOperations+j, 1*time.Minute)
 			}
@@ -228,7 +228,7 @@ func TestCacheConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
+			for j := range numOperations {
 				key := fmt.Sprintf("key:%d:%d", id, j)
 				cache.Get(key)
 			}
@@ -464,6 +464,25 @@ func TestNewValidatesConfig(t *testing.T) {
 			value:  -1,
 			reason: "must be >= 0",
 		},
+		{
+			name: "sieve cost budget without max size",
+			config: Config{
+				EvictionPolicy: SieveTinyLFU,
+				MaxCost:        5,
+			},
+			field:  "MaxSize",
+			value:  int64(0),
+			reason: "must be > 0 for SieveTinyLFU when MaxCost is set",
+		},
+		{
+			name: "default policy cost budget without max size",
+			config: Config{
+				MaxCost: 5, // EvictionPolicy unset resolves to SieveTinyLFU
+			},
+			field:  "MaxSize",
+			value:  int64(0),
+			reason: "must be > 0 for SieveTinyLFU when MaxCost is set",
+		},
 	}
 
 	for _, tt := range tests {
@@ -504,6 +523,61 @@ func TestManagerRegisterValidatesConfig(t *testing.T) {
 	}
 	if configErr.Field != "MaxSize" {
 		t.Fatalf("ConfigError.Field = %q, want MaxSize", configErr.Field)
+	}
+}
+
+func TestRegisterCacheAppliesTypedOptions(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	cfg := DefaultConfig()
+	cfg.MaxSize = 100
+	cfg.MaxCost = 10
+	cfg.ShardCount = 1
+	cfg.CleanupInterval = 0
+	cfg.EvictionPolicy = LRU
+
+	err := RegisterCache[string, []byte](manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
+		return int64(len(value))
+	}))
+	if err != nil {
+		t.Fatalf("RegisterCache() error = %v", err)
+	}
+
+	cache, err := GetCache[string, []byte](manager, "weighted")
+	if err != nil {
+		t.Fatalf("GetCache() error = %v", err)
+	}
+	if err := cache.Set("small", []byte("1234"), NoExpiration); err != nil {
+		t.Fatalf("Set small error = %v", err)
+	}
+	if got := cache.Cost(); got != 4 {
+		t.Fatalf("Cost() = %d, want weighted cost 4", got)
+	}
+	if err := cache.Set("large", make([]byte, 11), NoExpiration); !errors.Is(err, ErrItemTooLarge) {
+		t.Fatalf("Set large error = %v, want ErrItemTooLarge", err)
+	}
+}
+
+func TestRegisterCacheTypeMismatchDoesNotCreateInstance(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	cfg := DefaultConfig()
+	cfg.CleanupInterval = 0
+	if err := RegisterCache[int, int](manager, "typed", cfg); err != nil {
+		t.Fatalf("RegisterCache() error = %v", err)
+	}
+
+	if _, err := GetCache[string, int](manager, "typed"); !errors.Is(err, ErrTypeMismatch) {
+		t.Fatalf("GetCache() mismatch error = %v, want ErrTypeMismatch", err)
+	}
+	if stats := manager.Stats(); len(stats) != 0 {
+		t.Fatalf("type mismatch created a cache instance; stats=%v", stats)
+	}
+
+	if _, err := GetCache[int, int](manager, "typed"); err != nil {
+		t.Fatalf("GetCache() with registered type error = %v", err)
 	}
 }
 
@@ -573,6 +647,38 @@ func TestManagerCloseAllPreservesConfigs(t *testing.T) {
 	}
 }
 
+func TestManagerCloseAllPreservesTypedRegistration(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	cfg := DefaultConfig()
+	cfg.MaxSize = 100
+	cfg.MaxCost = 5
+	cfg.ShardCount = 1
+	cfg.CleanupInterval = 0
+	cfg.EvictionPolicy = LRU
+
+	if err := RegisterCache[string, []byte](manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
+		return int64(len(value))
+	})); err != nil {
+		t.Fatalf("RegisterCache() error = %v", err)
+	}
+	if _, err := GetCache[string, []byte](manager, "weighted"); err != nil {
+		t.Fatalf("GetCache() error = %v", err)
+	}
+	if err := manager.CloseAll(); err != nil {
+		t.Fatalf("CloseAll() error = %v", err)
+	}
+
+	cache, err := GetCache[string, []byte](manager, "weighted")
+	if err != nil {
+		t.Fatalf("GetCache() after CloseAll error = %v", err)
+	}
+	if err := cache.Set("large", make([]byte, 6), NoExpiration); !errors.Is(err, ErrItemTooLarge) {
+		t.Fatalf("Set large error = %v, want ErrItemTooLarge after CloseAll rebuild", err)
+	}
+}
+
 func TestGetCacheWithConfig(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(func() { manager.CloseAll() })
@@ -608,6 +714,34 @@ func TestGetCacheWithConfig(t *testing.T) {
 	// Type mismatch is reported, mirroring GetCache.
 	if _, err := GetCacheWithConfig[string, string](manager, "c", cfg); !errors.Is(err, ErrTypeMismatch) {
 		t.Fatalf("GetCacheWithConfig() type mismatch error = %v, want ErrTypeMismatch", err)
+	}
+}
+
+func TestGetCacheWithConfigAppliesTypedOptions(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(func() { manager.CloseAll() })
+
+	cfg := DefaultConfig()
+	cfg.MaxSize = 100
+	cfg.MaxCost = 8
+	cfg.ShardCount = 1
+	cfg.CleanupInterval = 0
+	cfg.EvictionPolicy = LRU
+
+	cache, err := GetCacheWithConfig[string, []byte](manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
+		return int64(len(value))
+	}))
+	if err != nil {
+		t.Fatalf("GetCacheWithConfig() error = %v", err)
+	}
+	if err := cache.Set("small", []byte("12345"), NoExpiration); err != nil {
+		t.Fatalf("Set small error = %v", err)
+	}
+	if got := cache.Cost(); got != 5 {
+		t.Fatalf("Cost() = %d, want weighted cost 5", got)
+	}
+	if err := cache.Set("large", make([]byte, 9), NoExpiration); !errors.Is(err, ErrItemTooLarge) {
+		t.Fatalf("Set large error = %v, want ErrItemTooLarge", err)
 	}
 }
 
@@ -675,7 +809,7 @@ func TestSetAsyncReturnsAfterEnqueueBeforeCommit(t *testing.T) {
 		t.Fatal("set blocked until commit; expected enqueue-only return")
 	}
 
-	if _, ok := shard.data["key"]; ok {
+	if _, ok := shard.tab.lookup(cache.hasher.Sum("key"), "key"); ok {
 		t.Fatal("set committed while shard lock was held")
 	}
 
@@ -720,7 +854,7 @@ func TestSetWaitsForCommit(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	if _, ok := shard.data["key"]; ok {
+	if _, ok := shard.tab.lookup(cache.hasher.Sum("key"), "key"); ok {
 		t.Fatal("set committed while shard lock was held")
 	}
 
@@ -784,7 +918,29 @@ func TestDeleteOrdersAfterPendingSet(t *testing.T) {
 	}
 }
 
-// Basic benchmarks are in cache_bench_test.go
+func TestSetAsyncAppliesInlineWhenUncontended(t *testing.T) {
+	cache := newTestCache[int, int](t, Config{
+		MaxSize:         1024,
+		ShardCount:      8,
+		CleanupInterval: 0,
+		DefaultTTL:      time.Hour,
+		EvictionPolicy:  LRU,
+		WriteBufferSize: 16,
+		WriteBatchSize:  8,
+	})
+	defer cache.Close()
+
+	for i := range 32 {
+		if err := cache.SetAsync(i, i*7, time.Hour); err != nil {
+			t.Fatalf("SetAsync(%d): %v", i, err)
+		}
+		// No Sync between the write and the read: an uncontended SetAsync must
+		// have applied inline for the key to be visible here.
+		if v, ok := cache.Get(i); !ok || v != i*7 {
+			t.Fatalf("key %d not visible after uncontended SetAsync; got %d ok=%v", i, v, ok)
+		}
+	}
+}
 
 type User struct {
 	ID        string    `json:"id"`
@@ -793,7 +949,6 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Test that verifies the new Set method's in-place update behavior
 func TestSetInPlaceUpdate(t *testing.T) {
 	config := Config{
 		MaxSize:         100,
@@ -818,7 +973,7 @@ func TestSetInPlaceUpdate(t *testing.T) {
 	// Get the item pointer before update (if we could access it)
 	shard := cache.getShard("key1")
 	shard.mu.RLock()
-	originalItem := shard.data["key1"]
+	originalItem, _ := shard.tab.lookup(cache.hasher.Sum("key1"), "key1")
 	shard.mu.RUnlock()
 
 	// Update the same key - should reuse the item
@@ -832,7 +987,7 @@ func TestSetInPlaceUpdate(t *testing.T) {
 
 	// Check that item was reused (same pointer)
 	shard.mu.RLock()
-	updatedItem := shard.data["key1"]
+	updatedItem, _ := shard.tab.lookup(cache.hasher.Sum("key1"), "key1")
 	shard.mu.RUnlock()
 
 	if originalItem != updatedItem {
@@ -846,7 +1001,6 @@ func TestSetInPlaceUpdate(t *testing.T) {
 	}
 }
 
-// Test LFU frequency reset behavior on Set
 func TestSetLFUFrequencyReset(t *testing.T) {
 	config := Config{
 		MaxSize:         3,
@@ -866,7 +1020,7 @@ func TestSetLFUFrequencyReset(t *testing.T) {
 	waitForWrites(t, cache)
 
 	// Access "a" multiple times to increase frequency
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		cache.Get("a")
 	}
 

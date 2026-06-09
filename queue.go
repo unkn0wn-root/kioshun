@@ -5,18 +5,6 @@ import "sync/atomic"
 // cacheLinePadding isolates contended atomics onto their own cache lines.
 const cacheLinePadding = 64
 
-// writeQueue connects cache producers to a shard's single write worker.
-// It is multi-producer/single-consumer and applies back-pressure instead of
-// dropping writes; on shutdown it must wake blocked producers.
-type writeQueue[K comparable, V any] interface {
-	enqueue(cmd writeCommand[K, V]) error
-	tryDequeue(buf []writeCommand[K, V]) int
-}
-
-func newWriteQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) writeQueue[K, V] {
-	return newMPSCQueue[K, V](size, wake, closeCh)
-}
-
 // signal performs wake on a size-1 channel:
 // if a token is already pending the wake is a no-op.
 func signal(ch chan struct{}) {
@@ -26,15 +14,17 @@ func signal(ch chan struct{}) {
 	}
 }
 
-// mpscCell is one ring slot. seq sequences ownership between producers and the
-// consumer (Vyukov bounded queue); cmd carries the payload in place.
+// mpscCell is one ring slot. seq sequences ownership between producers and the consumer
 type mpscCell[K comparable, V any] struct {
 	seq atomic.Uint64
 	cmd writeCommand[K, V]
 }
 
-// mpscQueue is a bounded Vyukov MPSC ring. Sequence numbers distinguish free,
-// published and stale slots across laps without a producer-side lock.
+// mpscQueue connects cache producers to a shard's single write worker. It is a
+// bounded Vyukov MPSC ring: sequence numbers distinguish free, published and
+// stale slots across laps without a producer-side lock. The queue applies
+// back-pressure instead of dropping writes; on shutdown it wakes blocked
+// producers.
 type mpscQueue[K comparable, V any] struct {
 	mask    uint64
 	buffer  []mpscCell[K, V]
@@ -45,7 +35,7 @@ type mpscQueue[K comparable, V any] struct {
 	_    [cacheLinePadding]byte
 	head atomic.Uint64 // hot
 	_    [cacheLinePadding]byte
-	tail uint64 // single consumer
+	tail atomic.Uint64 // single writer (the consumer)
 	_    [cacheLinePadding]byte
 }
 
@@ -95,19 +85,31 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 	}
 }
 
+// quiescent reports whether the queue holds no in-flight writes: head == tail
+// means every reserved slot has been consumed so there is neither a published
+// command waiting nor a slot a producer has reserved (advanced head) but not yet
+// published. Both ends are read atomically, so this is safe to call without the
+// drain token (e.g. on the lock-free read miss path) - it is only a hint: a
+// producer may reserve a slot, or the consumer may advance tail, right after it
+// returns, which the caller re-checks under the drain token before acting.
+func (q *mpscQueue[K, V]) quiescent() bool {
+	return q.head.Load() == q.tail.Load()
+}
+
 func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
 	n := 0
+	pos := q.tail.Load()
 	for n < len(buf) {
-		pos := q.tail
 		cell := &q.buffer[pos&q.mask]
-		seq := cell.seq.Load() // acquire; pairs with the producer's publish
+		seq := cell.seq.Load() // acquire
 		if int64(seq)-int64(pos+1) != 0 {
 			break // not yet published (empty)
 		}
-		q.tail = pos + 1
 		buf[n] = cell.cmd
-		cell.cmd = writeCommand[K, V]{}  // drop references so the GC can reclaim
+		cell.cmd = writeCommand[K, V]{}  // drop references
 		cell.seq.Store(pos + q.mask + 1) // free the slot for the next lap
+		pos++
+		q.tail.Store(pos) // publish progress so quiescent() sees it
 		n++
 	}
 	if n > 0 {

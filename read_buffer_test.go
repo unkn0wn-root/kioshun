@@ -7,17 +7,14 @@ import (
 	"time"
 )
 
-// newReadTestShard builds a minimal SieveTinyLFU shard wired with a read buffer,
-// without spinning up the cache's worker goroutine, so drains are deterministic.
 func newReadTestShard(t *testing.T, cap int64) *shard[int, int] {
 	t.Helper()
 	s := &shard[int, int]{
-		data: make(map[int]*cacheItem[int, int]),
+		tab:  newHtable[int, int](int(cap)),
 		cap:  cap,
 		wake: make(chan struct{}, 1),
 	}
-	s.initLRU()
-	s.sieve = newSieveTinyLFU[int, int](cap, 10, 100)
+	s.sieve = newSieveTinyLFU[int, int](cap, 0, 10, 100)
 	s.readBuf = newReadBuffer()
 	return s
 }
@@ -30,8 +27,8 @@ func TestReadBufferSampleThenDrainFeedsSketch(t *testing.T) {
 		t.Fatalf("initial estimate=%d, want 0", got)
 	}
 
-	for i := 0; i < 50; i++ {
-		s.sampleRead(h, false)
+	for range 50 {
+		s.readBuf.sample(h)
 	}
 	s.drainReadSamples()
 
@@ -56,8 +53,8 @@ func TestReadBufferLossyOverflowDrainsRecentWindow(t *testing.T) {
 	// Push far more than total ring capacity; producers overwrite older slots.
 	// The drain must stay bounded and still replay the most recent window.
 	total := readStripeSlots * (len(s.readBuf.stripes) + 4) * 8
-	for i := 0; i < total; i++ {
-		s.sampleRead(h, false)
+	for range total {
+		s.readBuf.sample(h)
 	}
 	s.drainReadSamples()
 
@@ -72,8 +69,8 @@ func TestReadBufferZeroHashMappedToSentinel(t *testing.T) {
 	s := newReadTestShard(t, 64)
 	// hash 0 collides with the empty-slot sentinel; sample() remaps it to 1 so
 	// it is not silently dropped by the drain.
-	for i := 0; i < 30; i++ {
-		s.sampleRead(0, false)
+	for range 30 {
+		s.readBuf.sample(0)
 	}
 	s.drainReadSamples()
 	if got := s.sieve.estimate(1); got == 0 {
@@ -90,7 +87,7 @@ func TestReadBufferSignalsAtHeadRelativeFullWindow(t *testing.T) {
 	st.tail.Store(10)
 	st.head.Store(10)
 
-	for i := 0; i < readStripeSlots-1; i++ {
+	for i := range readStripeSlots - 1 {
 		_, needDrain := rb.sample(uint64(i + 1))
 		if needDrain {
 			t.Fatalf("sample %d signaled before head-relative window was full", i)
@@ -106,20 +103,18 @@ func TestReadBufferSignalsAtHeadRelativeFullWindow(t *testing.T) {
 	}
 }
 
-// TestReadBufferConcurrentSampleDrain stresses many producers against a single
-// draining consumer; correctness here is "no race / no panic / bounded work".
 func TestReadBufferConcurrentSampleDrain(t *testing.T) {
 	s := newReadTestShard(t, 256)
 
 	var stop atomic.Bool
 	var wg sync.WaitGroup
-	for g := 0; g < 8; g++ {
+	for g := range 8 {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			h := uint64(id + 1)
 			for !stop.Load() {
-				s.sampleRead(h, false)
+				s.readBuf.sample(h)
 			}
 		}(g)
 	}
@@ -139,11 +134,6 @@ func TestReadBufferConcurrentSampleDrain(t *testing.T) {
 	}
 }
 
-// End-to-end: many read hits on a live cache must not break the read→worker
-// pipeline (Get -> sampleRead -> worker drain). We deliberately do not read the
-// sketch from the test goroutine: the worker mutates it lock-free, so any
-// external read would race. The deterministic sample->drain->sketch assertion
-// lives in TestReadBufferSampleThenDrainFeedsSketch.
 func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
 	c := newTestCache[int, int](t, Config{
 		MaxSize:         64,
@@ -161,7 +151,7 @@ func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		if v, ok := c.Get(key); !ok || v != key {
 			t.Fatalf("read %d: got (%d,%v), want (%d,true)", i, v, ok, key)
 		}
@@ -187,7 +177,7 @@ func TestReadMissesFeedAdmissionSketch(t *testing.T) {
 	})
 	defer c.Close()
 
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		if err := c.Set(i, i, time.Hour); err != nil {
 			t.Fatal(err)
 		}
@@ -195,7 +185,7 @@ func TestReadMissesFeedAdmissionSketch(t *testing.T) {
 
 	const key = 10_000
 	h := c.hasher.Sum(key)
-	for i := 0; i < readStripeSlots; i++ {
+	for range readStripeSlots {
 		if _, ok := c.Get(key); ok {
 			t.Fatal("unexpected hit for miss-sampling key")
 		}

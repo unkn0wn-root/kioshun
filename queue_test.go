@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func drainAll(q writeQueue[int, int], buf []writeCommand[int, int]) []writeCommand[int, int] {
+func drainAll(q *mpscQueue[int, int], buf []writeCommand[int, int]) []writeCommand[int, int] {
 	var out []writeCommand[int, int]
 	for {
 		n := q.tryDequeue(buf)
@@ -41,7 +41,7 @@ func TestMPSCQueueMinimumRingSize(t *testing.T) {
 func TestMPSCQueueFIFOSingleProducer(t *testing.T) {
 	q := newMPSCQueue[int, int](8, make(chan struct{}, 1), make(chan struct{}))
 	buf := make([]writeCommand[int, int], 3) // small batch to exercise multi-pass drain
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		if err := q.enqueue(writeCommand[int, int]{hash: uint64(i)}); err != nil {
 			t.Fatal(err)
 		}
@@ -60,7 +60,7 @@ func TestMPSCQueueFIFOSingleProducer(t *testing.T) {
 func TestMPSCQueueBackpressureBlocksUntilDrain(t *testing.T) {
 	q := newMPSCQueue[int, int](2, make(chan struct{}, 1), make(chan struct{}))
 	// Fill the ring (2 slots).
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if err := q.enqueue(writeCommand[int, int]{hash: uint64(i)}); err != nil {
 			t.Fatal(err)
 		}
@@ -92,7 +92,7 @@ func TestMPSCQueueBackpressureBlocksUntilDrain(t *testing.T) {
 func TestMPSCQueueCloseWakesBlockedProducer(t *testing.T) {
 	closeCh := make(chan struct{})
 	q := newMPSCQueue[int, int](2, make(chan struct{}, 1), closeCh)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if err := q.enqueue(writeCommand[int, int]{hash: uint64(i)}); err != nil {
 			t.Fatal(err)
 		}
@@ -118,9 +118,6 @@ func TestMPSCQueueCloseWakesBlockedProducer(t *testing.T) {
 	}
 }
 
-// TestMPSCQueueConcurrentProducersNoLoss runs many producers against one
-// draining consumer with back-pressure and verifies every command is delivered
-// exactly once, with per-producer FIFO preserved.
 func TestMPSCQueueConcurrentProducersNoLoss(t *testing.T) {
 	const producers = 8
 	const perProducer = 5000
@@ -153,11 +150,11 @@ func TestMPSCQueueConcurrentProducersNoLoss(t *testing.T) {
 	}()
 
 	var wg sync.WaitGroup
-	for p := 0; p < producers; p++ {
+	for p := range producers {
 		wg.Add(1)
 		go func(p int) {
 			defer wg.Done()
-			for s := 0; s < perProducer; s++ {
+			for s := range perProducer {
 				cmd := writeCommand[int, int]{hash: uint64(p)<<32 | uint64(s)}
 				if err := q.enqueue(cmd); err != nil {
 					t.Errorf("producer %d enqueue: %v", p, err)
@@ -178,26 +175,15 @@ func TestMPSCQueueConcurrentProducersNoLoss(t *testing.T) {
 	}
 }
 
-// TestWriteQueueWakeSignaled confirms enqueue pings the shared wake channel so
-// the worker is told there is work.
 func TestWriteQueueWakeSignaled(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		make func(wake chan struct{}) writeQueue[int, int]
-	}{
-		{"mpsc", func(w chan struct{}) writeQueue[int, int] { return newMPSCQueue[int, int](8, w, make(chan struct{})) }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			wake := make(chan struct{}, 1)
-			q := tc.make(wake)
-			if err := q.enqueue(writeCommand[int, int]{hash: 1}); err != nil {
-				t.Fatal(err)
-			}
-			select {
-			case <-wake:
-			default:
-				t.Fatal("enqueue did not signal the wake channel")
-			}
-		})
+	wake := make(chan struct{}, 1)
+	q := newMPSCQueue[int, int](8, wake, make(chan struct{}))
+	if err := q.enqueue(writeCommand[int, int]{hash: 1}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-wake:
+	default:
+		t.Fatal("enqueue did not signal the wake channel")
 	}
 }

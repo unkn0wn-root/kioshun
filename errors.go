@@ -14,6 +14,10 @@ var (
 	ErrInvalidConfig = errors.New("invalid cache configuration")
 	// ErrCacheClosed is returned by operations on a closed cache.
 	ErrCacheClosed = errors.New("cache is closed")
+	// ErrInvalidCost is returned when a configured weigher reports a negative cost.
+	ErrInvalidCost = errors.New("cache item cost is invalid")
+	// ErrItemTooLarge is returned when a weighted item cannot fit in its shard cost budget.
+	ErrItemTooLarge = errors.New("cache item cost exceeds shard budget")
 )
 
 // CacheError describes a failure from a named cache operation (register, get, close).
