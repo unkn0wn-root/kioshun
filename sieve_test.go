@@ -216,14 +216,14 @@ func TestDoorkeeperFiltersFirstFrequencyIncrement(t *testing.T) {
 
 func TestNewSieveTinyLFUDefaults(t *testing.T) {
 	a := newSieveTinyLFU[int, int](100, 0, 0, 0)
-	if a.probationCap != 1 || a.mainCap != 99 || a.ghostCap != 99 {
-		t.Fatalf("caps pc=%d mc=%d gc=%d, want 1/99/99", a.probationCap, a.mainCap, a.ghostCap)
+	if a.probationCap != 1 || a.mainCap != 99 || a.ghostCap != 74 {
+		t.Fatalf("caps pc=%d mc=%d gc=%d, want 1/99/74", a.probationCap, a.mainCap, a.ghostCap)
 	}
 	if a.probation.size != 0 || a.main.size != 0 || !a.probation.empty() || !a.main.empty() {
 		t.Fatal("new admission queues should be empty")
 	}
-	if len(a.ghost.entries) != 99 {
-		t.Fatalf("ghost cap=%d, want 99", len(a.ghost.entries))
+	if len(a.ghost.entries) != 74 {
+		t.Fatalf("ghost cap=%d, want 74", len(a.ghost.entries))
 	}
 	if len(a.sketch.counters) == 0 {
 		t.Fatal("sketch was not initialized")

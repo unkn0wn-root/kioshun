@@ -4,7 +4,10 @@ import "sync/atomic"
 
 const (
 	defaultProbationRatio = 1
-	defaultGhostRatio     = 100
+	// defaultGhostRatio sizes the B1 ghost as a percent of main capacity.
+	// A smaller B1 narrows the frequency core gap on stable hot set workloads
+	// (its readmissions stop repromoting cooling items).
+	defaultGhostRatio = 75
 )
 
 const (
