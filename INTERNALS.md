@@ -72,7 +72,7 @@ That design drives the item lifetime rules:
 - `ProbationRatio = 1`
 - `GhostRatio = 100`
 - `CostAdmission = CostAdmissionFrequency`
-- `WriteBufferSize = 1024`
+- `WriteBufferSize = 256`
 - `WriteBatchSize = 64`
 
 `New` validates the config, resolves `DefaultEvictionPolicy` to `SieveTinyLFU` and fills in default write queue settings when they are left as zero.
