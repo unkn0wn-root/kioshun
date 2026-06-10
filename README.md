@@ -238,7 +238,7 @@ pre-generated workloads with async and strict write modes reported separately:
 
 ```bash
 cd benchmarks
-GOCACHE=/tmp/kioshun-go-build go test -run=TestBenchmarkComparisonGetSetup -count=1 .
-GOCACHE=/tmp/kioshun-go-build go test -bench='BenchmarkCacheComparison' -benchmem -run=^$ -benchtime=1s .
-GOCACHE=/tmp/kioshun-go-build go test -bench=. -benchmem -run=^$ -benchtime=1s -timeout=30m .
+go test -run=TestBenchmarkComparisonGetSetup -count=1 .
+go test -bench='BenchmarkCacheComparison' -benchmem -run=^$ -benchtime=1s .
+go test -bench=. -benchmem -run=^$ -benchtime=1s -timeout=30m .
 ```
