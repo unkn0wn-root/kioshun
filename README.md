@@ -69,7 +69,34 @@ func main() {
 
 ## Configuration
 
-### Basic
+### Default Configuration
+
+For most caches, start with the built-in defaults:
+
+```go
+c := kioshun.NewDefault[string, string]()
+defer c.Close()
+```
+
+`NewDefault` uses `DefaultConfig()`: `MaxSize=10000`, `DefaultTTL=30m`,
+automatic shard count, `CleanupInterval=5m`, SieveTinyLFU eviction, stats
+disabled and the default async write buffer/batch sizes.
+
+When you only need a few changes, start from `DefaultConfig()` and override the
+specific fields:
+
+```go
+config := kioshun.DefaultConfig()
+config.MaxSize = 100000
+config.DefaultTTL = time.Hour
+
+c, err := kioshun.New[string, string](config)
+if err != nil {
+    // handle error
+}
+```
+
+### Custom Configuration
 
 ```go
 config := kioshun.Config{
