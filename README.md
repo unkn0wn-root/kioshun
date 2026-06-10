@@ -23,9 +23,6 @@
 - [Internals](INTERNALS.md)
 - [Benchmarks](#benchmarks)
 
-> [!INFO]
-> If you want to know more about Kioshun internals and how it works under the hood - see [Kioshun Internals](INTERNALS.md)
-
 ## Installation
 
 ```bash
