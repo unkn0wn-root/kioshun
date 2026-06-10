@@ -321,6 +321,13 @@ func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 	for {
 		select {
 		case <-s.wake:
+			// Drain, then re-arm under the wake-coalescing protocol. Clearing
+			// wakeState before re-checking ready() is what makes a missed signal
+			// impossible: a producer that publishes after this drain either becomes
+			// visible to ready() (so the loop re-arms and drains it) or finds
+			// wakeState already 0 and sends a fresh token. A failed re-arm CAS means
+			// a producer set wakeState and left a token, so break and let the next
+			// select consume it.
 			for {
 				c.drainShard(s)
 				s.queue.wakeState.Store(0)

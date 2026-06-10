@@ -51,9 +51,9 @@ type Cache[K comparable, V any] struct {
 	shards       []*shard[K, V] // tables + lists + counters
 	shardMask    uint64         // shards is 2^n; mask = shards-1
 	config       Config
-	perShardCap  int64 // floor(MaxSize/shards); 0 => unlimited
-	perShardCost int64 // floor(MaxCost/shards); 0 => unlimited
-	clockBase    time.Time
+	perShardCap  int64     // floor(MaxSize/shards); 0 => unlimited
+	perShardCost int64     // floor(MaxCost/shards); 0 => unlimited
+	clockBase    time.Time // monotonic epoch; nowNano and item expiry measure from here
 	closeCh      chan struct{}
 	closeOnce    sync.Once
 	closed       int32 // 1 => cache closed
@@ -630,6 +630,9 @@ func (c *Cache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
 }
 
+// nowNano is the cache's clock: monotonic nanoseconds since clockBase. Item
+// expiry is stamped and compared in this domain, so TTLs ignore wall-clock jumps
+// (NTP steps, manual changes). Every expiry read and stamp goes through it.
 func (c *Cache[K, V]) nowNano() int64 {
 	return time.Since(c.clockBase).Nanoseconds()
 }
