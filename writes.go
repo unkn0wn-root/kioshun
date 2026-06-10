@@ -111,7 +111,7 @@ func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bo
 	// after winning s.mu, so a SetAsync that cannot commit inline bails to the
 	// queue cheaply; the worker drains read samples before applying it anyway.
 	s.drainReadSamples()
-	c.stampExpireTime(cmd, c.nowNano())
+	c.stampExpireTimeNow(cmd)
 	committed := c.applySet(s, cmd)
 	s.mu.Unlock()
 	s.drainMu.Unlock()
@@ -240,7 +240,7 @@ func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error
 	var task callbackTask[K, V]
 	var hasTask bool
 	err := c.syncMutate(s, func() {
-		c.stampExpireTime(&cmd, c.nowNano())
+		c.stampExpireTimeNow(&cmd)
 		committed := c.applySet(s, &cmd)
 		task, hasTask = cmd.newCallbackTask(committed)
 	})
@@ -445,6 +445,12 @@ func (c *Cache[K, V]) stampExpireTime(cmd *writeCommand[K, V], now int64) {
 	}
 }
 
+func (c *Cache[K, V]) stampExpireTimeNow(cmd *writeCommand[K, V]) {
+	if cmd.expireTime > 0 {
+		cmd.expireTime += c.nowNano()
+	}
+}
+
 // newItem allocates a populated item for cmd. Items are not pooled: lock-free
 // reads may hold an evicted item, so the GC owns reclamation. Zero-valued fields
 // (list links, visited) start clean.
@@ -495,11 +501,15 @@ func (c *Cache[K, V]) applySet(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 // is published, at the slot probe located. Caller must hold s.mu.
 func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	warmup := s.belowSieveWarmup()
-	item := c.newItem(cmd)
-	prev, cur := s.tab.probe(item)
+	prev, slot, cur := s.tab.probe(cmd.hash, cmd.key)
 
 	if prev != nil {
-		// update: probe already swapped the slot to item; carry policy state across.
+		// update: swap a fresh immutable item into the slot probe located and
+		// carry policy state across. Always a singleton - an updated resident
+		// may live in main long past its insertion cohort, so it must not share
+		// a slab.
+		item := c.newItem(cmd)
+		s.tab.swapAt(slot, item)
 		if d := cmd.cost - prev.cost; d != 0 {
 			atomic.AddInt64(&s.cost, d)
 		}
@@ -511,8 +521,18 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 		return true
 	}
 
-	// insert: hold the candidate out of the table until admission decides its fate.
-	item.unpublished = true
+	// insert: hold the candidate out of the table until admission decides its
+	// fate. A ghost hit heads straight to main and stays resident long-term, so
+	// it allocates a singleton; everything else enters the probation FIFO, whose
+	// insertion-ordered lifetimes let items share bump slabs.
+	ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash)
+	var item *cacheItem[K, V]
+	if ghostHit && s.sieve.mainCap > 0 {
+		item = c.newItem(cmd)
+	} else {
+		item = c.newSlabItem(s, cmd)
+	}
+	item.flags |= itemUnpublished
 	if !warmup {
 		s.sieve.recordAccess(cmd.hash)
 	}
@@ -520,19 +540,20 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	if item.cost != 0 {
 		atomic.AddInt64(&s.cost, item.cost)
 	}
-	ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash)
 	s.sieve.insert(item, ghostHit)
 	if !warmup || s.overCapacity() {
 		s.enforceSieveCapacity(c.config.StatsEnabled, item, ghostHit)
 	}
 	if s.sieve.owns(item) {
-		item.unpublished = false
+		item.flags &^= itemUnpublished
 		s.tab.publish(item, cur)
 		s.sieve.stats.Admits++
 		return true
 	}
 	// rejected: enforceSieveCapacity already unlinked the candidate from policy and
-	// decremented size via the unpublished-aware drop; nothing was ever stored.
+	// decremented size via the unpublished-aware drop; nothing was ever stored, so
+	// release the probe cursor's reclamation barrier.
+	s.tab.unpin()
 	s.sieve.stats.Rejects++
 	return false
 }
@@ -588,6 +609,12 @@ func (c *Cache[K, V]) deleteKey(s *shard[K, V], kh uint64, key K) bool {
 // clearShard resets a shard's contents and policy state. The caller must hold s.mu.
 func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 	s.tab.clear()
+	// drop the active slab: its handed-out items still carry intrusive policy
+	// links from before the clear, and a slab kept (and refilled) past this
+	// point would hold the entire pre-clear item graph reachable through them.
+	// Slots are never reused, so the next insert simply starts a fresh slab.
+	s.slab = nil
+	s.slabOff = 0
 	if s.sieve == nil {
 		s.initLRU()
 	}

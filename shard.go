@@ -1,6 +1,7 @@
 package kioshun
 
 import (
+	"math/bits"
 	"sync"
 	"sync/atomic"
 )
@@ -40,6 +41,10 @@ type shard[K comparable, V any] struct {
 	cost int64 // live item cost
 
 	sieve *sieveTinyLFU[K, V]
+
+	// bump slab for probation inserts (see newSlabItem); writer only.
+	slab    []cacheItem[K, V]
+	slabOff int
 
 	// removal notification staging, used only when the cache has at least one
 	// listener (removeWake is the shared worker wakeup, nil otherwise). dropItem
@@ -82,8 +87,8 @@ func (s *shard[K, V]) dropItem(
 	// never stored, so it has no table slot to reclaim; unlink policy-only. Every
 	// other item is a confirmed resident and removeExact both rejects stale
 	// queue/hand pointers and frees the slot.
-	if item.unpublished {
-		item.unpublished = false
+	if item.flags&itemUnpublished != 0 {
+		item.flags &^= itemUnpublished
 	} else if !s.tab.removeExact(item) {
 		return false
 	}
@@ -152,15 +157,26 @@ func (s *shard[K, V]) sampleRead(h uint64) {
 	signal(s.wake) // may already be pending
 }
 
-// drainReadSamples replays every stripe's buffered read fingerprints into the
-// frequency sketch.
+// drainReadSamples replays the dirty stripes buffered read fingerprints into
+// the frequency sketch. The dirty mask keeps the usual quiescent check to a
+// single load. A bit is cleared only once its stripe turns out to be quiet,
+// so a busy stripe costs no mask writes and a producer racing the clear
+// rearms the bit on its next sample.
 func (s *shard[K, V]) drainReadSamples() {
 	p := s.sieve
 	if p == nil {
 		return
 	}
-	for i := range s.readBuf.stripes {
-		s.drainStripe(p, &s.readBuf.stripes[i])
+	d := s.readBuf.dirty.Load()
+	for d != 0 {
+		i := bits.TrailingZeros32(d)
+		d &^= 1 << i
+		st := &s.readBuf.stripes[i]
+		if st.tail.Load() == st.head.Load() {
+			s.readBuf.dirty.And(^(uint32(1) << i))
+			continue
+		}
+		s.drainStripe(p, st)
 	}
 }
 

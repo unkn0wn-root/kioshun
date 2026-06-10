@@ -166,7 +166,7 @@ func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
 	}
 }
 
-func TestReadMissesFeedAdmissionSketch(t *testing.T) {
+func TestMissesCountAtInsertNotOnReadPath(t *testing.T) {
 	c := newTestCache[int, int](t, Config{
 		MaxSize:         64,
 		ShardCount:      1,
@@ -198,7 +198,17 @@ func TestReadMissesFeedAdmissionSketch(t *testing.T) {
 	s.mu.RLock()
 	got := s.sieve.estimate(h)
 	s.mu.RUnlock()
-	if got == 0 {
-		t.Fatal("read misses were not replayed into the admission sketch")
+	if got != 0 {
+		t.Fatalf("read misses fed the sketch (estimate=%d), want no read-path admission work", got)
+	}
+
+	if err := c.Set(key, key, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.RLock()
+	got = s.sieve.estimate(h)
+	s.mu.RUnlock()
+	if got < 2 {
+		t.Fatalf("insert estimate=%d, want >= 2 (miss and Set both counted at insert)", got)
 	}
 }

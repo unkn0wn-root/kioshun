@@ -1,6 +1,10 @@
 package kioshun
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/unkn0wn-root/kioshun/internal/keyhash"
+)
 
 const (
 	defaultProbationRatio = 1
@@ -15,6 +19,19 @@ const (
 	maxEvictionWork         = 32
 	defaultMainVictimScan   = 8
 	probationPromotionReuse = 1
+)
+
+const (
+	// one doorkeeper/sketch deposit per insert: plain per-request TinyLFU,
+	// where candidates must prove reuse before a stable frequency core yields
+	// to them.
+	insertWeightStationary uint8 = 1
+	// a deposit for both observations behind an insert (the miss and the Set).
+	// This inflates candidates against long resident victims so a shifting
+	// working set displaces stale entries quickly. The default: it matches
+	// warmup's admission until the controller sees a stationary cycle. Either
+	// weight advances the estimator timebase identically (see recordAccess).
+	insertWeightShifting uint8 = 2
 )
 
 const (
@@ -271,6 +288,12 @@ type sieveTinyLFU[K comparable, V any] struct {
 	stats      PolicyStats
 	hand       *cacheItem[K, V]
 
+	// insertWeight is how many deposits one insert attempt makes in the
+	// estimator (see recordAccess); adaptSize picks it each cycle. It never
+	// changes the estimator timebase. Maintained and read only on the
+	// serialized maintenance path.
+	insertWeight uint8
+
 	capacity        int64
 	probationCap    int64
 	mainCap         int64
@@ -322,6 +345,7 @@ func newSieveTinyLFU[K comparable, V any](c int64, owner uint8, pr, gr uint8, mo
 	p.minProbationCap = lo
 	p.maxProbationCap = hi
 	p.adaptStep = max(int64(1), c/100)
+	p.insertWeight = insertWeightShifting
 	p.tuner.reset()
 	samples := uint64(max(c*10, int64(sketchMinCounters)))
 	p.ghost = newGhostQueue(int(gc))
@@ -333,17 +357,41 @@ func newSieveTinyLFU[K comparable, V any](c int64, owner uint8, pr, gr uint8, mo
 	return p
 }
 
+// recordAccess counts one insert attempt. The Get miss behind it was never
+// sampled on the read path (misses feed frequency only through the write
+// path), so the insert stands in for two observations - the miss and the Set -
+// and always advances the estimator timebase by two. Sketch aging and the
+// adaptive cycle cadence therefore run the same in every regime; the only
+// adaptive part is whether the second observation also deposits into the
+// doorkeeper/sketch (see insertWeightShifting vs insertWeightStationary).
+// adaptSize picks the weight from the same cycle signals that size the
+// probation window.
 func (p *sieveTinyLFU[K, V]) recordAccess(h uint64) {
 	p.incrementFrequency(h)
+	if p.insertWeight > 1 {
+		p.incrementFrequency(h)
+		return
+	}
+	p.tickObservation()
 }
 
-// incrementFrequency records one access in the doorkeeper/sketch pair and ages
-// the window after resetAt samples. It runs on the serialized maintenance path,
-// including sampled reads drained by the shard worker.
+// incrementFrequency records one access in the doorkeeper/sketch pair and
+// advances the estimator timebase. It runs on the serialized maintenance path,
+// including sampled reads drained by the shard worker. One avalanche feeds both
+// structures.
 func (p *sieveTinyLFU[K, V]) incrementFrequency(h uint64) {
-	if p.door.add(h) {
-		p.sketch.add(h)
+	av := keyhash.Avalanche(h)
+	if p.door.add(av) {
+		p.sketch.add(av)
 	}
+	p.tickObservation()
+}
+
+// tickObservation advances the estimator timebase by one observation. Sketch
+// aging and the adaptive-cycle window count observed traffic, not deposits
+// (the doorkeeper already withholds first-touch ones), so the timebase can
+// advance without writing to the doorkeeper or sketch at all.
+func (p *sieveTinyLFU[K, V]) tickObservation() {
 	p.sketch.samples++
 	if p.sketch.resetAt > 0 && p.sketch.samples >= p.sketch.resetAt {
 		p.sketch.age()
@@ -355,8 +403,9 @@ func (p *sieveTinyLFU[K, V]) incrementFrequency(h uint64) {
 // estimate includes the doorkeeper bit as one recent access, so a key seen once
 // can compete without immediately consuming count-min sketch counters.
 func (p *sieveTinyLFU[K, V]) estimate(h uint64) uint8 {
-	e := p.sketch.estimate(h)
-	if p.door.contains(h) && e < sketchMaxCounter {
+	av := keyhash.Avalanche(h)
+	e := p.sketch.estimate(av)
+	if p.door.contains(av) && e < sketchMaxCounter {
 		e++
 	}
 	return e
@@ -475,6 +524,7 @@ func (p *sieveTinyLFU[K, V]) reset() {
 	p.sketch.clear()
 	p.door.clear()
 	p.controller.resetCycle()
+	p.insertWeight = insertWeightShifting
 	p.tuner.reset()
 	p.stats = PolicyStats{}
 	p.hand = nil
@@ -548,6 +598,7 @@ func (s *shard[K, V]) evictProbation(stats bool) *cacheItem[K, V] {
 		return nil
 	}
 	if it.reuse >= probationPromotionReuse || sieveItemVisited(it) {
+		it = s.unslabForMain(it)
 		p.promote(it)
 		return it
 	}
@@ -932,6 +983,12 @@ func (p *sieveTinyLFU[K, V]) tick() {
 // main victims are not resurrecting, shrink when probation churns far more than
 // it promotes while main keeps earning its keep (probation too large for a
 // stationary workload).
+//
+// The same regime classification also picks insertWeight: the shifting
+// branches keep candidates inflated, the stationary branch (and a loop
+// signature) drops back to plain per-request deposits so a stable frequency
+// core stops yielding to unproven candidates. A cycle that matches no branch
+// keeps the last weight rather than flapping it.
 func (p *sieveTinyLFU[K, V]) adaptSize() {
 	c := &p.controller
 	resurrect := c.resurrectionRate()
@@ -939,21 +996,29 @@ func (p *sieveTinyLFU[K, V]) adaptSize() {
 	// resurrection evidence (or already committed to frequency); while that
 	// signature is present probation stays small so the pinned set holds.
 	loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
+	if loopish {
+		p.insertWeight = insertWeightStationary
+	}
 
 	switch {
 	case !loopish && c.cycleMainEvicts > c.promotions &&
 		resurrect < probationResurrectLow && c.ghostHits > c.promotions:
 		// shifting hot set: grow the recency window quickly so newly hot entries
 		// survive to their reuse instead of being evicted from a tiny probation.
+		p.insertWeight = insertWeightShifting
 		if p.probationCap < p.maxProbationCap {
 			step := max(int64(1), p.capacity*probationGrowStepPct/100)
 			p.setProbationCap(p.probationCap + step)
 		}
 	case !loopish && resurrect < probationResurrectLow && c.ghostHits > c.probationEvictions/4:
+		p.insertWeight = insertWeightShifting
 		if p.probationCap < p.maxProbationCap {
 			p.setProbationCap(p.probationCap + p.adaptStep)
 		}
 	case c.probationEvictions > c.promotions*2 && c.mainSurvivals > c.promotions:
+		// stationary skew: main is earning its capacity, so candidates compete
+		// at plain per-request deposits.
+		p.insertWeight = insertWeightStationary
 		if p.probationCap > p.minProbationCap {
 			p.setProbationCap(p.probationCap - p.adaptStep)
 		}
