@@ -10,7 +10,7 @@
   [![CI](https://github.com/unkn0wn-root/kioshun/actions/workflows/test.yml/badge.svg)](https://github.com/unkn0wn-root/kioshun/actions)
 
 
-  *Thread-safe, sharded in-memory cache for Go*
+  *Fast, sharded in-memory cache for Go*
 </div>
 
 > [!WARNING]
@@ -229,7 +229,7 @@ plotted as a percentage of the Belady optimum.
 
 ![Throughput](benchmarks/chart/throughput.svg)
 
-![Hit ratio vs throughput](benchmarks/chart/sweetspot.svg)
+![Hit ratio vs throughput](benchmarks/chart/spot.svg)
 
 ### Microbenchmarks
 
