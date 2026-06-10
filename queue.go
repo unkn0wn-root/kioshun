@@ -32,11 +32,13 @@ type mpscQueue[K comparable, V any] struct {
 	space   chan struct{}   // producer wakeup when the consumer frees a slot
 	closeCh <-chan struct{} // cache shutdown broadcast
 
-	_    [cacheLinePadding]byte
-	head atomic.Uint64 // hot
-	_    [cacheLinePadding]byte
-	tail atomic.Uint64 // single writer (the consumer)
-	_    [cacheLinePadding]byte
+	_         [cacheLinePadding]byte
+	head      atomic.Uint64 // hot
+	_         [cacheLinePadding]byte
+	tail      atomic.Uint64 // single writer (the consumer)
+	_         [cacheLinePadding]byte
+	wakeState atomic.Uint32 // 1 when a wake is pending or the consumer is active
+	_         [cacheLinePadding]byte
 }
 
 func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) *mpscQueue[K, V] {
@@ -68,7 +70,17 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 			if q.head.CompareAndSwap(pos, pos+1) {
 				cell.cmd = cmd
 				cell.seq.Store(pos + 1) // publish (release) for the consumer
-				signal(q.wake)
+				// Signal only when this publish makes an otherwise idle queue
+				// non-empty: tail == pos means the slot just filled is the one the
+				// consumer reads next and the wakeState CAS claims the single
+				// outstanding wake. When an earlier slot is still unconsumed
+				// (tail != pos) or a wake is already outstanding (wakeState == 1),
+				// the consumer reaches this item without another signal. The skip is
+				// safe because the consumer decides there is work from the ring
+				// itself (ready), never from wakeState - see writeWorker.
+				if q.tail.Load() == pos && q.wakeState.CompareAndSwap(0, 1) {
+					signal(q.wake)
+				}
 				return nil
 			}
 		case dif < 0:
@@ -94,6 +106,16 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 // returns, which the caller re-checks under the drain token before acting.
 func (q *mpscQueue[K, V]) quiescent() bool {
 	return q.head.Load() == q.tail.Load()
+}
+
+// ready reports whether a command is published at the consumer's tail, so the
+// next tryDequeue would return it. It is the wake protocol's source of truth for
+// "is there work". Only the consumer (writeWorker) may call it: it reads tail
+// unsynchronized, which is stable solely for the single consumer.
+func (q *mpscQueue[K, V]) ready() bool {
+	pos := q.tail.Load()
+	cell := &q.buffer[pos&q.mask]
+	return int64(cell.seq.Load())-int64(pos+1) == 0
 }
 
 func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {

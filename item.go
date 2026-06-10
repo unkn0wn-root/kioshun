@@ -11,7 +11,7 @@ package kioshun
 // than pooled.
 type cacheItem[K comparable, V any] struct {
 	value       V
-	expireTime  int64 // absolute ns; 0 => no expiration
+	expireTime  int64 // cache-relative monotonic ns; 0 => no expiration
 	cost        int64 // weigher-reported capacity cost;
 	prev        *cacheItem[K, V]
 	next        *cacheItem[K, V]

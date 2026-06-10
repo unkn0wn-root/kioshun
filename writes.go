@@ -95,6 +95,9 @@ func (c *Cache[K, V]) set(key K, value V, ttl time.Duration, callback func(K, V)
 // async queue, preserving both the enqueue-only SetAsync contract and the batching
 // that amortizes eviction on write-heavy shards.
 func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bool {
+	if !s.queue.quiescent() {
+		return false
+	}
 	if !s.drainMu.TryLock() {
 		return false
 	}
@@ -108,6 +111,7 @@ func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bo
 	// after winning s.mu, so a SetAsync that cannot commit inline bails to the
 	// queue cheaply; the worker drains read samples before applying it anyway.
 	s.drainReadSamples()
+	c.stampExpireTime(cmd, c.nowNano())
 	committed := c.applySet(s, cmd)
 	s.mu.Unlock()
 	s.drainMu.Unlock()
@@ -131,10 +135,9 @@ func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback fun
 		ttl = c.config.DefaultTTL
 	}
 
-	var now, expireTime int64
+	var expireTime int64
 	if ttl > 0 {
-		now = time.Now().UnixNano()
-		expireTime = now + ttl.Nanoseconds()
+		expireTime = ttl.Nanoseconds()
 	}
 
 	kh := c.hasher.Sum(key)
@@ -237,6 +240,7 @@ func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error
 	var task callbackTask[K, V]
 	var hasTask bool
 	err := c.syncMutate(s, func() {
+		c.stampExpireTime(&cmd, c.nowNano())
 		committed := c.applySet(s, &cmd)
 		task, hasTask = cmd.newCallbackTask(committed)
 	})
@@ -317,7 +321,23 @@ func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 	for {
 		select {
 		case <-s.wake:
-			c.drainShard(s)
+			// Drain, then re-arm under the wake-coalescing protocol. Clearing
+			// wakeState before re-checking ready() is what makes a missed signal
+			// impossible: a producer that publishes after this drain either becomes
+			// visible to ready() (so the loop re-arms and drains it) or finds
+			// wakeState already 0 and sends a fresh token. A failed re-arm CAS means
+			// a producer set wakeState and left a token, so break and let the next
+			// select consume it.
+			for {
+				c.drainShard(s)
+				s.queue.wakeState.Store(0)
+				if !s.queue.ready() {
+					break
+				}
+				if !s.queue.wakeState.CompareAndSwap(0, 1) {
+					break
+				}
+			}
 		case <-c.closeCh:
 			// final drain catches any writes accepted during shutdown then exit.
 			c.drainShard(s)
@@ -380,12 +400,17 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 	var ackBuf [inlineAckBuf]chan struct{}
 	acks := ackBuf[:0]
 	var callbacks []callbackTask[K, V]
+	var now int64
 
 	s.mu.Lock()
 	for i := range batch {
 		cmd := &batch[i]
 		switch cmd.op {
 		case writeSet:
+			if cmd.expireTime > 0 && now == 0 {
+				now = c.nowNano()
+			}
+			c.stampExpireTime(cmd, now)
 			committed := c.applySet(s, cmd)
 			if t, ok := cmd.newCallbackTask(committed); ok {
 				callbacks = append(callbacks, t)
@@ -411,6 +436,12 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 	}
 	for _, ch := range acks {
 		ch <- struct{}{}
+	}
+}
+
+func (c *Cache[K, V]) stampExpireTime(cmd *writeCommand[K, V], now int64) {
+	if cmd.expireTime > 0 {
+		cmd.expireTime += now
 	}
 }
 
@@ -571,7 +602,7 @@ func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 }
 
 func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
-	delay := max(time.Duration(task.expireTime-time.Now().UnixNano()), 0)
+	delay := max(time.Duration(task.expireTime-c.nowNano()), 0)
 
 	go func() {
 		timer := time.NewTimer(delay)
@@ -583,7 +614,7 @@ func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
 			s := c.shardByHash(kh)
 			s.mu.RLock()
 			item, exists := s.tab.lookup(kh, task.key)
-			if exists && item.expireTime > 0 && time.Now().UnixNano() > item.expireTime {
+			if exists && item.expireTime > 0 && c.nowNano() > item.expireTime {
 				s.mu.RUnlock()
 				task.callback(task.key, task.value)
 			} else {
