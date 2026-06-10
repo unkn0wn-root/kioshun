@@ -476,14 +476,14 @@ func TestSieveTinyLFUExpiredFastPathDoesNotCountMainSurvival(t *testing.T) {
 	defer c.Close()
 
 	shard := c.shards[0]
-	now := time.Now().UnixNano()
+	now := c.nowNano()
 	expiredHash := c.hasher.Sum(1)
 	otherHash := c.hasher.Sum(2)
 
 	expired := &cacheItem[int, int]{
 		key:        1,
 		value:      1,
-		expireTime: now - int64(time.Second),
+		expireTime: max(int64(1), now-int64(time.Second)),
 		hash:       expiredHash,
 	}
 	other := &cacheItem[int, int]{

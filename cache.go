@@ -53,6 +53,7 @@ type Cache[K comparable, V any] struct {
 	config       Config
 	perShardCap  int64 // floor(MaxSize/shards); 0 => unlimited
 	perShardCost int64 // floor(MaxCost/shards); 0 => unlimited
+	clockBase    time.Time
 	closeCh      chan struct{}
 	closeOnce    sync.Once
 	closed       int32 // 1 => cache closed
@@ -116,6 +117,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		shards:    make([]*shard[K, V], shardCount),
 		shardMask: uint64(shardCount - 1),
 		config:    config,
+		clockBase: time.Now(),
 		closeCh:   make(chan struct{}),
 		trackCost: config.MaxCost > 0 || config.CostAdmission != CostAdmissionFrequency,
 		waiterPool: sync.Pool{
@@ -297,7 +299,7 @@ func (c *Cache[K, V]) Exists(key K) bool {
 
 	kh := c.hasher.Sum(key)
 	shard := c.shardByHash(kh)
-	now := time.Now().UnixNano()
+	now := c.nowNano()
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -324,7 +326,7 @@ func (c *Cache[K, V]) Keys() []K {
 	}
 
 	var keys []K
-	now := time.Now().UnixNano()
+	now := c.nowNano()
 
 	for _, shard := range c.shards {
 		shard.mu.RLock()
@@ -423,7 +425,7 @@ func (c *Cache[K, V]) Cleanup() {
 		return
 	}
 
-	now := time.Now().UnixNano()
+	now := c.nowNano()
 	for _, shard := range c.shards {
 		shard.cleanup(now, c.config.EvictionPolicy, c.config.StatsEnabled)
 	}
@@ -500,7 +502,7 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 
 	var now int64
 	for {
-		now = time.Now().UnixNano()
+		now = c.nowNano()
 		if item.expireTime > 0 && now > item.expireTime {
 			if !shardLockedWrite {
 				shard.mu.RUnlock()
@@ -595,7 +597,7 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 	// remove the entry. recordReadHit above only set the visited bit, so recording
 	// a read on an entry we then find expired is harmless.
 	if res.expireTime > 0 {
-		res.now = time.Now().UnixNano()
+		res.now = c.nowNano()
 		if res.now > res.expireTime {
 			shard.mu.Lock()
 			if cur, ok := shard.tab.lookup(kh, key); ok && cur.expireTime > 0 && res.now > cur.expireTime {
@@ -626,6 +628,10 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 
 func (c *Cache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
+}
+
+func (c *Cache[K, V]) nowNano() int64 {
+	return time.Since(c.clockBase).Nanoseconds()
 }
 
 func (c *Cache[K, V]) removeItem(s *shard[K, V], item *cacheItem[K, V], reason RemovalReason) {

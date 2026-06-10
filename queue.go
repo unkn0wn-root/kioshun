@@ -37,6 +37,8 @@ type mpscQueue[K comparable, V any] struct {
 	_    [cacheLinePadding]byte
 	tail atomic.Uint64 // single writer (the consumer)
 	_    [cacheLinePadding]byte
+	wakeState atomic.Uint32 // 1 when a wake is pending or the consumer is active
+	_         [cacheLinePadding]byte
 }
 
 func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) *mpscQueue[K, V] {
@@ -68,7 +70,9 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 			if q.head.CompareAndSwap(pos, pos+1) {
 				cell.cmd = cmd
 				cell.seq.Store(pos + 1) // publish (release) for the consumer
-				signal(q.wake)
+				if q.tail.Load() == pos && q.wakeState.CompareAndSwap(0, 1) {
+					signal(q.wake)
+				}
 				return nil
 			}
 		case dif < 0:
@@ -94,6 +98,12 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 // returns, which the caller re-checks under the drain token before acting.
 func (q *mpscQueue[K, V]) quiescent() bool {
 	return q.head.Load() == q.tail.Load()
+}
+
+func (q *mpscQueue[K, V]) ready() bool {
+	pos := q.tail.Load()
+	cell := &q.buffer[pos&q.mask]
+	return int64(cell.seq.Load())-int64(pos+1) == 0
 }
 
 func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
