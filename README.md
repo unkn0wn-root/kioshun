@@ -13,30 +13,18 @@
   *Fast, sharded in-memory cache for Go*
 </div>
 
-> [!WARNING]
-> <b>v1</b> is a complete redesign, not a drop-in upgrade from earlier releases!
->
-> The biggest change is that clustering has been removed - the old peer-to-peer features are no longer part of the project. The focus is now on continuously improving cache performance and correctness.
-> The cache core was also rebuilt - `AdmissionLFU` default has been replaced by a self-adapting `SieveTinyLFU` with probation/main queues, ghost entries, TinyLFU sketching, adaptive segment sizing, lock-free bounded Sieve reads and queued/batched writes.
->
-> Public APIs changed as part of the redesign, including `New` and `NewDefault` replacing `NewWithDefaults`, cache policy/config names changing and HTTP middleware moving to the `httpcache` package.
-
 ## Index
 
-- [What is Kioshun?](#what-is-kioshun)
-- [Internals](INTERNALS.md)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [API](#api)
 - [HTTP Middleware](MIDDLEWARE.md)
+- [Internals](INTERNALS.md)
 - [Benchmarks](#benchmarks)
 
-## What is Kioshun?
-
-Kioshun is a fast, sharded in-memory cache for Go.
-
-If you want to know more about Kioshun internals and how it works under the hood - see [Kioshun Internals](INTERNALS.md)
+> [!INFO]
+> If you want to know more about Kioshun internals and how it works under the hood - see [Kioshun Internals](INTERNALS.md)
 
 ## Installation
 
@@ -131,11 +119,6 @@ c, err := kioshun.New[string, []byte](config, kioshun.WithWeigher(
 ))
 ```
 
-`CostAdmissionFrequency` preserves TinyLFU frequency admission. For weighted
-SieveTinyLFU caches, `CostAdmissionBalanced` compares frequency divided by
-sqrt(cost), while `CostAdmissionDensity` compares frequency divided by cost.
-Use the balanced mode when request hit ratio and byte pressure both matter.
-
 ## API
 
 ```go
@@ -156,45 +139,11 @@ c.Cleanup()
 c.Close() error
 ```
 
-> `Set` is synchronous and gives immediate read-after-write visibility for the key.
-> `SetAsync` is optional. A nil error means the write was accepted - it may have
-> committed inline already or it may still be queued. Use `Sync` when committed
-> visibility is required.
-
-> Create with `kioshun.New(config, kioshun.WithOnRemove(func(key K, value V, reason kioshun.RemovalReason) { ... }))`
-> to receive a callback for every key removed by capacity eviction,
-> SieveTinyLFU admission rejection, TTL expiration or `Delete`. Use
-> `WithOnEvict(func(key K, value V) { ... })` for capacity evictions only.
-
-### Statistics
-
-```go
-type Stats struct {
-    Hits        int64
-    Misses      int64
-    Evictions   int64
-    Expirations int64
-    Size        int64
-    Cost        int64
-    Capacity    int64
-    MaxCost     int64
-    HitRatio    float64
-    Shards      int
-}
-
-type PolicyStats struct {
-    Admits              int64
-    Rejects             int64
-    GhostHits           int64
-    Promotions          int64
-    ProbationEvictions  int64
-    MainEvictions       int64
-}
-```
+> `Set` is synchronous and gives immediate 'read-after-write' visibility for the key.
+> `SetAsync` is optional - it may have committed inline already or it may still be queued.
+> Use `Sync` when committed visibility is required.
 
 ## HTTP Middleware
-
-Kioshun provides HTTP middleware out-of-the-box.
 
 ```go
 import "github.com/unkn0wn-root/kioshun/httpcache"
