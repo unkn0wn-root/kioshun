@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [1.2.1](https://github.com/unkn0wn-root/kioshun/compare/v1.0.0...v1.2.1) (2026-06-10)
+
+
+### Features
+
+* add hints and comments ([#40](https://github.com/unkn0wn-root/kioshun/issues/40)) ([d931cee](https://github.com/unkn0wn-root/kioshun/commit/d931ceeb4de10391a7fc88cb24be2484bc9b6de3))
+* disable stats in default config ([125bec6](https://github.com/unkn0wn-root/kioshun/commit/125bec68822cee0c0a5b46c54d4b17a583e9fcff))
+
+
+### Bug Fixes
+
+* **cache:** make SieveTinyLFU adaptation windowed ([3f07163](https://github.com/unkn0wn-root/kioshun/commit/3f071631518aacda73da87564dbd847a3c7f9ad6))
+* remove heap allocation from strict Set path ([#44](https://github.com/unkn0wn-root/kioshun/issues/44)) ([cf11b75](https://github.com/unkn0wn-root/kioshun/commit/cf11b757d07dc79b1da9fc91e2b327c5c74fc2e2))
+
 ## [1.0.0](https://github.com/unkn0wn-root/kioshun/compare/v0.3.14...v1.0.0) (2026-06-02)
 
 
