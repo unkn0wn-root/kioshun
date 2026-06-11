@@ -168,7 +168,13 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		if config.EvictionPolicy == SieveTinyLFU && s.cap > 0 {
 			// shard index is the queue owner tag; shardCount <= maxShardCount (256)
 			// so it fits a byte and is unique per shard.
-			s.sieve = newSieveTinyLFU[K, V](s.cap, uint8(i), config.ProbationRatio, config.GhostRatio, config.CostAdmission)
+			s.sieve = newSieveTinyLFU[K, V](
+				s.cap,
+				uint8(i),
+				config.ProbationRatio,
+				config.GhostRatio,
+				config.CostAdmission,
+			)
 			s.readBuf = newReadBuffer() // pershard read sampling for the sketch
 		}
 		// Only policies backed by the shared LRU list need its sentinels; bounded

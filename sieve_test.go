@@ -535,9 +535,16 @@ func TestSieveTinyLFUInitializesState(t *testing.T) {
 			t.Fatalf("shard %d missing admission state", i)
 		}
 		if s.sieve.probationCap != 1 || s.sieve.mainCap != 3 || s.sieve.ghostCap != 1 {
-			t.Fatalf("shard %d caps pc=%d mc=%d gc=%d, want 1/3/1", i, s.sieve.probationCap, s.sieve.mainCap, s.sieve.ghostCap)
+			t.Fatalf(
+				"shard %d caps pc=%d mc=%d gc=%d, want 1/3/1",
+				i,
+				s.sieve.probationCap,
+				s.sieve.mainCap,
+				s.sieve.ghostCap,
+			)
 		}
-		if s.sieve.probation.size != 0 || s.sieve.main.size != 0 || !s.sieve.probation.empty() || !s.sieve.main.empty() {
+		if s.sieve.probation.size != 0 || s.sieve.main.size != 0 || !s.sieve.probation.empty() ||
+			!s.sieve.main.empty() {
 			t.Fatalf("shard %d policy queues should start empty", i)
 		}
 	}
@@ -872,7 +879,12 @@ func TestSieveTinyLFUClearResetsPolicyState(t *testing.T) {
 		t.Fatalf("size=%d, want 0", atomic.LoadInt64(&s.size))
 	}
 	if s.sieve.probation.size != 0 || s.sieve.main.size != 0 || s.sieve.ghost.count() != 0 {
-		t.Fatalf("policy state not cleared: p=%d m=%d g=%d", s.sieve.probation.size, s.sieve.main.size, s.sieve.ghost.count())
+		t.Fatalf(
+			"policy state not cleared: p=%d m=%d g=%d",
+			s.sieve.probation.size,
+			s.sieve.main.size,
+			s.sieve.ghost.count(),
+		)
 	}
 }
 

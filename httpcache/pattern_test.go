@@ -162,8 +162,16 @@ func TestPatternIndex_GetMatchingKeys(t *testing.T) {
 	}{
 		{name: "exact match", pattern: "/api/v1/users", expected: []string{"users-key1", "users-key2"}},
 		{name: "wildcard match", pattern: "/api/v1/*", expected: []string{"users-key1", "users-key2", "posts-key1"}},
-		{name: "broader wildcard", pattern: "/api/*", expected: []string{"users-key1", "users-key2", "posts-key1", "v2-users-key1"}},
-		{name: "root wildcard", pattern: "/*", expected: []string{"users-key1", "users-key2", "posts-key1", "v2-users-key1", "css-key1", "root-key"}},
+		{
+			name:     "broader wildcard",
+			pattern:  "/api/*",
+			expected: []string{"users-key1", "users-key2", "posts-key1", "v2-users-key1"},
+		},
+		{
+			name:     "root wildcard",
+			pattern:  "/*",
+			expected: []string{"users-key1", "users-key2", "posts-key1", "v2-users-key1", "css-key1", "root-key"},
+		},
 		{name: "no match", pattern: "/nonexistent", expected: nil},
 		{name: "root exact", pattern: "/", expected: []string{"root-key"}},
 		{name: "empty pattern", pattern: "", expected: []string{"root-key"}},

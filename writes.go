@@ -125,7 +125,12 @@ func (c *Cache[K, V]) setAndWait(key K, value V, ttl time.Duration, callback fun
 	return c.applySetSync(s, cmd)
 }
 
-func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback func(K, V)) (*shard[K, V], writeCommand[K, V], error) {
+func (c *Cache[K, V]) setCommand(
+	key K,
+	value V,
+	ttl time.Duration,
+	callback func(K, V),
+) (*shard[K, V], writeCommand[K, V], error) {
 	if ttl == DefaultExpiration {
 		ttl = c.config.DefaultTTL
 	}

@@ -35,7 +35,7 @@ const (
 	notifyRemovedRejected removalNotifyMask = 1 << RemovedRejected
 	notifyRemovedExpired  removalNotifyMask = 1 << RemovedExpired
 	notifyRemovedDeleted  removalNotifyMask = 1 << RemovedDeleted
-	notifyAllRemovals     = notifyRemovedCapacity | notifyRemovedRejected | notifyRemovedExpired | notifyRemovedDeleted
+	notifyAllRemovals                       = notifyRemovedCapacity | notifyRemovedRejected | notifyRemovedExpired | notifyRemovedDeleted
 )
 
 func removalNotifyBit(reason RemovalReason) removalNotifyMask {
