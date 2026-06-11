@@ -17,7 +17,7 @@
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
-- [Configuration](#configuration)
+- [Configuration](#configuration) ([full reference](CONFIGURATION.md))
 - [API](#api)
 - [HTTP Middleware](MIDDLEWARE.md)
 - [Internals](INTERNALS.md)
@@ -69,8 +69,6 @@ func main() {
 
 ## Configuration
 
-### Default Configuration
-
 For most caches, start with the built-in defaults:
 
 ```go
@@ -96,52 +94,8 @@ if err != nil {
 }
 ```
 
-### Custom Configuration
-
-```go
-config := kioshun.Config{
-    MaxSize:         100000,               // Maximum number of items
-    MaxCost:         0,                    // Optional weighted capacity budget
-    ShardCount:      16,                   // Number of shards (0 = auto-detect)
-    CleanupInterval: 5 * time.Minute,      // Cleanup frequency
-    DefaultTTL:      30 * time.Minute,     // Default expiration time
-    EvictionPolicy:  kioshun.SieveTinyLFU, // Eviction algorithm (default)
-    // StatsEnabled records cache activity metrics such as hits, misses and
-    // evictions. Tracking those counters adds runtime cost so enable it only
-    // if you can accept runtime performance tradeoff.
-    StatsEnabled:    true,
-    WriteBufferSize: 1024,                 // Per-shard async write queue
-    WriteBatchSize:  64,                   // Max commands applied per worker batch
-}
-
-c, err := kioshun.New[string, any](config)
-if err != nil {
-    // handle error
-}
-```
-
-> Each cache runs one write-worker goroutine per shard (plus a cleanup goroutine when `CleanupInterval > 0`),
-> so `ShardCount` sets the number of background goroutines - default `min(NumCPU*4, 256)`.
-> If you create many caches (e.g. via the cache `Manager`), set `ShardCount` explicitly to bound the total.
-
-### Weighted Capacity
-
-`MaxSize` limits resident entry count. `MaxCost` optionally adds a weighted
-resident budget. Without a custom weigher every entry costs `1`; with
-`WithWeigher`, the cache can enforce byte-like or domain-specific weights.
-
-```go
-config := kioshun.DefaultConfig()
-config.MaxSize = 100000
-config.MaxCost = 256 << 20
-config.CostAdmission = kioshun.CostAdmissionBalanced
-
-c, err := kioshun.New[string, []byte](config, kioshun.WithWeigher(
-    func(_ string, value []byte) int64 {
-        return int64(len(value))
-    },
-))
-```
+> Every `Config` field, weighted capacity (`MaxCost` + `WithWeigher`) and the
+> named-cache `Manager` are covered in **[CONFIGURATION.md](CONFIGURATION.md)**.
 
 ## API
 
@@ -166,6 +120,8 @@ c.Close() error
 > `Set` is synchronous and gives immediate 'read-after-write' visibility for the key.
 > `SetAsync` is optional - it may have committed inline already or it may still be queued.
 > Use `Sync` when committed visibility is required.
+
+Full API reference: [pkg.go.dev/github.com/unkn0wn-root/kioshun](https://pkg.go.dev/github.com/unkn0wn-root/kioshun)
 
 ## HTTP Middleware
 
