@@ -26,18 +26,13 @@ type writeCommand[K comparable, V any] struct {
 	expireTime int64
 	cost       int64
 	op         writeOp
-	result     chan struct{}
+	result     chan struct{} // completion signal; nil when no ack is needed
 	extra      *writeExtra[K, V]
 }
 
 // writeExtra holds the cold fields of a write command.
 type writeExtra[K comparable, V any] struct {
 	callback func(K, V)
-}
-
-// resultChan returns the command's completion signal or nil when none is needed.
-func (cmd *writeCommand[K, V]) resultChan() chan struct{} {
-	return cmd.result
 }
 
 type writeWaiter struct {
@@ -270,18 +265,18 @@ func (c *Cache[K, V]) enqueueAllAndWait(op writeOp) error {
 	if c.isClosed() {
 		return ErrCacheClosed
 	}
-	return c.enqueueBarrierAll(op)
+	return c.enqueueAllShardsAndWait(op)
 }
 
 // flush drains every shard's accepted writes during shutdown
 func (c *Cache[K, V]) flush() {
-	_ = c.enqueueBarrierAll(writeBarrier)
+	_ = c.enqueueAllShardsAndWait(writeBarrier)
 }
 
-// enqueueBarrierAll pushes a barrier command to every shard and waits for each
-// ack, giving an ordered fence: all writes a shard accepted before its barrier
-// are applied before this returns. Waits abandon on shutdown via awaitResult.
-func (c *Cache[K, V]) enqueueBarrierAll(op writeOp) error {
+// enqueueAllShardsAndWait pushes op to every shard and waits for each ack,
+// giving an ordered fence: all writes a shard accepted before its op are
+// applied before this returns. Waits abandon on shutdown via awaitResult.
+func (c *Cache[K, V]) enqueueAllShardsAndWait(op writeOp) error {
 	waiters := make([]*writeWaiter, 0, len(c.shards))
 	for _, s := range c.shards {
 		waiter := c.acquireWriteWaiter()
@@ -415,18 +410,11 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 			if t, ok := cmd.newCallbackTask(committed); ok {
 				callbacks = append(callbacks, t)
 			}
-			if ch := cmd.resultChan(); ch != nil {
-				acks = append(acks, ch)
-			}
 		case writeClear:
 			c.clearShard(s)
-			if ch := cmd.resultChan(); ch != nil {
-				acks = append(acks, ch)
-			}
-		case writeBarrier:
-			if ch := cmd.resultChan(); ch != nil {
-				acks = append(acks, ch)
-			}
+		}
+		if cmd.result != nil {
+			acks = append(acks, cmd.result)
 		}
 	}
 	s.mu.Unlock()
@@ -626,11 +614,10 @@ func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
 			s := c.shardByHash(kh)
 			s.mu.RLock()
 			item, exists := s.tab.lookup(kh, task.key)
-			if exists && item.expireTime > 0 && c.nowNano() > item.expireTime {
-				s.mu.RUnlock()
+			expired := exists && item.expireTime > 0 && c.nowNano() > item.expireTime
+			s.mu.RUnlock()
+			if expired {
 				task.callback(task.key, task.value)
-			} else {
-				s.mu.RUnlock()
 			}
 		case <-c.closeCh:
 			return

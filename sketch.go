@@ -5,8 +5,8 @@ const (
 	sketchAgingMultiplier = 10
 	sketchCountersPerWord = 16
 	sketchCounterBits     = 4
-	sketchCounterMask     = 0x0f
-	sketchMaxCounter      = 15
+	sketchCounterMask     = (1 << sketchCounterBits) - 1
+	sketchMaxCounter      = sketchCounterMask
 	// aging shifts packed 4-bit counters right by one; this mask clears bits
 	// that would bleed. Keep tied to sketchCounterBits.
 	sketchCounterAgingMask = 0x7777777777777777
@@ -171,19 +171,19 @@ func (s *countMinSketch) clear() {
 	s.samples = 0
 }
 
+// locate resolves counter cell i to its word index and in-word bit shift.
+func locate(i uint64) (word, shift uint64) {
+	return i / sketchCountersPerWord, (i % sketchCountersPerWord) * sketchCounterBits
+}
+
 func (s *countMinSketch) counter(i uint64) uint8 {
-	wi := i / sketchCountersPerWord
-	ci := i % sketchCountersPerWord
-	sh := ci * sketchCounterBits
+	wi, sh := locate(i)
 	return uint8((s.counters[wi] >> sh) & sketchCounterMask)
 }
 
 func (s *countMinSketch) incrementCounter(i uint64) {
-	wi := i / sketchCountersPerWord
-	ci := i % sketchCountersPerWord
-	sh := ci * sketchCounterBits
-	v := (s.counters[wi] >> sh) & sketchCounterMask
-	if v < sketchMaxCounter {
+	wi, sh := locate(i)
+	if (s.counters[wi]>>sh)&sketchCounterMask < sketchMaxCounter {
 		s.counters[wi] += 1 << sh
 	}
 }

@@ -28,27 +28,18 @@ func (r RemovalReason) String() string {
 
 type removalNotifyMask uint8
 
+// each reason's notify bit is its position in the RemovalReason enum, so
+// removalNotifyBit is a shift instead of a hand-maintained mapping.
 const (
-	notifyRemovedCapacity removalNotifyMask = 1 << iota
-	notifyRemovedRejected
-	notifyRemovedExpired
-	notifyRemovedDeleted
-	notifyAllRemovals = notifyRemovedCapacity | notifyRemovedRejected | notifyRemovedExpired | notifyRemovedDeleted
+	notifyRemovedCapacity removalNotifyMask = 1 << RemovedCapacity
+	notifyRemovedRejected removalNotifyMask = 1 << RemovedRejected
+	notifyRemovedExpired  removalNotifyMask = 1 << RemovedExpired
+	notifyRemovedDeleted  removalNotifyMask = 1 << RemovedDeleted
+	notifyAllRemovals     = notifyRemovedCapacity | notifyRemovedRejected | notifyRemovedExpired | notifyRemovedDeleted
 )
 
 func removalNotifyBit(reason RemovalReason) removalNotifyMask {
-	switch reason {
-	case RemovedCapacity:
-		return notifyRemovedCapacity
-	case RemovedRejected:
-		return notifyRemovedRejected
-	case RemovedExpired:
-		return notifyRemovedExpired
-	case RemovedDeleted:
-		return notifyRemovedDeleted
-	default:
-		return 0
-	}
+	return removalNotifyMask(1) << reason
 }
 
 // WithOnRemove registers a listener invoked once for every key removed from the
@@ -119,12 +110,12 @@ func (c *Cache[K, V]) drainRemovals() {
 		s.removePending.Store(false)
 		s.mu.Unlock()
 
-		for i := range buf {
+		for _, e := range buf {
 			if c.onRemove != nil {
-				c.onRemove(buf[i].key, buf[i].value, buf[i].reason)
+				c.onRemove(e.key, e.value, e.reason)
 			}
-			if buf[i].reason == RemovedCapacity && c.onEvict != nil {
-				c.onEvict(buf[i].key, buf[i].value)
+			if e.reason == RemovedCapacity && c.onEvict != nil {
+				c.onEvict(e.key, e.value)
 			}
 		}
 	}

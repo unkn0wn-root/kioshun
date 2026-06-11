@@ -115,7 +115,7 @@ func (q *mpscQueue[K, V]) quiescent() bool {
 func (q *mpscQueue[K, V]) ready() bool {
 	pos := q.tail.Load()
 	cell := &q.buffer[pos&q.mask]
-	return int64(cell.seq.Load())-int64(pos+1) == 0
+	return cell.seq.Load() == pos+1
 }
 
 func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
@@ -123,8 +123,7 @@ func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
 	pos := q.tail.Load()
 	for n < len(buf) {
 		cell := &q.buffer[pos&q.mask]
-		seq := cell.seq.Load() // acquire
-		if int64(seq)-int64(pos+1) != 0 {
+		if cell.seq.Load() != pos+1 {
 			break // not yet published (empty)
 		}
 		buf[n] = cell.cmd

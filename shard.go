@@ -11,7 +11,7 @@ type shard[K comparable, V any] struct {
 	tab     *htable[K, V]
 	stats   *stats // shared per-P telemetry
 	cap     int64  // resident item limit for this shard; 0 => unlimited
-	costCap int64  // same
+	costCap int64  // resident cost limit for this shard; 0 => unlimited
 
 	queue *mpscQueue[K, V] // async mutation transport consumed by this shard's worker
 
@@ -63,6 +63,19 @@ const (
 	dropLFU
 	dropSieve
 )
+
+// dropModeFor maps an eviction policy to the unlink path that keeps its
+// auxiliary state consistent.
+func dropModeFor(policy EvictionPolicy) itemDropMode {
+	switch policy {
+	case LFU:
+		return dropLFU
+	case SieveTinyLFU:
+		return dropSieve
+	default:
+		return dropLRU
+	}
+}
 
 // dropItem removes a resident item from the table and unlinks its policy
 // metadata. removeExact both rejects stale queue or hand pointers (it only
@@ -226,23 +239,13 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[K, V]) {
 	if s.head.next == item {
 		return
 	}
-	if item.prev != nil {
-		item.prev.next = item.next
-	}
-	if item.next != nil {
-		item.next.prev = item.prev
-	}
-
-	oldNext := s.head.next
-	s.head.next = item
-	item.prev = s.head
-	item.next = oldNext
-	oldNext.prev = item
+	s.removeFromLRU(item)
+	s.addToLRUHead(item)
 }
 
-// cleanup expires items under the shard lock and mirrors the same policy unlink
-// rules used by normal deletion. It collects the expired items first so the scan
-// phase stays separate from unlinking and removal.
+// cleanup expires items under the shard lock through the same dropItem path as
+// normal deletion. It collects the expired items first so the scan phase stays
+// separate from unlinking and removal.
 func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, statsEnabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,34 +258,13 @@ func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, statsEna
 		return true
 	})
 
-	staged := false
+	mode := dropModeFor(evictionPolicy)
 	for _, item := range expired {
-		if !s.tab.removeExact(item) {
+		if !s.dropItem(item, statsEnabled, RemovedExpired, mode) {
 			continue
 		}
-		if s.stageRemoval(item.key, item.value, RemovedExpired) {
-			staged = true
-		}
-		switch {
-		case evictionPolicy == LFU:
-			s.lfuList.remove(item)
-			s.removeFromLRU(item)
-		case evictionPolicy == SieveTinyLFU && s.sieve != nil:
-			s.sieve.remove(item)
-		default:
-			s.removeFromLRU(item)
-		}
-		if item.cost != 0 {
-			atomic.AddInt64(&s.cost, -item.cost)
-		}
-		atomic.AddInt64(&s.size, -1)
 		if statsEnabled {
 			s.stats.recordExpiration()
 		}
-	}
-
-	if staged {
-		s.removePending.Store(true)
-		signal(s.removeWake)
 	}
 }

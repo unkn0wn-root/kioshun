@@ -41,7 +41,7 @@ const (
 	// compares frequency divided by sqrt(cost), a middle
 	// ground between request-hit and byte-hit objectives.
 	CostAdmissionBalanced
-	// acompares frequency divided by cost, favoring dense
+	// compares frequency divided by cost, favoring dense
 	// hot entries when request hit ratio matters more than byte hit ratio.
 	CostAdmissionDensity
 )
@@ -126,7 +126,7 @@ func (c Config) Validate() error {
 		return newConfigError("GhostRatio", c.GhostRatio, "must be <= 100")
 	}
 
-	// ---Async write pipeline ---
+	// --- Async write pipeline ---
 	if c.WriteBufferSize < 0 {
 		return newConfigError("WriteBufferSize", c.WriteBufferSize, "must be >= 0")
 	}

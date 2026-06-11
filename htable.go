@@ -23,8 +23,7 @@ type htable[K comparable, V any] struct {
 	pinned uint64 // writer
 }
 
-// htNoPin marks no probe cursor in flight
-// no real slot index reaches 2^64-1 anyway.
+// htNoPin marks no probe cursor in flight; no real slot index reaches 2^64-1.
 const htNoPin = ^uint64(0)
 
 // htslot is one colocated cell. tag pre-filters probes without dereferencing
@@ -163,8 +162,8 @@ func (t *htable[K, V]) probe(hash uint64, key K) (prev *cacheItem[K, V], slot *h
 				firstTomb = int(i)
 			}
 		case tag:
-			if cur := s.item.Load(); cur != nil && cur.key == key {
-				return cur, s, htCursor[K, V]{}
+			if it := s.item.Load(); it != nil && it.key == key {
+				return it, s, htCursor[K, V]{}
 			}
 		}
 		i = (i + 1) & d.mask
@@ -258,13 +257,12 @@ func (t *htable[K, V]) length() int { return t.live }
 func (t *htable[K, V]) forEach(fn func(*cacheItem[K, V]) bool) {
 	d := t.data.Load()
 	for i := range d.slots {
-		if d.slots[i].tag.Load() <= 1 {
+		s := &d.slots[i]
+		if s.tag.Load() <= 1 {
 			continue
 		}
-		if it := d.slots[i].item.Load(); it != nil {
-			if !fn(it) {
-				return
-			}
+		if it := s.item.Load(); it != nil && !fn(it) {
+			return
 		}
 	}
 }

@@ -14,7 +14,7 @@ func newReadTestShard(t *testing.T, cap int64) *shard[int, int] {
 		cap:  cap,
 		wake: make(chan struct{}, 1),
 	}
-	s.sieve = newSieveTinyLFU[int, int](cap, 0, 10, 100)
+	s.sieve = newSieveTinyLFU[int, int](cap, 0, 10, 100, CostAdmissionFrequency)
 	s.readBuf = newReadBuffer()
 	return s
 }
