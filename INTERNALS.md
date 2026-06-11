@@ -11,7 +11,6 @@ The root `kioshun` package contains the generic cache:
 - `shard.go`: per-shard state, item removal, read-sample draining, TTL cleanup.
 - `htable.go`: per-shard open-addressing table with lock-free lookups.
 - `item.go`: cache entry metadata and immutable reader-visible fields.
-- `slab.go`: bump-slab item allocation - the pointer-free type gate, slab sizing, and promotion rehousing.
 - `evict.go`: removal reasons and removal/eviction listener options.
 - `evictor.go`: LRU, LFU, and FIFO eviction adapters.
 - `lfu.go`: exact LFU frequency bucket list.
@@ -48,8 +47,6 @@ That design drives the item lifetime rules:
 - Reader-visible item fields (`key`, `hash`, `value`, `expireTime`) are written before publication and are never mutated after publication.
 - SieveTinyLFU updates publish a fresh item instead of mutating the old one.
 - An evicted item may still be held by a reader, so cache items are not returned to `sync.Pool`; the Go GC owns item reclamation.
-- Probation inserts are bump-allocated from a per-shard slab (about 2 KiB, at most 64 items) when both K and V are pointer-free types. Slab slots are never reused; the GC frees a slab once every item in it is dead. Probation evicts in insertion order, which is also slab order, so slabs reclaim wholesale. Updates and B1 ghost-hit inserts allocate singletons, and a promotion rehouses a slab-backed resident into its own allocation (`unslabForMain`), so long-lived main entries never pin a slab. `Clear` drops the shard's active slab: its handed-out items still carry pre-clear intrusive links, and refilling it would keep the old item graph reachable through them.
-- Pointer-carrying K or V (strings, slices, pointers, maps, or structs containing them) disable slabs entirely and allocate singletons. Dead slab slots cannot be zeroed - a lock-free reader may still hold their items - and one surviving item keeps the whole slab's pointer fields as live GC roots, so a pointer-carrying type would retain removed neighbors' transitive memory far beyond the slab byte cap. Pointer-free items retain nothing but the capped slab bytes themselves.
 - Only synchronous write waiters are pooled.
 
 `cacheItem` carries the stored value plus the metadata needed by the active policy:
@@ -59,7 +56,7 @@ That design drives the item lifetime rules:
 - `prev`, `next`: intrusive list/queue links.
 - `queue`, `queueOwner`: Sieve queue identity for probation/main ownership.
 - `reuse`, `visited`: Sieve reuse state. Readers set `visited` atomically; the maintenance path consumes and clears it.
-- `flags`: `itemUnpublished` marks a Sieve insert candidate living in policy queues before it is published into the table; `itemSlabbed` marks an item allocated from its shard's bump slab.
+- `unpublished`: marks a Sieve insert candidate living in policy queues before it is published into the table.
 
 ## Configuration
 

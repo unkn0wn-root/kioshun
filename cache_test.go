@@ -728,9 +728,14 @@ func TestGetCacheWithConfigAppliesTypedOptions(t *testing.T) {
 	cfg.CleanupInterval = 0
 	cfg.EvictionPolicy = LRU
 
-	cache, err := GetCacheWithConfig[string, []byte](manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
-		return int64(len(value))
-	}))
+	cache, err := GetCacheWithConfig[string, []byte](
+		manager,
+		"weighted",
+		cfg,
+		WithWeigher(func(_ string, value []byte) int64 {
+			return int64(len(value))
+		}),
+	)
 	if err != nil {
 		t.Fatalf("GetCacheWithConfig() error = %v", err)
 	}

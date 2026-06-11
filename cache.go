@@ -56,13 +56,12 @@ type Cache[K comparable, V any] struct {
 	clockBase    time.Time // monotonic epoch; nowNano and item expiry measure from here
 	closeCh      chan struct{}
 	closeOnce    sync.Once
-	closed       int32 // 1 => cache closed
+	closed       atomic.Bool // set once by Close
 	workers      sync.WaitGroup
 	waiterPool   sync.Pool // write ack waiters for sync mutation paths
 	hasher       keyhash.Hasher[K]
 	weigher      Weigher[K, V]
 	trackCost    bool
-	slabLen      int           // items per shard bump slab; <=1 disables slab allocation
 	evictor      evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
 	onRemove     func(K, V, RemovalReason)
 	onEvict      func(K, V)
@@ -96,21 +95,13 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		shardCount = min(shardCount, maxShardCount)
 	}
 
+	// bound shards by capacity so tiny MaxSize/MaxCost values do not create
+	// empty shards.
 	if config.MaxSize > 0 {
-		limit := min(config.MaxSize, int64(maxShardCount))
-		maxPow2 := 1
-		for (int64(maxPow2) << 1) <= limit {
-			maxPow2 <<= 1
-		}
-		shardCount = min(shardCount, maxPow2)
+		shardCount = min(shardCount, int(prevPowerOf2(min(config.MaxSize, int64(maxShardCount)))))
 	}
 	if config.MaxCost > 0 {
-		limit := min(config.MaxCost, int64(maxShardCount))
-		maxPow2 := 1
-		for (int64(maxPow2) << 1) <= limit {
-			maxPow2 <<= 1
-		}
-		shardCount = min(shardCount, maxPow2)
+		shardCount = min(shardCount, int(prevPowerOf2(min(config.MaxCost, int64(maxShardCount)))))
 	}
 	shardCount = nextPowerOf2(shardCount)
 
@@ -136,7 +127,6 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 	}
 
 	cache.hasher = keyhash.New[K]()
-	cache.slabLen = itemSlabLen[K, V]()
 	if config.StatsEnabled {
 		cache.stats = newStats(runtime.GOMAXPROCS(0))
 	}
@@ -159,13 +149,8 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 				costCap++
 			}
 		}
-		capHint := 0
-		if sc > 0 {
-			capHint = int(sc)
-		}
-
 		s := &shard[K, V]{
-			tab:        newHtable[K, V](capHint),
+			tab:        newHtable[K, V](int(sc)),
 			cap:        sc,
 			costCap:    costCap,
 			stats:      cache.stats,
@@ -183,7 +168,13 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		if config.EvictionPolicy == SieveTinyLFU && s.cap > 0 {
 			// shard index is the queue owner tag; shardCount <= maxShardCount (256)
 			// so it fits a byte and is unique per shard.
-			s.sieve = newSieveTinyLFU[K, V](s.cap, uint8(i), config.ProbationRatio, config.GhostRatio, config.CostAdmission)
+			s.sieve = newSieveTinyLFU[K, V](
+				s.cap,
+				uint8(i),
+				config.ProbationRatio,
+				config.GhostRatio,
+				config.CostAdmission,
+			)
 			s.readBuf = newReadBuffer() // pershard read sampling for the sketch
 		}
 		// Only policies backed by the shared LRU list need its sentinels; bounded
@@ -409,7 +400,7 @@ func (c *Cache[K, V]) PolicyStats() PolicyStats {
 func (c *Cache[K, V]) Close() error {
 	c.closeOnce.Do(func() {
 		// stop accepting new producer writes (sequential Set-after-Close fails).
-		atomic.StoreInt32(&c.closed, 1)
+		c.closed.Store(true)
 		// Drain everything accepted so far via a barrier, then broadcast shutdown:
 		// workers do a final drain and exit; producers blocked on a full queue wake
 		// and return ErrCacheClosed. No queue is ever closed out from under a sender.
@@ -449,7 +440,7 @@ func (c *Cache[K, V]) cleanupWorker() {
 
 // isClosed reports whether Close has been called.
 func (c *Cache[K, V]) isClosed() bool {
-	return atomic.LoadInt32(&c.closed) == 1
+	return c.closed.Load()
 }
 
 func (c *Cache[K, V]) getShard(key K) *shard[K, V] {
@@ -478,9 +469,9 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 		return c.getSieve(key, kh, shard)
 	}
 
-	nw := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
+	needsWriteLock := c.config.EvictionPolicy == LRU || c.config.EvictionPolicy == LFU
 	shardLockedWrite := false
-	if nw {
+	if needsWriteLock {
 		shard.mu.Lock()
 		shardLockedWrite = true
 	} else {
@@ -639,12 +630,5 @@ func (c *Cache[K, V]) nowNano() int64 {
 }
 
 func (c *Cache[K, V]) removeItem(s *shard[K, V], item *cacheItem[K, V], reason RemovalReason) {
-	mode := dropLRU
-	switch c.config.EvictionPolicy {
-	case LFU:
-		mode = dropLFU
-	case SieveTinyLFU:
-		mode = dropSieve
-	}
-	s.dropItem(item, c.config.StatsEnabled, reason, mode)
+	s.dropItem(item, c.config.StatsEnabled, reason, dropModeFor(c.config.EvictionPolicy))
 }

@@ -45,11 +45,8 @@ func (l *lfuList[K, V]) increment(item *cacheItem[K, V]) {
 	newFreq := cur.freq + 1
 	delete(cur.items, item)
 
-	nxt := cur.next
-	var target *freqNode[K, V]
-	if nxt != l.head && nxt.freq == newFreq {
-		target = nxt
-	} else {
+	target := cur.next
+	if target == l.head || target.freq != newFreq {
 		target = l.ensureIndex(cur, newFreq)
 	}
 	target.items[item] = struct{}{}

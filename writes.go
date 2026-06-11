@@ -26,18 +26,13 @@ type writeCommand[K comparable, V any] struct {
 	expireTime int64
 	cost       int64
 	op         writeOp
-	result     chan struct{}
+	result     chan struct{} // completion signal; nil when no ack is needed
 	extra      *writeExtra[K, V]
 }
 
 // writeExtra holds the cold fields of a write command.
 type writeExtra[K comparable, V any] struct {
 	callback func(K, V)
-}
-
-// resultChan returns the command's completion signal or nil when none is needed.
-func (cmd *writeCommand[K, V]) resultChan() chan struct{} {
-	return cmd.result
 }
 
 type writeWaiter struct {
@@ -130,7 +125,12 @@ func (c *Cache[K, V]) setAndWait(key K, value V, ttl time.Duration, callback fun
 	return c.applySetSync(s, cmd)
 }
 
-func (c *Cache[K, V]) setCommand(key K, value V, ttl time.Duration, callback func(K, V)) (*shard[K, V], writeCommand[K, V], error) {
+func (c *Cache[K, V]) setCommand(
+	key K,
+	value V,
+	ttl time.Duration,
+	callback func(K, V),
+) (*shard[K, V], writeCommand[K, V], error) {
 	if ttl == DefaultExpiration {
 		ttl = c.config.DefaultTTL
 	}
@@ -270,18 +270,18 @@ func (c *Cache[K, V]) enqueueAllAndWait(op writeOp) error {
 	if c.isClosed() {
 		return ErrCacheClosed
 	}
-	return c.enqueueBarrierAll(op)
+	return c.enqueueAllShardsAndWait(op)
 }
 
 // flush drains every shard's accepted writes during shutdown
 func (c *Cache[K, V]) flush() {
-	_ = c.enqueueBarrierAll(writeBarrier)
+	_ = c.enqueueAllShardsAndWait(writeBarrier)
 }
 
-// enqueueBarrierAll pushes a barrier command to every shard and waits for each
-// ack, giving an ordered fence: all writes a shard accepted before its barrier
-// are applied before this returns. Waits abandon on shutdown via awaitResult.
-func (c *Cache[K, V]) enqueueBarrierAll(op writeOp) error {
+// enqueueAllShardsAndWait pushes op to every shard and waits for each ack,
+// giving an ordered fence: all writes a shard accepted before its op are
+// applied before this returns. Waits abandon on shutdown via awaitResult.
+func (c *Cache[K, V]) enqueueAllShardsAndWait(op writeOp) error {
 	waiters := make([]*writeWaiter, 0, len(c.shards))
 	for _, s := range c.shards {
 		waiter := c.acquireWriteWaiter()
@@ -415,18 +415,11 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 			if t, ok := cmd.newCallbackTask(committed); ok {
 				callbacks = append(callbacks, t)
 			}
-			if ch := cmd.resultChan(); ch != nil {
-				acks = append(acks, ch)
-			}
 		case writeClear:
 			c.clearShard(s)
-			if ch := cmd.resultChan(); ch != nil {
-				acks = append(acks, ch)
-			}
-		case writeBarrier:
-			if ch := cmd.resultChan(); ch != nil {
-				acks = append(acks, ch)
-			}
+		}
+		if cmd.result != nil {
+			acks = append(acks, cmd.result)
 		}
 	}
 	s.mu.Unlock()
@@ -505,9 +498,7 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 
 	if prev != nil {
 		// update: swap a fresh immutable item into the slot probe located and
-		// carry policy state across. Always a singleton - an updated resident
-		// may live in main long past its insertion cohort, so it must not share
-		// a slab.
+		// carry policy state across.
 		item := c.newItem(cmd)
 		s.tab.swapAt(slot, item)
 		if d := cmd.cost - prev.cost; d != 0 {
@@ -522,17 +513,10 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	}
 
 	// insert: hold the candidate out of the table until admission decides its
-	// fate. A ghost hit heads straight to main and stays resident long-term, so
-	// it allocates a singleton; everything else enters the probation FIFO, whose
-	// insertion-ordered lifetimes let items share bump slabs.
+	// fate.
 	ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash)
-	var item *cacheItem[K, V]
-	if ghostHit && s.sieve.mainCap > 0 {
-		item = c.newItem(cmd)
-	} else {
-		item = c.newSlabItem(s, cmd)
-	}
-	item.flags |= itemUnpublished
+	item := c.newItem(cmd)
+	item.unpublished = true
 	if !warmup {
 		s.sieve.recordAccess(cmd.hash)
 	}
@@ -545,7 +529,7 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 		s.enforceSieveCapacity(c.config.StatsEnabled, item, ghostHit)
 	}
 	if s.sieve.owns(item) {
-		item.flags &^= itemUnpublished
+		item.unpublished = false
 		s.tab.publish(item, cur)
 		s.sieve.stats.Admits++
 		return true
@@ -609,12 +593,6 @@ func (c *Cache[K, V]) deleteKey(s *shard[K, V], kh uint64, key K) bool {
 // clearShard resets a shard's contents and policy state. The caller must hold s.mu.
 func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 	s.tab.clear()
-	// drop the active slab: its handed-out items still carry intrusive policy
-	// links from before the clear, and a slab kept (and refilled) past this
-	// point would hold the entire pre-clear item graph reachable through them.
-	// Slots are never reused, so the next insert simply starts a fresh slab.
-	s.slab = nil
-	s.slabOff = 0
 	if s.sieve == nil {
 		s.initLRU()
 	}
@@ -641,11 +619,10 @@ func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
 			s := c.shardByHash(kh)
 			s.mu.RLock()
 			item, exists := s.tab.lookup(kh, task.key)
-			if exists && item.expireTime > 0 && c.nowNano() > item.expireTime {
-				s.mu.RUnlock()
+			expired := exists && item.expireTime > 0 && c.nowNano() > item.expireTime
+			s.mu.RUnlock()
+			if expired {
 				task.callback(task.key, task.value)
-			} else {
-				s.mu.RUnlock()
 			}
 		case <-c.closeCh:
 			return

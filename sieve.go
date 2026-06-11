@@ -1,6 +1,8 @@
 package kioshun
 
 import (
+	"cmp"
+	"math/bits"
 	"sync/atomic"
 
 	"github.com/unkn0wn-root/kioshun/internal/keyhash"
@@ -57,7 +59,7 @@ const (
 	mainQueue
 )
 
-// sieveVisited marks recent reuse. Readers write it at, while the
+// sieveVisited marks recent reuse. Readers set it on access, while the
 // serialized maintenance path consumes and clears it during SIEVE scans.
 const sieveVisited = uint32(1)
 
@@ -144,7 +146,7 @@ func (q *sieveQueue[K, V]) isSentinel(it *cacheItem[K, V]) bool {
 }
 
 func (q *sieveQueue[K, V]) holds(it *cacheItem[K, V]) bool {
-	return q.ownsTag(it) && it != &q.head && it != &q.tail
+	return q.ownsTag(it) && !q.isSentinel(it)
 }
 
 // adaptiveController accumulates the per-cycle signals that drive probation/main
@@ -309,11 +311,7 @@ type sieveTinyLFU[K comparable, V any] struct {
 // Probation is clamped between 1% and 60% of capacity so main has room for
 // protected entries when capacity permits, while the ghost queue is sized as a
 // fraction of main.
-func newSieveTinyLFU[K comparable, V any](c int64, owner uint8, pr, gr uint8, modes ...CostAdmission) *sieveTinyLFU[K, V] {
-	mode := CostAdmissionFrequency
-	if len(modes) > 0 {
-		mode = modes[0]
-	}
+func newSieveTinyLFU[K comparable, V any](c int64, owner uint8, pr, gr uint8, mode CostAdmission) *sieveTinyLFU[K, V] {
 	p := &sieveTinyLFU[K, V]{capacity: c, costAdmission: mode, owner: owner}
 	p.probation.init(probationQueue, owner)
 	p.main.init(mainQueue, owner)
@@ -598,7 +596,6 @@ func (s *shard[K, V]) evictProbation(stats bool) *cacheItem[K, V] {
 		return nil
 	}
 	if it.reuse >= probationPromotionReuse || sieveItemVisited(it) {
-		it = s.unslabForMain(it)
 		p.promote(it)
 		return it
 	}
@@ -854,17 +851,14 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 		return true
 	}
 
-	cmp := p.compareAdmissionScore(in, v)
-	if cmp > 0 {
+	switch c := p.compareAdmissionScore(in, v); {
+	case c > 0:
 		return true
+	case c < 0:
+		return tie && p.closeAdmissionScore(in, v)
+	default:
+		return tie || (!sieveItemVisited(v) && v.reuse == 0)
 	}
-	if cmp < 0 {
-		if tie && p.closeAdmissionScore(in, v) {
-			return true
-		}
-		return false
-	}
-	return tie || (!sieveItemVisited(v) && v.reuse == 0)
 }
 
 // compareAdmissionScore orders candidate against victim. Frequency mode is a
@@ -875,9 +869,9 @@ func (p *sieveTinyLFU[K, V]) compareAdmissionScore(in, v *cacheItem[K, V]) int {
 	cf := uint64(p.estimate(in.hash))
 	vf := uint64(p.estimate(v.hash))
 	if p.costAdmission == CostAdmissionFrequency {
-		return compareUint64(cf, vf)
+		return cmp.Compare(cf, vf)
 	}
-	return compareUint64(mulScore(cf, p.costDenom(v)), mulScore(vf, p.costDenom(in)))
+	return cmp.Compare(mulScore(cf, p.costDenom(v)), mulScore(vf, p.costDenom(in)))
 }
 
 // closeAdmissionScore reports whether the candidate is within one frequency
@@ -911,22 +905,14 @@ func scoreCost(cost int64) uint64 {
 	return uint64(cost)
 }
 
-func compareUint64(a, b uint64) int {
-	switch {
-	case a > b:
-		return 1
-	case a < b:
-		return -1
-	default:
-		return 0
-	}
-}
-
+// mulScore is a saturating multiply: an overflowing admission score clamps to
+// the maximum instead of wrapping past a smaller honest one.
 func mulScore(a, b uint64) uint64 {
-	if a != 0 && b > ^uint64(0)/a {
+	hi, lo := bits.Mul64(a, b)
+	if hi != 0 {
 		return ^uint64(0)
 	}
-	return a * b
+	return lo
 }
 
 func isqrt64(n uint64) uint64 {

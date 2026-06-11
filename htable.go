@@ -23,8 +23,7 @@ type htable[K comparable, V any] struct {
 	pinned uint64 // writer
 }
 
-// htNoPin marks no probe cursor in flight
-// no real slot index reaches 2^64-1 anyway.
+// htNoPin marks no probe cursor in flight; no real slot index reaches 2^64-1.
 const htNoPin = ^uint64(0)
 
 // htslot is one colocated cell. tag pre-filters probes without dereferencing
@@ -163,8 +162,8 @@ func (t *htable[K, V]) probe(hash uint64, key K) (prev *cacheItem[K, V], slot *h
 				firstTomb = int(i)
 			}
 		case tag:
-			if cur := s.item.Load(); cur != nil && cur.key == key {
-				return cur, s, htCursor[K, V]{}
+			if it := s.item.Load(); it != nil && it.key == key {
+				return it, s, htCursor[K, V]{}
 			}
 		}
 		i = (i + 1) & d.mask
@@ -199,28 +198,6 @@ func (t *htable[K, V]) publish(it *cacheItem[K, V], cur htCursor[K, V]) {
 // new one - both are complete snapshots of the key.
 func (t *htable[K, V]) swapAt(slot *htslot[K, V], it *cacheItem[K, V]) {
 	slot.item.Store(it)
-}
-
-// replaceExact finds the slot holding exactly old and swaps in new, which must
-// carry the same key and hash. Same publication story as swapAt. Returns false
-// when old is no longer resident.
-func (t *htable[K, V]) replaceExact(old, new *cacheItem[K, V]) bool {
-	tag := htNormHash(old.hash)
-	d := t.data.Load()
-	i := tag & d.mask
-	for {
-		s := &d.slots[i]
-		switch s.tag.Load() {
-		case 0:
-			return false
-		case tag:
-			if s.item.Load() == old {
-				s.item.Store(new)
-				return true
-			}
-		}
-		i = (i + 1) & d.mask
-	}
 }
 
 // removeExact tombstones the slot only if it still holds exactly it, returning
@@ -280,13 +257,12 @@ func (t *htable[K, V]) length() int { return t.live }
 func (t *htable[K, V]) forEach(fn func(*cacheItem[K, V]) bool) {
 	d := t.data.Load()
 	for i := range d.slots {
-		if d.slots[i].tag.Load() <= 1 {
+		s := &d.slots[i]
+		if s.tag.Load() <= 1 {
 			continue
 		}
-		if it := d.slots[i].item.Load(); it != nil {
-			if !fn(it) {
-				return
-			}
+		if it := s.item.Load(); it != nil && !fn(it) {
+			return
 		}
 	}
 }
