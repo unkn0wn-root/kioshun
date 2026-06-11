@@ -13,9 +13,10 @@ const (
 	readStripeSlots = 64
 	readSlotMask    = readStripeSlots - 1
 
-	// maxReadStripes caps per-shard striping. Shards already partition keys so
-	// matching common GOMAXPROCS values spreads hot-shard readers without
-	// allocating an unbounded number of per-shard rings.
+	// caps per-shard striping. Shards already partition keys, so
+	// matching common GOMAXPROCS values spreads hot shard readers without
+	// allocating an unbounded number of per shard rings.
+	// Must stay <= 32 so one uint32 can hold a dirty bit per stripe.
 	maxReadStripes = 16
 )
 
@@ -36,6 +37,16 @@ type readStripe struct {
 type readBuffer struct {
 	stripes []readStripe
 	mask    uint64
+
+	// dirty has one bit per stripe: producers set it on a stripe's first
+	// sample, the consumer clears it only when the stripe turns out to be
+	// quiet. The write path asks "any samples pending?" constantly, and the
+	// mask makes that one word instead of a walk over every stripe's cursors.
+	// A busy stripe's bit just stays set, so neither side pays a
+	// read-modify-write in steady state. Lossy like the stripes themselves: a
+	// sample racing the clear is delayed until the stripe's next sample
+	// re-arms the bit, not lost.
+	dirty atomic.Uint32
 }
 
 func newReadBuffer() readBuffer {
@@ -61,5 +72,8 @@ func (rb *readBuffer) sample(h uint64) (stripe int, needDrain bool) {
 	st := &rb.stripes[idx]
 	i := st.tail.Add(1) - 1
 	st.buf[i&readSlotMask].Store(h)
+	if bit := uint32(1) << idx; rb.dirty.Load()&bit == 0 {
+		rb.dirty.Or(bit)
+	}
 	return int(idx), (i+1)-st.head.Load() >= readStripeSlots
 }

@@ -11,6 +11,7 @@ The root `kioshun` package contains the generic cache:
 - `shard.go`: per-shard state, item removal, read-sample draining, TTL cleanup.
 - `htable.go`: per-shard open-addressing table with lock-free lookups.
 - `item.go`: cache entry metadata and immutable reader-visible fields.
+- `slab.go`: bump-slab item allocation - the pointer-free type gate, slab sizing, and promotion rehousing.
 - `evict.go`: removal reasons and removal/eviction listener options.
 - `evictor.go`: LRU, LFU, and FIFO eviction adapters.
 - `lfu.go`: exact LFU frequency bucket list.
@@ -47,6 +48,8 @@ That design drives the item lifetime rules:
 - Reader-visible item fields (`key`, `hash`, `value`, `expireTime`) are written before publication and are never mutated after publication.
 - SieveTinyLFU updates publish a fresh item instead of mutating the old one.
 - An evicted item may still be held by a reader, so cache items are not returned to `sync.Pool`; the Go GC owns item reclamation.
+- Probation inserts are bump-allocated from a per-shard slab (about 2 KiB, at most 64 items) when both K and V are pointer-free types. Slab slots are never reused; the GC frees a slab once every item in it is dead. Probation evicts in insertion order, which is also slab order, so slabs reclaim wholesale. Updates and B1 ghost-hit inserts allocate singletons, and a promotion rehouses a slab-backed resident into its own allocation (`unslabForMain`), so long-lived main entries never pin a slab. `Clear` drops the shard's active slab: its handed-out items still carry pre-clear intrusive links, and refilling it would keep the old item graph reachable through them.
+- Pointer-carrying K or V (strings, slices, pointers, maps, or structs containing them) disable slabs entirely and allocate singletons. Dead slab slots cannot be zeroed - a lock-free reader may still hold their items - and one surviving item keeps the whole slab's pointer fields as live GC roots, so a pointer-carrying type would retain removed neighbors' transitive memory far beyond the slab byte cap. Pointer-free items retain nothing but the capped slab bytes themselves.
 - Only synchronous write waiters are pooled.
 
 `cacheItem` carries the stored value plus the metadata needed by the active policy:
@@ -56,7 +59,7 @@ That design drives the item lifetime rules:
 - `prev`, `next`: intrusive list/queue links.
 - `queue`, `queueOwner`: Sieve queue identity for probation/main ownership.
 - `reuse`, `visited`: Sieve reuse state. Readers set `visited` atomically; the maintenance path consumes and clears it.
-- `unpublished`: Sieve insert candidates can live in policy queues before they are published into the table.
+- `flags`: `itemUnpublished` marks a Sieve insert candidate living in policy queues before it is published into the table; `itemSlabbed` marks an item allocated from its shard's bump slab.
 
 ## Configuration
 
@@ -122,9 +125,14 @@ The table relies on a strict publication order:
 Writers are serialized by the shard lock, so table metadata like `live` and `tombs` is writer-only. A reader may still be walking an old table snapshot, or
 holding an old item, after a writer has removed it. That is safe because both the old table array and the old item remain reachable to the GC until the reader is done.
 
-Sieve inserts use a two-step table path. `probe` either swaps an existing key to a fresh immutable item, or returns a cursor where a new candidate could be
-published. New candidates run admission before they enter the table. A rejected candidate was never visible to readers and leaves no tombstone. An admitted
-candidate is published at the captured cursor.
+Sieve inserts use a two-step table path. `probe` either returns an existing key's item and slot so the writer can swap in a fresh immutable item, or returns a
+cursor where a new candidate could be published. New candidates run admission before they enter the table. A rejected candidate was never visible to readers
+and leaves no tombstone. An admitted candidate is published at the captured cursor.
+
+Removals reclaim tombstones at the end of their probe cluster: a tombstone followed by an empty slot lies on no live item's probe path, so it (and any
+tombstones immediately before it) converts back to empty. This is safe under concurrent lock-free lookups - a reader stops one slot earlier with the same
+result - and keeps miss probes short on eviction-heavy shards. The slot a probe cursor is waiting to fill is pinned: reclamation neither clears it nor treats
+it as the empty trigger, so a pending insert's probe path stays intact.
 
 ## TTL And Expiration
 
@@ -293,16 +301,26 @@ The frequency estimator is a doorkeeper in front of a count-min sketch:
 - the first observation sets doorkeeper bits only
 - later observations add to the sketch
 - `estimate` returns the sketch estimate plus one if the doorkeeper still contains the item
-- the sketch has 4-bit saturating counters packed 16 per `uint64`
-- four indexes are derived by rotating the key hash and applying the xxHash64 avalanche finalizer
+- the sketch has 4-bit saturating counters packed 16 per `uint64`, grouped into cache-line blocks of 8 words
+- one xxHash64 avalanche feeds everything: its low bits select the block (and the doorkeeper indexes), and four disjoint higher bit ranges select the in-block counters, so an add or estimate costs one hash and touches one sketch cache line
 - counters are aged by right-shifting after `resetAt` observations
 - aging also clears the doorkeeper
 
-Reads do not update the sketch directly. They append key hashes to a striped, lossy, per-shard read buffer. The worker drains those samples into the
+Read hits do not update the sketch directly. They append key hashes to a striped, lossy, per-shard read buffer. The worker drains those samples into the
 estimator before and between write batches. If a stripe fills faster than the worker can drain it, old samples are overwritten. That can reduce frequency
 accuracy, but it cannot corrupt cache contents.
 
-The read buffer has up to 16 stripes, rounded to a power of two from `GOMAXPROCS`. `procID()` uses `runtime.procPin` through `go:linkname` as a stripe hint.
+Read misses do no admission work at all: a miss that becomes a Set is counted at insert, and a miss that never becomes a Set is not an admission candidate.
+Every insert advances the estimator timebase by exactly two observations (the unsampled miss plus the Set), so sketch aging and the adaptive-cycle cadence
+run the same in every regime. How much the insert deposits is the adaptive part, deliberately decoupled from that timebase. During shifting working sets
+both observations deposit into the doorkeeper/sketch, which inflates candidates against long-resident victims so a moving working set displaces stale
+entries quickly. During stationary or loop regimes only the first deposits - plain per-request TinyLFU - so candidates must prove reuse before a stable
+frequency core yields to them. `adaptSize` picks the weight from the same per-cycle signals that size the probation window, defaulting to the shifting
+weight.
+
+The read buffer has up to 16 stripes, rounded to a power of two from `GOMAXPROCS`. `procID()` uses `runtime.procPin` through `go:linkname` as a stripe hint. A
+per-buffer dirty mask carries one bit per stripe: producers set it on a stripe's first sample, and the consumer clears it only when the stripe turns out to be
+quiet. That makes the frequent "any samples pending?" check on the write path a single load, and a busy stripe costs neither side a read-modify-write.
 
 #### Ghost Queues
 
@@ -317,7 +335,7 @@ B1 hits mean a probation victim returned quickly, so the item is readmitted dire
 SieveTinyLFU inserts work like this:
 
 1. During warmup, insert into probation and skip frequency/admission work.
-2. After warmup, record the key hash in the estimator and note a B2 resurrection if the key was a recent main-eviction victim.
+2. After warmup, record the key hash in the estimator at the controller-selected insert weight (see the frequency estimator above), and note a B2 resurrection if the key was a recent main-eviction victim.
 3. If the hash is in B1, remove the ghost entry and insert the item directly into main with `visited=true`.
 4. Otherwise insert into probation with `reuse=0` and `visited=false`.
 5. Enforce resident capacity and segment pressure.

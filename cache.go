@@ -62,6 +62,7 @@ type Cache[K comparable, V any] struct {
 	hasher       keyhash.Hasher[K]
 	weigher      Weigher[K, V]
 	trackCost    bool
+	slabLen      int           // items per shard bump slab; <=1 disables slab allocation
 	evictor      evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
 	onRemove     func(K, V, RemovalReason)
 	onEvict      func(K, V)
@@ -135,6 +136,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 	}
 
 	cache.hasher = keyhash.New[K]()
+	cache.slabLen = itemSlabLen[K, V]()
 	if config.StatsEnabled {
 		cache.stats = newStats(runtime.GOMAXPROCS(0))
 	}
@@ -568,14 +570,13 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		// a read never waits for the writer, so a miss may be a Set still
 		// queued for this shard. Drain pending writes and re-check
 		// before declaring a miss so a Get racing a Set of the same key still sees
-		// it without making writes synchronous.
+		// it without making writes synchronous. The miss itself is not sampled:
+		// a miss that becomes a Set is counted by recordAccess at insert, and
+		// one that never does is not an admission candidate.
 		if it, ok := c.drainMissAndLookup(shard, kh, key); ok {
 			item = it
 			warmup = shard.belowSieveWarmup()
 		} else {
-			if !warmup {
-				shard.sampleRead(kh)
-			}
 			if c.config.StatsEnabled {
 				c.stats.recordMiss()
 			}

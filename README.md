@@ -215,3 +215,12 @@ go test -run=TestBenchmarkComparisonGetSetup -count=1 .
 go test -bench='BenchmarkCacheComparison' -benchmem -run=^$ -benchtime=1s .
 go test -bench=. -benchmem -run=^$ -benchtime=1s -timeout=30m .
 ```
+
+### Runtime tuning for insert heavy workloads
+
+For pointer-free key/value types, cache items are allocated in small slabs that the GC frees wholesale
+so a sustained stream of inserts allocates and releases memory in bursts rather than one item at a time.
+With default GC settings the runtime can end up returning those pages to the OS and faulting them right back in.
+On insert heavy workloads setting [`GOMEMLIMIT`](https://pkg.go.dev/runtime#hdr-Environment_Variables)
+(or raising `GOGC`) recovers roughly 10% throughput. No tuning is needed for read mostly workloads.
+This is only for very special cases.

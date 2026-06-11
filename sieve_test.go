@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/unkn0wn-root/kioshun/internal/keyhash"
 )
 
 func TestSieveQueuePushPopRemove(t *testing.T) {
@@ -154,9 +156,11 @@ func TestGhostQueueDuplicateDoesNotGrow(t *testing.T) {
 }
 
 // increment is a test helper: it drives add + sample-aging directly, without the
-// doorkeeper gate production applies in sieveTinyLFU.incrementFrequency.
+// doorkeeper gate production applies in sieveTinyLFU.incrementFrequency. It
+// avalanches like production callers so estimates through the policy path see
+// the same cells.
 func (s *countMinSketch) increment(h uint64) {
-	s.add(h)
+	s.add(keyhash.Avalanche(h))
 	s.samples++
 	if s.resetAt > 0 && s.samples >= s.resetAt {
 		s.age()
@@ -166,23 +170,24 @@ func (s *countMinSketch) increment(h uint64) {
 func TestCountMinSketchIncrementEstimateAgeClear(t *testing.T) {
 	s := newCountMinSketch(32)
 	h := uint64(12345)
-	if got := s.estimate(h); got != 0 {
+	av := keyhash.Avalanche(h)
+	if got := s.estimate(av); got != 0 {
 		t.Fatalf("initial estimate=%d, want 0", got)
 	}
 	for i := 1; i <= 20; i++ {
 		s.increment(h)
 	}
-	if got := s.estimate(h); got != sketchMaxCounter {
+	if got := s.estimate(av); got != sketchMaxCounter {
 		t.Fatalf("saturated estimate=%d, want %d", got, sketchMaxCounter)
 	}
 
 	s.age()
-	if got := s.estimate(h); got != sketchMaxCounter/2 {
+	if got := s.estimate(av); got != sketchMaxCounter/2 {
 		t.Fatalf("aged estimate=%d, want %d", got, sketchMaxCounter/2)
 	}
 
 	s.clear()
-	if got := s.estimate(h); got != 0 {
+	if got := s.estimate(av); got != 0 {
 		t.Fatalf("cleared estimate=%d, want 0", got)
 	}
 }
@@ -190,27 +195,31 @@ func TestCountMinSketchIncrementEstimateAgeClear(t *testing.T) {
 func TestDoorkeeperFiltersFirstFrequencyIncrement(t *testing.T) {
 	a := newSieveTinyLFU[int, int](32, 0, 10, 100)
 	h := uint64(12345)
+	av := keyhash.Avalanche(h)
 
+	// at the default shifting insert weight, recordAccess deposits both
+	// observations (the unsampled Get miss plus the Set): the doorkeeper absorbs
+	// the first, the sketch takes the second.
 	a.recordAccess(h)
-	if got := a.sketch.estimate(h); got != 0 {
-		t.Fatalf("first access sketch estimate=%d, want 0", got)
-	}
-	if got := a.estimate(h); got != 1 {
-		t.Fatalf("first access policy estimate=%d, want 1", got)
-	}
-
-	a.recordAccess(h)
-	if got := a.sketch.estimate(h); got != 1 {
-		t.Fatalf("second access sketch estimate=%d, want 1", got)
+	if got := a.sketch.estimate(av); got != 1 {
+		t.Fatalf("first insert sketch estimate=%d, want 1", got)
 	}
 	if got := a.estimate(h); got != 2 {
-		t.Fatalf("second access policy estimate=%d, want 2", got)
+		t.Fatalf("first insert policy estimate=%d, want 2", got)
+	}
+
+	a.recordAccess(h)
+	if got := a.sketch.estimate(av); got != 3 {
+		t.Fatalf("second insert sketch estimate=%d, want 3", got)
+	}
+	if got := a.estimate(h); got != 4 {
+		t.Fatalf("second insert policy estimate=%d, want 4", got)
 	}
 
 	a.sketch.age()
 	a.door.clear()
-	if got := a.estimate(h); got != 0 {
-		t.Fatalf("aged and cleared estimate=%d, want 0", got)
+	if got := a.estimate(h); got != 1 {
+		t.Fatalf("aged and cleared estimate=%d, want 1", got)
 	}
 }
 
@@ -985,7 +994,7 @@ func TestSieveDropUnpublishedCandidateIsTableFreeAndIdempotent(t *testing.T) {
 
 	// An unpublished candidate: linked into policy, deliberately absent from the
 	// table, exactly as applySieve holds a candidate during admission.
-	cand := &cacheItem[int, int]{key: 2, value: 2, hash: 2, unpublished: true}
+	cand := &cacheItem[int, int]{key: 2, value: 2, hash: 2, flags: itemUnpublished}
 	s.sieve.insert(cand, false)
 	atomic.AddInt64(&s.size, 1)
 	if _, ok := s.tab.lookup(cand.hash, cand.key); ok {
@@ -995,7 +1004,7 @@ func TestSieveDropUnpublishedCandidateIsTableFreeAndIdempotent(t *testing.T) {
 	if !s.dropSieveItem(cand, false, RemovedRejected) {
 		t.Fatal("dropping an unpublished candidate returned false")
 	}
-	if cand.unpublished {
+	if cand.flags&itemUnpublished != 0 {
 		t.Fatal("drop did not clear the unpublished flag")
 	}
 	if s.sieve.owns(cand) {
@@ -1338,4 +1347,34 @@ func assertSieveQueueConsistent[K comparable, V any](
 		t.Fatalf("walked queue size=%d, stored size=%d", n, q.size)
 	}
 	return n
+}
+
+func TestInsertWeightDecouplesEvidenceFromTimebase(t *testing.T) {
+	h := uint64(12345)
+	av := keyhash.Avalanche(h)
+
+	shifting := newSieveTinyLFU[int, int](32, 0, 10, 100)
+	if shifting.insertWeight != insertWeightShifting {
+		t.Fatalf("default insertWeight=%d, want shifting (%d)", shifting.insertWeight, insertWeightShifting)
+	}
+	shifting.recordAccess(h)
+	if got := shifting.sketch.samples; got != 2 {
+		t.Fatalf("shifting samples=%d after one insert, want 2", got)
+	}
+	if got := shifting.sketch.estimate(av); got != 1 {
+		t.Fatalf("shifting sketch estimate=%d, want 1 (second observation deposits)", got)
+	}
+
+	stationary := newSieveTinyLFU[int, int](32, 0, 10, 100)
+	stationary.insertWeight = insertWeightStationary
+	stationary.recordAccess(h)
+	if got := stationary.sketch.samples; got != 2 {
+		t.Fatalf("stationary samples=%d after one insert, want 2 (timebase is weight-independent)", got)
+	}
+	if got := stationary.sketch.estimate(av); got != 0 {
+		t.Fatalf("stationary sketch estimate=%d, want 0 (second observation banks no deposit)", got)
+	}
+	if got := stationary.estimate(h); got != 1 {
+		t.Fatalf("stationary policy estimate=%d, want 1 (doorkeeper only)", got)
+	}
 }
