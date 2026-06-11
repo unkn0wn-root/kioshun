@@ -65,8 +65,7 @@ func xxHash64(input string) uint64 {
 	if length >= largeInputThreshold {
 		h64 = xxHash64Large(data, uint64(length))
 	} else {
-		h64 = prime64_5 + uint64(length) // small input init
-		h64 = xxHash64Small(data, h64)
+		h64 = xxHash64Finalize(data, prime64_5+uint64(length)) // small input init
 	}
 
 	return Avalanche(h64)
@@ -101,10 +100,6 @@ func xxHash64Large(data []byte, length uint64) uint64 {
 	h64 = xxHash64MergeRound(h64, v4)
 
 	h64 += length
-	return xxHash64Finalize(data, h64)
-}
-
-func xxHash64Small(data []byte, h64 uint64) uint64 {
 	return xxHash64Finalize(data, h64)
 }
 

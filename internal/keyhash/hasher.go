@@ -6,10 +6,11 @@ import (
 	"unsafe"
 )
 
-// Hash finalization shared by integerkey hashing and ghost tagging.
-// The full xxHash64 string implementation and its remaining constants live in
-// stringhash_purego.go, compiled only under the kioshun_purego build tag. The
-// default build hashes string keys with the Go runtime's memhash.
+// Hash finalization shared by integer-key hashing, ghost probing and sketch
+// indexing. The full xxHash64 string implementation and its remaining
+// constants live in stringhash_purego.go, compiled only under the
+// kioshun_purego build tag. The default build hashes string keys with the Go
+// runtime's memhash.
 const (
 	prime64_2 = 0xC2B2AE3D27D4EB4F
 	prime64_3 = 0x165667B19E3779F9
@@ -18,8 +19,6 @@ const (
 	avalancheShift1 = 33
 	avalancheShift2 = 29
 	avalancheShift3 = 32
-
-	ghostTagSalt = 0x9ddfea08eb382d69
 )
 
 // hashableInteger is every key kind we hash by reading its integer
@@ -35,53 +34,38 @@ type Hasher[K comparable] struct {
 }
 
 func New[K comparable]() Hasher[K] {
-	var zero K
-	if typ := reflect.TypeOf(zero); typ != nil {
-		switch typ.Kind() {
-		case reflect.String:
-			return Hasher[K]{sum: hashStringKey[K]}
-		case reflect.Int:
-			return Hasher[K]{sum: hashIntKey[K, int]}
-		case reflect.Int8:
-			return Hasher[K]{sum: hashIntKey[K, int8]}
-		case reflect.Int16:
-			return Hasher[K]{sum: hashIntKey[K, int16]}
-		case reflect.Int32:
-			return Hasher[K]{sum: hashIntKey[K, int32]}
-		case reflect.Int64:
-			return Hasher[K]{sum: hashIntKey[K, int64]}
-		case reflect.Uint:
-			return Hasher[K]{sum: hashIntKey[K, uint]}
-		case reflect.Uint8:
-			return Hasher[K]{sum: hashIntKey[K, uint8]}
-		case reflect.Uint16:
-			return Hasher[K]{sum: hashIntKey[K, uint16]}
-		case reflect.Uint32:
-			return Hasher[K]{sum: hashIntKey[K, uint32]}
-		case reflect.Uint64:
-			return Hasher[K]{sum: hashIntKey[K, uint64]}
-		case reflect.Uintptr:
-			return Hasher[K]{sum: hashIntKey[K, uintptr]}
-		}
+	switch reflect.TypeFor[K]().Kind() {
+	case reflect.String:
+		return Hasher[K]{sum: hashStringKey[K]}
+	case reflect.Int:
+		return Hasher[K]{sum: hashIntKey[K, int]}
+	case reflect.Int8:
+		return Hasher[K]{sum: hashIntKey[K, int8]}
+	case reflect.Int16:
+		return Hasher[K]{sum: hashIntKey[K, int16]}
+	case reflect.Int32:
+		return Hasher[K]{sum: hashIntKey[K, int32]}
+	case reflect.Int64:
+		return Hasher[K]{sum: hashIntKey[K, int64]}
+	case reflect.Uint:
+		return Hasher[K]{sum: hashIntKey[K, uint]}
+	case reflect.Uint8:
+		return Hasher[K]{sum: hashIntKey[K, uint8]}
+	case reflect.Uint16:
+		return Hasher[K]{sum: hashIntKey[K, uint16]}
+	case reflect.Uint32:
+		return Hasher[K]{sum: hashIntKey[K, uint32]}
+	case reflect.Uint64:
+		return Hasher[K]{sum: hashIntKey[K, uint64]}
+	case reflect.Uintptr:
+		return Hasher[K]{sum: hashIntKey[K, uintptr]}
+	default:
+		return Hasher[K]{sum: hashFallbackKey[K]}
 	}
-
-	return Hasher[K]{sum: hashFallbackKey[K]}
 }
 
 func (h Hasher[K]) Sum(key K) uint64 {
 	return h.sum(key)
-}
-
-func (h Hasher[K]) Tag(key K) uint16 {
-	return TagFromHash(h.Sum(key))
-}
-
-func TagFromHash(hash uint64) uint16 {
-	tag := uint16(Avalanche(hash^ghostTagSalt) >> 48)
-	if tag == 0 {
-		return 1
-	}
-	return tag
 }
 
 // hashStringKey reinterprets K (known from reflect.Kind to be a string kind) as
