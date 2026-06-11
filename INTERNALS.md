@@ -403,8 +403,9 @@ An admission reject means a newly inserted candidate lost admission and was remo
 
 ## Manager
 
-`Manager` keeps named configs in a locked map and live cache instances in a `sync.Map`. `GetCache` creates a cache lazily from the registered config, or
-from `DefaultConfig` when nothing was registered. If concurrent creators race, `LoadOrStore` keeps one cache and closes the loser so worker goroutines do not leak.
+`Manager` keeps named configs in a locked map and live cache instances in a `sync.Map`. `GetCache` creates a cache lazily from the registered config and
+returns `ErrCacheNotRegistered` for unknown names, so a misspelled name fails instead of silently minting a default cache; `GetCacheWithConfig` is the
+explicit get-or-create path. If concurrent creators race, `LoadOrStore` keeps one cache and closes the loser so worker goroutines do not leak.
 
 Named caches are typed. Asking for the same name with a different `K, V` pair returns `ErrTypeMismatch`.
 

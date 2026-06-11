@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"slices"
 	"sync"
 )
 
@@ -55,12 +56,12 @@ func RegisterCache[K comparable, V any](m *Manager, name string, config Config, 
 		return newCacheError("register", name, err)
 	}
 
-	opts = append([]Option[K, V](nil), opts...)
+	opts = slices.Clone(opts)
 	reg := cacheRegistration{
 		config:    config,
 		cacheType: cacheTypeOf[K, V](),
 		factory: func() (any, error) {
-			return New[K, V](config, opts...)
+			return New(config, opts...)
 		},
 	}
 	return m.register(name, reg)
@@ -79,7 +80,9 @@ func (m *Manager) register(name string, reg cacheRegistration) error {
 }
 
 // GetCache returns the named typed cache, creating it from the registered
-// configuration (or DefaultConfig when none is registered) on first use.
+// configuration on first use. A name that was never registered (or whose
+// registration was dropped by Remove) returns ErrCacheNotRegistered; use
+// GetCacheWithConfig to get-or-create without registering first.
 func GetCache[K comparable, V any](m *Manager, name string) (*Cache[K, V], error) {
 	if cached, ok := m.caches.Load(name); ok {
 		return assertCache[K, V](name, cached)
@@ -90,8 +93,9 @@ func GetCache[K comparable, V any](m *Manager, name string) (*Cache[K, V], error
 	m.configMu.RUnlock()
 
 	if !exists {
-		reg = cacheRegistration{config: DefaultConfig()}
-	} else if reg.cacheType != nil && reg.cacheType != cacheTypeOf[K, V]() {
+		return nil, newCacheError("get", name, ErrCacheNotRegistered)
+	}
+	if reg.cacheType != nil && reg.cacheType != cacheTypeOf[K, V]() {
 		return nil, newCacheError("get", name, ErrTypeMismatch)
 	}
 
@@ -110,7 +114,7 @@ func GetCacheWithConfig[K comparable, V any](
 	if cached, ok := m.caches.Load(name); ok {
 		return assertCache[K, V](name, cached)
 	}
-	return createCache[K, V](m, name, cacheRegistration{config: config}, opts...)
+	return createCache(m, name, cacheRegistration{config: config}, opts...)
 }
 
 // createCache builds a cache from config and races to publish it under name.
@@ -126,7 +130,7 @@ func createCache[K comparable, V any](
 	if reg.factory != nil {
 		created, err = reg.factory()
 	} else {
-		created, err = New[K, V](reg.config, opts...)
+		created, err = New(reg.config, opts...)
 	}
 	if err != nil {
 		return nil, newCacheError("get", name, err)
@@ -214,12 +218,13 @@ func RegisterGlobalCache(name string, config Config) error {
 
 // RegisterGlobalTypedCache registers a typed cache factory in the global manager.
 func RegisterGlobalTypedCache[K comparable, V any](name string, config Config, opts ...Option[K, V]) error {
-	return RegisterCache[K, V](globalManager, name, config, opts...)
+	return RegisterCache(globalManager, name, config, opts...)
 }
 
-// GetGlobalCache retrieves or creates a cache from the global manager. Caches
-// created this way live for the lifetime of the process unless released with
-// CloseAllGlobalCaches.
+// GetGlobalCache retrieves the named cache from the global manager, creating
+// it from its registered configuration on first use. An unregistered name
+// returns ErrCacheNotRegistered (see GetCache). Caches created this way live
+// for the lifetime of the process unless released with CloseAllGlobalCaches.
 func GetGlobalCache[K comparable, V any](name string) (*Cache[K, V], error) {
 	return GetCache[K, V](globalManager, name)
 }
@@ -231,7 +236,7 @@ func GetGlobalCacheWithConfig[K comparable, V any](
 	config Config,
 	opts ...Option[K, V],
 ) (*Cache[K, V], error) {
-	return GetCacheWithConfig[K, V](globalManager, name, config, opts...)
+	return GetCacheWithConfig(globalManager, name, config, opts...)
 }
 
 // GetGlobalCacheStats returns stats for all caches in the global manager.

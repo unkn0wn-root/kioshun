@@ -604,11 +604,15 @@ func TestManagerRemoveDropsConfig(t *testing.T) {
 		t.Fatalf("Remove() error = %v", err)
 	}
 
-	// Remove drops the registration, so a fresh GetCache rebuilds from
-	// DefaultConfig rather than resurrecting the removed config.
-	second, err := GetCache[string, int](manager, "c")
+	// Remove drops the registration, so the name is gone until it is
+	// registered again or recreated explicitly via GetCacheWithConfig.
+	if _, err := GetCache[string, int](manager, "c"); !errors.Is(err, ErrCacheNotRegistered) {
+		t.Fatalf("GetCache() after Remove error = %v, want ErrCacheNotRegistered", err)
+	}
+
+	second, err := GetCacheWithConfig[string, int](manager, "c", DefaultConfig())
 	if err != nil {
-		t.Fatalf("GetCache() after Remove error = %v", err)
+		t.Fatalf("GetCacheWithConfig() after Remove error = %v", err)
 	}
 	if second == first {
 		t.Fatal("expected a new cache instance after Remove")
@@ -658,7 +662,7 @@ func TestManagerCloseAllPreservesTypedRegistration(t *testing.T) {
 	cfg.CleanupInterval = 0
 	cfg.EvictionPolicy = LRU
 
-	if err := RegisterCache[string, []byte](manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
+	if err := RegisterCache(manager, "weighted", cfg, WithWeigher(func(_ string, value []byte) int64 {
 		return int64(len(value))
 	})); err != nil {
 		t.Fatalf("RegisterCache() error = %v", err)
@@ -728,7 +732,7 @@ func TestGetCacheWithConfigAppliesTypedOptions(t *testing.T) {
 	cfg.CleanupInterval = 0
 	cfg.EvictionPolicy = LRU
 
-	cache, err := GetCacheWithConfig[string, []byte](
+	cache, err := GetCacheWithConfig(
 		manager,
 		"weighted",
 		cfg,

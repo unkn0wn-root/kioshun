@@ -8,6 +8,10 @@ import (
 var (
 	// ErrCacheExists is returned when registering a name that already has a configuration.
 	ErrCacheExists = errors.New("cache already exists")
+	// ErrCacheNotRegistered is returned by GetCache for a name with no live
+	// instance and no registered configuration. Use GetCacheWithConfig to
+	// get-or-create without registering first.
+	ErrCacheNotRegistered = errors.New("cache not registered")
 	// ErrTypeMismatch is returned when a cached instance's type parameters differ from those requested.
 	ErrTypeMismatch = errors.New("cache type mismatch")
 	// ErrInvalidConfig is the sentinel that ConfigError unwraps to.
