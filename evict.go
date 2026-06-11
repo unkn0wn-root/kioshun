@@ -28,8 +28,7 @@ func (r RemovalReason) String() string {
 
 type removalNotifyMask uint8
 
-// each reason's notify bit is its position in the RemovalReason enum, so
-// removalNotifyBit is a shift instead of a hand-maintained mapping.
+// each reason's notify bit is its position in the RemovalReason enum.
 const (
 	notifyRemovedCapacity removalNotifyMask = 1 << RemovedCapacity
 	notifyRemovedRejected removalNotifyMask = 1 << RemovedRejected
