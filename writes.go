@@ -505,9 +505,7 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 
 	if prev != nil {
 		// update: swap a fresh immutable item into the slot probe located and
-		// carry policy state across. Always a singleton - an updated resident
-		// may live in main long past its insertion cohort, so it must not share
-		// a slab.
+		// carry policy state across.
 		item := c.newItem(cmd)
 		s.tab.swapAt(slot, item)
 		if d := cmd.cost - prev.cost; d != 0 {
@@ -522,17 +520,10 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	}
 
 	// insert: hold the candidate out of the table until admission decides its
-	// fate. A ghost hit heads straight to main and stays resident long-term, so
-	// it allocates a singleton; everything else enters the probation FIFO, whose
-	// insertion-ordered lifetimes let items share bump slabs.
+	// fate.
 	ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash)
-	var item *cacheItem[K, V]
-	if ghostHit && s.sieve.mainCap > 0 {
-		item = c.newItem(cmd)
-	} else {
-		item = c.newSlabItem(s, cmd)
-	}
-	item.flags |= itemUnpublished
+	item := c.newItem(cmd)
+	item.unpublished = true
 	if !warmup {
 		s.sieve.recordAccess(cmd.hash)
 	}
@@ -545,7 +536,7 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 		s.enforceSieveCapacity(c.config.StatsEnabled, item, ghostHit)
 	}
 	if s.sieve.owns(item) {
-		item.flags &^= itemUnpublished
+		item.unpublished = false
 		s.tab.publish(item, cur)
 		s.sieve.stats.Admits++
 		return true
@@ -609,12 +600,6 @@ func (c *Cache[K, V]) deleteKey(s *shard[K, V], kh uint64, key K) bool {
 // clearShard resets a shard's contents and policy state. The caller must hold s.mu.
 func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 	s.tab.clear()
-	// drop the active slab: its handed-out items still carry intrusive policy
-	// links from before the clear, and a slab kept (and refilled) past this
-	// point would hold the entire pre-clear item graph reachable through them.
-	// Slots are never reused, so the next insert simply starts a fresh slab.
-	s.slab = nil
-	s.slabOff = 0
 	if s.sieve == nil {
 		s.initLRU()
 	}

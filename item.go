@@ -20,17 +20,9 @@ type cacheItem[K comparable, V any] struct {
 	queue      sieveQueueID // which SIEVE queue role owns this (queueNone = unlinked)
 	queueOwner uint8
 	reuse      uint8
-	flags      uint8
-	visited    uint32
+	// unpublished marks a SieveTinyLFU candidate that is live in the policy
+	// queues but not yet stored in the table: admission is still deciding its
+	// fate, so there is no slot to reclaim on removal.
+	unpublished bool
+	visited     uint32
 }
-
-const (
-	// marks a SieveTinyLFU candidate that is live in the policy queues but
-	// not yet stored in the table: admission is still deciding its fate, so
-	// there is no slot to reclaim on removal.
-	itemUnpublished uint8 = 1 << iota
-	// marks an item allocated from its shard's bump slab rather than on its
-	// own. A slab-backed item must not enter the main queue (see
-	// unslabForMain): one long lived survivor would pin its whole slab.
-	itemSlabbed
-)

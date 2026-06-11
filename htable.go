@@ -201,28 +201,6 @@ func (t *htable[K, V]) swapAt(slot *htslot[K, V], it *cacheItem[K, V]) {
 	slot.item.Store(it)
 }
 
-// replaceExact finds the slot holding exactly old and swaps in new, which must
-// carry the same key and hash. Same publication story as swapAt. Returns false
-// when old is no longer resident.
-func (t *htable[K, V]) replaceExact(old, new *cacheItem[K, V]) bool {
-	tag := htNormHash(old.hash)
-	d := t.data.Load()
-	i := tag & d.mask
-	for {
-		s := &d.slots[i]
-		switch s.tag.Load() {
-		case 0:
-			return false
-		case tag:
-			if s.item.Load() == old {
-				s.item.Store(new)
-				return true
-			}
-		}
-		i = (i + 1) & d.mask
-	}
-}
-
 // removeExact tombstones the slot only if it still holds exactly it, returning
 // whether it did. The identity check rejects stale hand/queue pointers whose
 // slot another mutation already replaced or removed.

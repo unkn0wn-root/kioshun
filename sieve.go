@@ -598,7 +598,6 @@ func (s *shard[K, V]) evictProbation(stats bool) *cacheItem[K, V] {
 		return nil
 	}
 	if it.reuse >= probationPromotionReuse || sieveItemVisited(it) {
-		it = s.unslabForMain(it)
 		p.promote(it)
 		return it
 	}

@@ -994,7 +994,7 @@ func TestSieveDropUnpublishedCandidateIsTableFreeAndIdempotent(t *testing.T) {
 
 	// An unpublished candidate: linked into policy, deliberately absent from the
 	// table, exactly as applySieve holds a candidate during admission.
-	cand := &cacheItem[int, int]{key: 2, value: 2, hash: 2, flags: itemUnpublished}
+	cand := &cacheItem[int, int]{key: 2, value: 2, hash: 2, unpublished: true}
 	s.sieve.insert(cand, false)
 	atomic.AddInt64(&s.size, 1)
 	if _, ok := s.tab.lookup(cand.hash, cand.key); ok {
@@ -1004,8 +1004,8 @@ func TestSieveDropUnpublishedCandidateIsTableFreeAndIdempotent(t *testing.T) {
 	if !s.dropSieveItem(cand, false, RemovedRejected) {
 		t.Fatal("dropping an unpublished candidate returned false")
 	}
-	if cand.flags&itemUnpublished != 0 {
-		t.Fatal("drop did not clear the unpublished flag")
+	if cand.unpublished {
+		t.Fatal("drop did not clear the unpublished mark")
 	}
 	if s.sieve.owns(cand) {
 		t.Fatal("drop left the candidate linked in a policy queue")

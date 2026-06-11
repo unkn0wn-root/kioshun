@@ -62,7 +62,6 @@ type Cache[K comparable, V any] struct {
 	hasher       keyhash.Hasher[K]
 	weigher      Weigher[K, V]
 	trackCost    bool
-	slabLen      int           // items per shard bump slab; <=1 disables slab allocation
 	evictor      evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
 	onRemove     func(K, V, RemovalReason)
 	onEvict      func(K, V)
@@ -136,7 +135,6 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 	}
 
 	cache.hasher = keyhash.New[K]()
-	cache.slabLen = itemSlabLen[K, V]()
 	if config.StatsEnabled {
 		cache.stats = newStats(runtime.GOMAXPROCS(0))
 	}

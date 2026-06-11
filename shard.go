@@ -42,10 +42,6 @@ type shard[K comparable, V any] struct {
 
 	sieve *sieveTinyLFU[K, V]
 
-	// bump slab for probation inserts (see newSlabItem); writer only.
-	slab    []cacheItem[K, V]
-	slabOff int
-
 	// removal notification staging, used only when the cache has at least one
 	// listener (removeWake is the shared worker wakeup, nil otherwise). dropItem
 	// and cleanup append removed (key, value, reason) to removeBuf under
@@ -87,8 +83,8 @@ func (s *shard[K, V]) dropItem(
 	// never stored, so it has no table slot to reclaim; unlink policy-only. Every
 	// other item is a confirmed resident and removeExact both rejects stale
 	// queue/hand pointers and frees the slot.
-	if item.flags&itemUnpublished != 0 {
-		item.flags &^= itemUnpublished
+	if item.unpublished {
+		item.unpublished = false
 	} else if !s.tab.removeExact(item) {
 		return false
 	}
