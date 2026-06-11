@@ -102,8 +102,7 @@ func resolveConfig(config Config) (Config, error) {
 }
 
 func configWithDefaults(config Config) Config {
-	defaults := DefaultConfig()
-	cfg := defaults
+	cfg := DefaultConfig()
 
 	if config.MaxSize != 0 {
 		cfg.MaxSize = config.MaxSize

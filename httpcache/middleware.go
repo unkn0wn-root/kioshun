@@ -63,6 +63,8 @@ func New(config Config) (*Middleware, error) {
 		return nil, err
 	}
 
+	// resolveConfig already zeroed CleanupInterval/MaxSize/MaxBodySize for the
+	// corresponding Disable* flags.
 	cacheConfig := kioshun.Config{
 		MaxSize:         config.MaxSize,
 		ShardCount:      config.ShardCount,
@@ -72,9 +74,6 @@ func New(config Config) (*Middleware, error) {
 		ProbationRatio:  config.ProbationRatio,
 		GhostRatio:      config.GhostRatio,
 		StatsEnabled:    !config.DisableStats,
-	}
-	if config.DisableCleanup {
-		cacheConfig.CleanupInterval = 0
 	}
 
 	m := &Middleware{
@@ -130,25 +129,22 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		next.ServeHTTP(rw, r)
 		rw.finish()
 
+		if !rw.cacheable() {
+			return
+		}
 		body := rw.buf.Bytes()
-		if rw.cacheable() {
-			shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body)
-			if !shouldCache {
-				return
-			}
-			cached := &Response{
-				StatusCode: rw.statusCode,
-				Headers:    m.cachedHeaders(rw.headers),
-				Body:       make([]byte, len(body)),
-				CachedAt:   time.Now(),
-			}
-			copy(cached.Body, body)
-
-			if err := m.store(key, cached, ttl); err == nil {
-				if m.onSet != nil {
-					m.onSet(key, ttl)
-				}
-			}
+		shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body)
+		if !shouldCache {
+			return
+		}
+		cached := &Response{
+			StatusCode: rw.statusCode,
+			Headers:    m.cachedHeaders(rw.headers),
+			Body:       bytes.Clone(body),
+			CachedAt:   time.Now(),
+		}
+		if err := m.store(key, cached, ttl); err == nil && m.onSet != nil {
+			m.onSet(key, ttl)
 		}
 	})
 }
@@ -520,10 +516,9 @@ func KeyWithVaryHeaders(varyHeaders []string) KeyGenerator {
 }
 
 // KeyWithoutQuery keys responses by method and path, ignoring query parameters.
+// It is PathBasedKeyGenerator in the form New-style call sites expect.
 func KeyWithoutQuery() KeyGenerator {
-	return func(r *http.Request) string {
-		return r.Method + ":" + r.URL.Path
-	}
+	return PathBasedKeyGenerator
 }
 
 // KeyWithoutQueryHashed hashes method, path, and common vary headers.
