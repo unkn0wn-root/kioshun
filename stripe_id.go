@@ -60,10 +60,15 @@ func (a *stripeIDAlloc) release(id uint64) {
 // and the cleanup registration off the hot path.
 var stripeTokens = sync.Pool{New: newStripeToken}
 
-// stripeToken carries no false sharing padding: idx is written once when the
-// token is issued and only read after that.
+// stripeToken has a pointer field for one reason: it keeps the token off the
+// runtime's tiny allocator which packs small pointer free objects into a
+// shared memory block. As long as anything in that block is still alive, the
+// dead objects in it are not collected and their cleanups may never run - for
+// us that would mean leaked token ids. Objects containing pointers are never
+// packed like this, no matter their size.
 type stripeToken struct {
 	idx uint64
+	_   *byte
 }
 
 func newStripeToken() any {

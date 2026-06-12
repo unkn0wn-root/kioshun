@@ -1,6 +1,7 @@
 package kioshun
 
 import (
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -80,4 +81,19 @@ func TestStripeIDMaskedStable(t *testing.T) {
 		}
 	}
 	t.Fatal("id never sticky across 100 back-to-back call pairs")
+}
+
+func TestStripeTokenNotTinyBatched(t *testing.T) {
+	// Id reuse rides on runtime.AddCleanup, and the cleanup of a tiny
+	// pointer-free object may never run when the runtime batches it into a
+	// shared allocation block with something longer-lived. A pointer field
+	// keeps the token off the tiny-allocator path entirely; do not "simplify"
+	// it away or ids leak.
+	typ := reflect.TypeOf(stripeToken{})
+	for i := range typ.NumField() {
+		if typ.Field(i).Type.Kind() == reflect.Pointer {
+			return
+		}
+	}
+	t.Fatal("stripeToken has no pointer field; tiny-allocator batching can starve its cleanup")
 }
