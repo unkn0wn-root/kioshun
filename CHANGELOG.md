@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [1.5.1](https://github.com/unkn0wn-root/kioshun/compare/v1.4.2...v1.5.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* keep stripe tokens off the tiny alloc so id cleanups run ([59d25c4](https://github.com/unkn0wn-root/kioshun/commit/59d25c4d6244b89491e4fab44b3ee7b6bc77837f))
+
 ### [1.4.2](https://github.com/unkn0wn-root/kioshun/compare/v1.3.2...v1.4.2) (2026-06-11)
 
 
