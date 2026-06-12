@@ -15,8 +15,8 @@ import "github.com/unkn0wn-root/kioshun/internal/keyhash"
 //
 // All operations run on the single-consumer maintenance path under the shard
 // write lock so the index needs no synchronization. Membership lives in the
-// index, not the ring values, so fingerprint 0 (empty-string and zero-int keys
-// hash to 0) is tracked like any other: a cleared ring slot reads as 0 but is
+// index, not the ring values, so fingerprint 0 (a zero integer key hashes to
+// 0) is tracked like any other: a cleared ring slot reads as 0 but is
 // distinguished from a tracked 0 by having no index entry point at it.
 type ghostQueue struct {
 	entries []uint64

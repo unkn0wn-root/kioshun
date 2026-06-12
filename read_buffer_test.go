@@ -28,7 +28,7 @@ func TestReadBufferSampleThenDrainFeedsSketch(t *testing.T) {
 	}
 
 	for range 50 {
-		s.readBuf.sample(h)
+		s.readBuf.sample(h, stripeID())
 	}
 	s.drainReadSamples()
 
@@ -54,7 +54,7 @@ func TestReadBufferLossyOverflowDrainsRecentWindow(t *testing.T) {
 	// The drain must stay bounded and still replay the most recent window.
 	total := readStripeSlots * (len(s.readBuf.stripes) + 4) * 8
 	for range total {
-		s.readBuf.sample(h)
+		s.readBuf.sample(h, stripeID())
 	}
 	s.drainReadSamples()
 
@@ -70,7 +70,7 @@ func TestReadBufferZeroHashMappedToSentinel(t *testing.T) {
 	// hash 0 collides with the empty-slot sentinel; sample() remaps it to 1 so
 	// it is not silently dropped by the drain.
 	for range 30 {
-		s.readBuf.sample(0)
+		s.readBuf.sample(0, stripeID())
 	}
 	s.drainReadSamples()
 	if got := s.sieve.estimate(1); got == 0 {
@@ -88,13 +88,13 @@ func TestReadBufferSignalsAtHeadRelativeFullWindow(t *testing.T) {
 	st.head.Store(10)
 
 	for i := range readStripeSlots - 1 {
-		_, needDrain := rb.sample(uint64(i + 1))
+		_, needDrain := rb.sample(uint64(i+1), 0)
 		if needDrain {
 			t.Fatalf("sample %d signaled before head-relative window was full", i)
 		}
 	}
 
-	_, needDrain := rb.sample(123)
+	_, needDrain := rb.sample(123, 0)
 	if !needDrain {
 		t.Fatal("sample did not signal when tail-head reached readStripeSlots")
 	}
@@ -114,7 +114,7 @@ func TestReadBufferConcurrentSampleDrain(t *testing.T) {
 			defer wg.Done()
 			h := uint64(id + 1)
 			for !stop.Load() {
-				s.readBuf.sample(h)
+				s.readBuf.sample(h, stripeID())
 			}
 		}(g)
 	}

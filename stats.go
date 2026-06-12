@@ -23,13 +23,16 @@ func newStats(parallelism int) *stats {
 }
 
 func (s *stats) stripe() *statStripe {
-	return &s.stripes[uint64(procID())&s.mask]
+	return &s.stripes[stripeID()&s.mask]
 }
 
-func (s *stats) recordHit()        { s.stripe().hits.Add(1) }
-func (s *stats) recordMiss()       { s.stripe().misses.Add(1) }
-func (s *stats) recordEviction()   { s.stripe().evictions.Add(1) }
-func (s *stats) recordExpiration() { s.stripe().expirations.Add(1) }
+// recordHit takes the stripe id from the caller because the read hot path
+// already has one in hand for the read sample; reusing it avoids a second
+// stripeID call per hit. The events below are rare enough to fetch their own.
+func (s *stats) recordHit(id uint64) { s.stripes[id&s.mask].hits.Add(1) }
+func (s *stats) recordMiss()         { s.stripe().misses.Add(1) }
+func (s *stats) recordEviction()     { s.stripe().evictions.Add(1) }
+func (s *stats) recordExpiration()   { s.stripe().expirations.Add(1) }
 
 func (s *stats) aggregate() (hits, misses, evictions, expirations int64) {
 	for i := range s.stripes {
