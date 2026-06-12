@@ -532,7 +532,7 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 	}
 
 	if c.config.StatsEnabled {
-		c.stats.recordHit()
+		c.stats.recordHit(stripeID())
 	}
 
 	return getResult[V]{
@@ -607,13 +607,17 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		}
 	}
 
-	if c.config.StatsEnabled {
-		c.stats.recordHit()
-	}
-	// feed the read into the frequency sketch via the per-shard read buffer so
-	// TinyLFU admission reflects read popularity, not just write traffic.
-	if !warmup {
-		shard.sampleRead(kh)
+	// fetch the stripe id once; the hit counter and the read sample share it.
+	if c.config.StatsEnabled || !warmup {
+		id := stripeID()
+		if c.config.StatsEnabled {
+			c.stats.recordHit(id)
+		}
+		// feed the read into the frequency sketch via the per-shard read buffer
+		// so TinyLFU admission reflects read popularity, not just write traffic.
+		if !warmup {
+			shard.sampleRead(kh, id)
+		}
 	}
 	return res
 }

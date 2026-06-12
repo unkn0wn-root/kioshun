@@ -125,3 +125,22 @@ func BenchmarkHashDistribution(b *testing.B) {
 		collisions[hash]++
 	}
 }
+
+func TestPerHasherSeeds(t *testing.T) {
+	h1 := New[string]()
+	h2 := New[string]()
+
+	// Each Hasher carries its own seed, so two hashers must disagree on a
+	// key (a single 64-bit collision across independent seeds is effectively
+	// impossible).
+	if h1.Sum("seed-check") == h2.Sum("seed-check") {
+		t.Error("two string hashers produced the same hash; seed is not per Hasher")
+	}
+
+	// Integer keys skip the seed, so int hashers stay interchangeable.
+	i1 := New[int]()
+	i2 := New[int]()
+	if i1.Sum(42) != i2.Sum(42) {
+		t.Error("int hashers disagree; the int path must not depend on the seed")
+	}
+}

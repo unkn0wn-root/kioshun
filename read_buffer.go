@@ -32,7 +32,7 @@ type readStripe struct {
 }
 
 // readBuffer is the per-shard BP-Wrapper read buffer: a small set of striped
-// rings indexed by the producer's P id to reduce contention on hot shards. The
+// rings indexed by a per-P stripe id to reduce contention on hot shards. The
 // zero value is unused (no stripes); only SieveTinyLFU shards allocate one.
 type readBuffer struct {
 	stripes []readStripe
@@ -57,18 +57,19 @@ func newReadBuffer() readBuffer {
 	}
 }
 
-// sample records an access fingerprint into the caller's P-local stripe and
-// returns that stripe's index plus whether the consumer has fallen a full window
-// behind. Once tail-head reaches readStripeSlots, the next producer writes begin
-// overwriting unread samples; the caller can drain exactly that stripe or wake
-// the worker. The head load is a hint: head only advances, so a stale read can
-// over-report backlog and cause an extra drain, but it cannot hide a full window
-// that existed before the sample. Lossy by design.
-func (rb *readBuffer) sample(h uint64) (stripe int, needDrain bool) {
+// sample records an access fingerprint into the stripe picked by the caller's
+// id (see stripeID) and returns that stripe's index plus whether the
+// consumer has fallen a full window behind. Once tail-head reaches
+// readStripeSlots, the next producer writes begin overwriting unread samples;
+// the caller can drain exactly that stripe or wake the worker. The head load
+// is a hint: head only advances, so a stale read can over-report backlog and
+// cause an extra drain, but it cannot hide a full window that existed before
+// the sample. Lossy by design.
+func (rb *readBuffer) sample(h, id uint64) (stripe int, needDrain bool) {
 	if h == 0 {
 		h = 1 // reserve 0 as the empty slot sentinel
 	}
-	idx := uint64(procID()) & rb.mask
+	idx := id & rb.mask
 	st := &rb.stripes[idx]
 	i := st.tail.Add(1) - 1
 	st.buf[i&readSlotMask].Store(h)

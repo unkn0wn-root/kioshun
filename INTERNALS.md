@@ -16,7 +16,7 @@ The root `kioshun` package contains the generic cache:
 - `lfu.go`: exact LFU frequency bucket list.
 - `sieve.go`, `sketch.go`, `ghost.go`, `read_buffer.go`: SieveTinyLFU policy.
 - `queue.go`: bounded per-shard MPSC write queue.
-- `pid.go`: best-effort P id lookup used for striped read buffers and stats.
+- `stripe_id.go`: per-P stripe id used by striped read buffers and stats.
 - `internal/keyhash`: type-specialized hashing.
 - `manager.go`: named cache registry and global manager helpers.
 
@@ -94,13 +94,14 @@ A SieveTinyLFU cache with `MaxCost > 0` must also have `MaxSize > 0`; the policy
 
 `internal/keyhash.New[K]` picks a hash function once for the key type:
 
-- strings use the Go runtime `memhash` backend by default
-- builds with `-tags kioshun_purego` use FNV-1a for strings of length `<= 8` and a local `xxHash64(seed=0)` implementation for longer strings
+- strings use `hash/maphash.String`
 - integer-like keys are read directly and avalanched with the xxHash64 finalizer
-- other comparable keys fall back to `fmt.Sprintf("%v", key)` and hash that string
+- other comparable keys use `hash/maphash.Comparable`, which hashes the value's memory representation the way the built-in map would
 
-The default string path uses `unsafe` plus `go:linkname` to call `runtime.memhash`. The call only reads string bytes and does not keep the
-pointer, but it does depend on a runtime internal symbol. Build with `-tags kioshun_purego` when that tradeoff is not acceptable.
+`hash/maphash` is the public API over the runtime's own seeded hash, so the cache does not depend on runtime internals or `go:linkname`.
+Each cache gets its own seed, the way the runtime gives every map its own: hashes stay stable for the cache's lifetime (they are never
+persisted), and a key set that hashes badly into one cache does not hash badly into the rest. Integer keys skip the seed and only get the
+avalanche mix.
 
 The hash selects a shard by `hash & shardMask`. The table still compares full keys on tag matches, so hash collisions affect distribution and probe length not key equality.
 
@@ -315,7 +316,9 @@ entries quickly. During stationary or loop regimes only the first deposits - pla
 frequency core yields to them. `adaptSize` picks the weight from the same per-cycle signals that size the probation window, defaulting to the shifting
 weight.
 
-The read buffer has up to 16 stripes, rounded to a power of two from `GOMAXPROCS`. `procID()` uses `runtime.procPin` through `go:linkname` as a stripe hint. A
+The read buffer has up to 16 stripes, rounded to a power of two from `GOMAXPROCS`. Producers pick a stripe with `stripeID()`. The id lives in a
+small token kept in a `sync.Pool`, which in steady state holds one token per P, and ids come from a lowest-free-id allocator, so concurrently
+running producers end up on distinct stripes - the same spread P ids used to give us, without touching runtime internals. A
 per-buffer dirty mask carries one bit per stripe: producers set it on a stripe's first sample, and the consumer clears it only when the stripe turns out to be
 quiet. That makes the frequent "any samples pending?" check on the write path a single load, and a busy stripe costs neither side a read-modify-write.
 

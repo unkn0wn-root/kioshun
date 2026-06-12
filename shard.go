@@ -150,11 +150,11 @@ func (s *shard[K, V]) belowSieveWarmup() bool {
 // then drains that one stripe itself if it can claim the single-consumer token
 // without blocking (bounding inline work to a single stripe), otherwise it wakes
 // the worker. Below that backlog this is just the buffer append.
-func (s *shard[K, V]) sampleRead(h uint64) {
+func (s *shard[K, V]) sampleRead(h, id uint64) {
 	if s.wake == nil {
 		return
 	}
-	stripe, needDrain := s.readBuf.sample(h)
+	stripe, needDrain := s.readBuf.sample(h, id)
 	if !needDrain {
 		return
 	}
