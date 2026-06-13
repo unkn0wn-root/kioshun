@@ -592,6 +592,118 @@ func TestNonAdmissionPolicyDoesNotInitializeAdmissionState(t *testing.T) {
 	}
 }
 
+func TestShardSieveStateMatchesPolicyInvariant(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+	}{
+		{
+			name: "bounded sieve",
+			config: Config{
+				MaxSize:         16,
+				ShardCount:      4,
+				CleanupInterval: 0,
+				DefaultTTL:      time.Hour,
+				EvictionPolicy:  SieveTinyLFU,
+			},
+		},
+		{
+			name: "unbounded sieve",
+			config: Config{
+				MaxSize:         0,
+				MaxCost:         0,
+				ShardCount:      4,
+				CleanupInterval: 0,
+				DefaultTTL:      time.Hour,
+				EvictionPolicy:  SieveTinyLFU,
+			},
+		},
+		{
+			name: "default policy resolves to bounded sieve",
+			config: Config{
+				MaxSize:         16,
+				ShardCount:      4,
+				CleanupInterval: 0,
+				DefaultTTL:      time.Hour,
+				EvictionPolicy:  DefaultEvictionPolicy,
+			},
+		},
+		{
+			name: "lru",
+			config: Config{
+				MaxSize:         16,
+				ShardCount:      4,
+				CleanupInterval: 0,
+				DefaultTTL:      time.Hour,
+				EvictionPolicy:  LRU,
+			},
+		},
+		{
+			name: "lfu",
+			config: Config{
+				MaxSize:         16,
+				ShardCount:      4,
+				CleanupInterval: 0,
+				DefaultTTL:      time.Hour,
+				EvictionPolicy:  LFU,
+			},
+		},
+		{
+			name: "fifo",
+			config: Config{
+				MaxSize:         16,
+				ShardCount:      4,
+				CleanupInterval: 0,
+				DefaultTTL:      time.Hour,
+				EvictionPolicy:  FIFO,
+			},
+		},
+		{
+			name: "cost-only lru",
+			config: Config{
+				MaxSize:         0,
+				MaxCost:         16,
+				ShardCount:      4,
+				CleanupInterval: 0,
+				DefaultTTL:      time.Hour,
+				EvictionPolicy:  LRU,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestCache[int, int](t, tt.config)
+			defer c.Close()
+
+			wantEvictor := c.config.EvictionPolicy != SieveTinyLFU
+			if got := c.evictor != nil; got != wantEvictor {
+				t.Fatalf("evictor initialized=%v, want %v for policy %v", got, wantEvictor, c.config.EvictionPolicy)
+			}
+
+			for i, s := range c.shards {
+				wantSieve := c.config.EvictionPolicy == SieveTinyLFU && s.cap > 0
+				if got := s.sieve != nil; got != wantSieve {
+					t.Fatalf(
+						"shard %d sieve initialized=%v, want %v (policy=%v cap=%d)",
+						i,
+						got,
+						wantSieve,
+						c.config.EvictionPolicy,
+						s.cap,
+					)
+				}
+				if wantSieve && len(s.readBuf.stripes) == 0 {
+					t.Fatalf("shard %d bounded Sieve missing read buffer", i)
+				}
+				if !wantSieve && (s.head == nil || s.tail == nil) {
+					t.Fatalf("shard %d non-Sieve storage path missing LRU sentinels", i)
+				}
+			}
+		})
+	}
+}
+
 func TestSieveTinyLFUBoundedVictimNeedsForce(t *testing.T) {
 	a := newSieveTinyLFU[int, int](8, 0, 25, 100, CostAdmissionFrequency)
 	for k := 1; k <= 4; k++ {

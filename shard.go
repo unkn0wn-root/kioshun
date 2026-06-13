@@ -158,7 +158,7 @@ func (s *shard[K, V]) sampleRead(h, id uint64) {
 	if !needDrain {
 		return
 	}
-	if s.sieve != nil && s.drainMu.TryLock() {
+	if s.drainMu.TryLock() {
 		s.drainStripe(s.sieve, &s.readBuf.stripes[stripe])
 		s.drainMu.Unlock()
 		return

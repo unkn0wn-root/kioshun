@@ -459,7 +459,7 @@ func (c *Cache[K, V]) newItem(cmd *writeCommand[K, V]) *cacheItem[K, V] {
 
 // applySet mutates shard contents and policy state. The caller must hold s.mu.
 func (c *Cache[K, V]) applySet(s *shard[K, V], cmd *writeCommand[K, V]) bool {
-	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
+	if s.sieve != nil {
 		return c.applySieve(s, cmd)
 	}
 
@@ -571,7 +571,7 @@ func (c *Cache[K, V]) enforcePostUpdateCapacity(s *shard[K, V]) {
 	if !s.overCapacity() {
 		return
 	}
-	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
+	if s.sieve != nil {
 		s.enforceSieveCapacity(c.config.StatsEnabled, nil, false)
 		return
 	}
@@ -599,7 +599,7 @@ func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 	if c.config.EvictionPolicy == LFU {
 		s.lfuList = newLFUList[K, V]()
 	}
-	if c.config.EvictionPolicy == SieveTinyLFU && s.sieve != nil {
+	if s.sieve != nil {
 		s.sieve.reset()
 	}
 	atomic.StoreInt64(&s.size, 0)

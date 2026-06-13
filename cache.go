@@ -465,7 +465,7 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 	// sieve cache has no policy state (shard.sieve == nil) and never evicts so it
 	// falls through to the lock-based path below with no per-read policy update -
 	// the same as FIFO.
-	if c.config.EvictionPolicy == SieveTinyLFU && shard.sieve != nil {
+	if shard.sieve != nil {
 		return c.getSieve(key, kh, shard)
 	}
 
@@ -575,7 +575,7 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		}
 	}
 
-	if shard.sieve != nil && !warmup {
+	if !warmup {
 		shard.sieve.recordReadHit(item)
 	}
 
