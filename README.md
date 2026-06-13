@@ -95,7 +95,7 @@ if err != nil {
 ```
 
 > Every `Config` field, weighted capacity (`MaxCost` + `WithWeigher`) and the
-> named-cache `Manager` are covered in **[CONFIGURATION.md](CONFIGURATION.md)**.
+> named cache `Manager` are covered in **[configuration.md](docs/configuration.md)**.
 
 ## API
 
@@ -121,8 +121,6 @@ c.Close() error
 > `SetAsync` is optional - it may have committed inline already or it may still be queued.
 > Use `Sync` when committed visibility is required.
 
-Full API reference: [pkg.go.dev/github.com/unkn0wn-root/kioshun](https://pkg.go.dev/github.com/unkn0wn-root/kioshun)
-
 ## HTTP Middleware
 
 ```go
@@ -140,7 +138,7 @@ defer middleware.Close()
 
 http.Handle("/api/users", middleware.Wrap(usersHandler))
 ```
-> See **[MIDDLEWARE.md](MIDDLEWARE.md)** for complete documentation.
+> See **[http.md](docs/http.md)** for complete documentation.
 
 ## Benchmarks
 
