@@ -17,10 +17,10 @@
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
-- [Configuration](#configuration) ([full reference](CONFIGURATION.md))
+- [Configuration](#configuration) ([full reference](docs/configuration.md))
 - [API](#api)
-- [HTTP Middleware](MIDDLEWARE.md)
-- [Internals](INTERNALS.md)
+- [HTTP Middleware](#http-middleware) ([full reference](docs/http.md))
+- [Internals](docs/internals.md)
 - [Benchmarks](#benchmarks)
 
 ## Installation
