@@ -1,6 +1,9 @@
 package kioshun
 
-import "github.com/unkn0wn-root/kioshun/internal/keyhash"
+import (
+	"github.com/unkn0wn-root/kioshun/internal/keyhash"
+	"github.com/unkn0wn-root/kioshun/internal/mathx"
+)
 
 // ghostQueue is a fixed size FIFO of recently evicted item fingerprints. A hit
 // is evidence that the queue the item came from was too small for the current
@@ -31,7 +34,7 @@ func newGhostQueue(n int) ghostQueue {
 		return ghostQueue{}
 	}
 
-	m := max(nextPowerOf2(n*2), 8)
+	m := max(mathx.NextPowerOf2(n*2), 8)
 	return ghostQueue{
 		entries: make([]uint64, n),
 		slots:   make([]uint32, m),

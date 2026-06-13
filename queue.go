@@ -1,6 +1,10 @@
 package kioshun
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/unkn0wn-root/kioshun/internal/mathx"
+)
 
 // cacheLinePadding isolates contended atomics onto their own cache lines.
 const cacheLinePadding = 64
@@ -45,7 +49,7 @@ func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-c
 	// Vyukov ring needs >= 2 slots: at size 1 a cell's "published" sequence
 	// is indistinguishable from its "freed" sequence so the next enqueue would
 	// overwrite an un-dequeued item.
-	n := max(nextPowerOf2(size), 2)
+	n := max(mathx.NextPowerOf2(size), 2)
 	q := &mpscQueue[K, V]{
 		mask:    uint64(n - 1),
 		buffer:  make([]mpscCell[K, V], n),

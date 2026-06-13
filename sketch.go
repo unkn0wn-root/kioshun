@@ -1,5 +1,7 @@
 package kioshun
 
+import "github.com/unkn0wn-root/kioshun/internal/mathx"
+
 const (
 	sketchMinCounters     = 1024
 	sketchAgingMultiplier = 10
@@ -33,7 +35,7 @@ func newDoorkeeper(n uint64) doorkeeper {
 	if n < 64 {
 		n = 64
 	}
-	n = uint64(nextPowerOf2(int(n)))
+	n = uint64(mathx.NextPowerOf2(int(n)))
 	return doorkeeper{
 		bits: make([]uint64, n/64),
 		mask: n - 1,
@@ -97,7 +99,7 @@ func newCountMinSketch(n uint64) countMinSketch {
 	if n < sketchMinCounters {
 		n = sketchMinCounters
 	}
-	n = uint64(nextPowerOf2(int(n)))
+	n = uint64(mathx.NextPowerOf2(int(n)))
 
 	w := n / sketchCountersPerWord
 	return countMinSketch{

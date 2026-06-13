@@ -3,6 +3,8 @@ package kioshun
 import (
 	"runtime"
 	"sync/atomic"
+
+	"github.com/unkn0wn-root/kioshun/internal/mathx"
 )
 
 const (
@@ -50,7 +52,7 @@ type readBuffer struct {
 }
 
 func newReadBuffer() readBuffer {
-	n := max(nextPowerOf2(min(runtime.GOMAXPROCS(0), maxReadStripes)), 1)
+	n := max(mathx.NextPowerOf2(min(runtime.GOMAXPROCS(0), maxReadStripes)), 1)
 	return readBuffer{
 		stripes: make([]readStripe, n),
 		mask:    uint64(n - 1),

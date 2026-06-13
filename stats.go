@@ -1,6 +1,10 @@
 package kioshun
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/unkn0wn-root/kioshun/internal/mathx"
+)
 
 const statStripeCap = 16
 
@@ -18,7 +22,7 @@ type stats struct {
 }
 
 func newStats(parallelism int) *stats {
-	n := max(nextPowerOf2(min(parallelism, statStripeCap)), 1)
+	n := max(mathx.NextPowerOf2(min(parallelism, statStripeCap)), 1)
 	return &stats{stripes: make([]statStripe, n), mask: uint64(n - 1)}
 }
 

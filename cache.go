@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/unkn0wn-root/kioshun/internal/keyhash"
+	"github.com/unkn0wn-root/kioshun/internal/mathx"
 )
 
 // Store is the key/value store implemented by Cache.
@@ -98,12 +99,12 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 	// bound shards by capacity so tiny MaxSize/MaxCost values do not create
 	// empty shards.
 	if config.MaxSize > 0 {
-		shardCount = min(shardCount, int(prevPowerOf2(min(config.MaxSize, int64(maxShardCount)))))
+		shardCount = min(shardCount, int(mathx.PrevPowerOf2(min(config.MaxSize, int64(maxShardCount)))))
 	}
 	if config.MaxCost > 0 {
-		shardCount = min(shardCount, int(prevPowerOf2(min(config.MaxCost, int64(maxShardCount)))))
+		shardCount = min(shardCount, int(mathx.PrevPowerOf2(min(config.MaxCost, int64(maxShardCount)))))
 	}
-	shardCount = nextPowerOf2(shardCount)
+	shardCount = mathx.NextPowerOf2(shardCount)
 
 	cache := &Cache[K, V]{
 		shards:    make([]*shard[K, V], shardCount),

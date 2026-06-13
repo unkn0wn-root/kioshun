@@ -1,6 +1,10 @@
 package kioshun
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/unkn0wn-root/kioshun/internal/mathx"
+)
 
 // htable is the per-shard key/value store: a single-writer/multi-reader
 // open-addressing hash table with lock-free reads.
@@ -51,7 +55,7 @@ const (
 )
 
 func newHtable[K comparable, V any](capacityHint int) *htable[K, V] {
-	n := max(nextPowerOf2(capacityHint*2), htMinSlots)
+	n := max(mathx.NextPowerOf2(capacityHint*2), htMinSlots)
 	t := &htable[K, V]{pinned: htNoPin}
 	t.data.Store(&htableData[K, V]{slots: make([]htslot[K, V], n), mask: uint64(n - 1)})
 	return t
