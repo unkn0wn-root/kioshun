@@ -73,6 +73,21 @@ type Cache[K comparable, V any] struct {
 
 type Option[K comparable, V any] func(*Cache[K, V])
 
+// Weigher reports the relative capacity cost for a cache entry. The default
+// cost is 1, preserving entry count when MaxCost is unset.
+type Weigher[K comparable, V any] func(K, V) int64
+
+// WithWeigher configures typed item weights for MaxCost enforcement and
+// cost-aware SieveTinyLFU admission. A nil weigher is ignored.
+func WithWeigher[K comparable, V any](weigher Weigher[K, V]) Option[K, V] {
+	return func(c *Cache[K, V]) {
+		if weigher != nil {
+			c.weigher = weigher
+			c.trackCost = true
+		}
+	}
+}
+
 // New constructs a Cache from config, returning an error if config is invalid.
 // Shard count is normalized to 2^n (and bounded by MaxSize); background
 // workers start immediately so callers must Close the cache to release them.
@@ -190,7 +205,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		opt(cache)
 	}
 
-	nm := cache.removalNotifyMask()
+	nm := cache.listenerNotifyMask()
 	if nm != 0 {
 		cache.removeWake = make(chan struct{}, 1)
 		for _, s := range cache.shards {
