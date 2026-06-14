@@ -25,6 +25,13 @@ func newDefaultTestCache[K comparable, V any](t testing.TB) *Cache[K, V] {
 	return NewDefault[K, V]()
 }
 
+func waitForWrites[K comparable, V any](t testing.TB, c *Cache[K, V]) {
+	t.Helper()
+	if err := c.Sync(); err != nil {
+		t.Fatalf("wait for async writes: %v", err)
+	}
+}
+
 func TestDefaultConfigValid(t *testing.T) {
 	if err := DefaultConfig().Validate(); err != nil {
 		t.Fatalf("DefaultConfig() is invalid: %v", err)
