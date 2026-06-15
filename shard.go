@@ -34,13 +34,19 @@ type cacheItem[K comparable, V any] struct {
 }
 
 type shard[K comparable, V any] struct {
-	mu      sync.RWMutex // serializes writers (and cold scans); reads of tab are lock-free
-	tab     *htable[K, V]
-	stats   *stats // shared per-P telemetry
-	cap     int64  // resident item limit for this shard; 0 => unlimited
-	costCap int64  // resident cost limit for this shard; 0 => unlimited
+	// read-path hot: read on every Get - tab for the lookup, cap for the
+	// warmup gate, sieve on a hit. Pinned to their own cache line, away from the
+	// writer's mutex and the size/cost counters below, so a concurrent write
+	// does not invalidate the line readers depend on.
+	tab   *htable[K, V]
+	sieve *sieveTinyLFU[K, V]
+	cap   int64 // resident item limit for this shard; 0 => unlimited
+	_     [cacheLinePadding]byte
 
-	queue *mpscQueue[K, V] // async mutation transport consumed by this shard's worker
+	mu      sync.RWMutex     // serializes writers (and cold scans); reads of tab are lock-free
+	stats   *stats           // shared per-P telemetry
+	costCap int64            // resident cost limit for this shard; 0 => unlimited
+	queue   *mpscQueue[K, V] // async mutation transport consumed by this shard's worker
 
 	// worker's wake-up: producers ping it after enqueuing a
 	// write and read sampling pings it when a stripe fills. Buffered size 1.
@@ -65,8 +71,6 @@ type shard[K comparable, V any] struct {
 
 	size int64 // live items
 	cost int64 // live item cost
-
-	sieve *sieveTinyLFU[K, V]
 
 	// removal notification staging, used only when the cache has at least one
 	// listener (removeWake is the shared worker wakeup, nil otherwise). dropItem
