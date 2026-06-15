@@ -94,11 +94,6 @@ func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bo
 		s.drainMu.Unlock()
 		return false
 	}
-
-	// Replay buffered reads into the sketch before admission so the inline apply
-	// makes the same SieveTinyLFU decision a queued write would. This runs only
-	// after winning s.mu, so a SetAsync that cannot commit inline bails to the
-	// queue cheaply; the worker drains read samples before applying it anyway.
 	s.drainReadSamples()
 	c.stampExpireTimeNow(cmd)
 	committed := c.applySet(s, cmd)

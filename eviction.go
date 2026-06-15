@@ -49,8 +49,6 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], statsEnabled bool) {
 	if lfu == nil {
 		return
 	}
-	// removeLFU already unlinked the LFU bucket; dropLRU unlinks the shared LRU
-	// list and table without a redundant lookup.
 	s.dropItem(lfu, statsEnabled, RemovedCapacity, dropLRU)
 }
 
