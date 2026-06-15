@@ -16,7 +16,6 @@ type lfuList[K comparable, V any] struct {
 	itemFreq map[*cacheItem[K, V]]*freqNode[K, V] // item -> bucket
 }
 
-// newLFUList creates a circular list with a freq==0 sentinel.
 func newLFUList[K comparable, V any]() *lfuList[K, V] {
 	list := &lfuList[K, V]{
 		head:     &freqNode[K, V]{freq: 0, items: make(map[*cacheItem[K, V]]struct{})},
@@ -34,7 +33,6 @@ func (l *lfuList[K, V]) add(item *cacheItem[K, V]) {
 	l.itemFreq[item] = node
 }
 
-// increment moves item to freq+1, preserving the ascending-bucket invariant.
 func (l *lfuList[K, V]) increment(item *cacheItem[K, V]) {
 	cur := l.itemFreq[item]
 	if cur == nil {
@@ -57,7 +55,6 @@ func (l *lfuList[K, V]) increment(item *cacheItem[K, V]) {
 	}
 }
 
-// removeLFU returns one item from the minimum frequency bucket.
 func (l *lfuList[K, V]) removeLFU() *cacheItem[K, V] {
 	node := l.head.next
 	if node == l.head {
@@ -92,7 +89,6 @@ func (l *lfuList[K, V]) remove(item *cacheItem[K, V]) {
 	}
 }
 
-// ensureIndex inserts a missing bucket immediately after prev.
 func (l *lfuList[K, V]) ensureIndex(prev *freqNode[K, V], freq int64) *freqNode[K, V] {
 	if node, ok := l.freqMap[freq]; ok {
 		return node
@@ -113,7 +109,6 @@ func (l *lfuList[K, V]) ensureIndex(prev *freqNode[K, V], freq int64) *freqNode[
 	return newNode
 }
 
-// removeFreqNode unlinks an empty non-sentinel bucket and drops its freq map entry.
 func (l *lfuList[K, V]) removeFreqNode(node *freqNode[K, V]) {
 	node.prev.next = node.next
 	node.next.prev = node.prev

@@ -2,10 +2,10 @@ package kioshun
 
 import "time"
 
-// Sentinel TTLs for Set and related methods: NoExpiration keeps an item until it
-// is evicted or deleted; DefaultExpiration falls back to Config.DefaultTTL.
 const (
-	NoExpiration      time.Duration = -1
+	// NoExpiration keeps an item until it is evicted, deleted or cleared.
+	NoExpiration time.Duration = -1
+	// DefaultExpiration uses Config.DefaultTTL for Set and related methods.
 	DefaultExpiration time.Duration = 0
 )
 
@@ -36,31 +36,31 @@ const (
 type CostAdmission int
 
 const (
-	// estimate(candidate) > estimate(victim).
+	// CostAdmissionFrequency compares estimate(candidate) > estimate(victim).
 	CostAdmissionFrequency CostAdmission = iota
-	// compares frequency divided by sqrt(cost), a middle
-	// ground between request-hit and byte-hit objectives.
+	// CostAdmissionBalanced compares frequency / sqrt(cost): a middle ground
+	// between request-hit and byte-hit objectives.
 	CostAdmissionBalanced
-	// compares frequency divided by cost, favoring dense
-	// hot entries when request hit ratio matters more than byte hit ratio.
+	// CostAdmissionDensity compares frequency / cost, favoring dense hot entries
+	// when request hit ratio matters more than byte hit ratio.
 	CostAdmissionDensity
 )
 
 // Config controls cache capacity, sharding, eviction, and the async write
 // pipeline. Use DefaultConfig for recommended settings.
 type Config struct {
-	MaxSize         int64
-	MaxCost         int64
-	ShardCount      int
-	CleanupInterval time.Duration
-	DefaultTTL      time.Duration
-	EvictionPolicy  EvictionPolicy
-	StatsEnabled    bool
-	ProbationRatio  uint8
-	GhostRatio      uint8
-	CostAdmission   CostAdmission
-	WriteBufferSize int
-	WriteBatchSize  int
+	MaxSize         int64          // max resident items; 0 => unlimited
+	MaxCost         int64          // max total weighted cost; 0 => disabled
+	ShardCount      int            // shard count; 0 => auto (scaled to CPUs, 2^n)
+	CleanupInterval time.Duration  // expired-item sweep interval; 0 => no sweep
+	DefaultTTL      time.Duration  // TTL for Set with DefaultExpiration; NoExpiration => none
+	EvictionPolicy  EvictionPolicy // replacement policy; default SieveTinyLFU
+	StatsEnabled    bool           // collect hit/miss/eviction telemetry (off by default)
+	ProbationRatio  uint8          // SieveTinyLFU probation window, % of capacity; 0 => default
+	GhostRatio      uint8          // SieveTinyLFU B1 ghost size, % of main; 0 => default
+	CostAdmission   CostAdmission  // how weighted items compete at admission
+	WriteBufferSize int            // per-shard async write queue capacity; 0 => default
+	WriteBatchSize  int            // max writes applied per drain batch; 0 => default
 }
 
 // DefaultConfig returns self-tuning SieveTinyLFU with stats disabled and shard
@@ -84,7 +84,6 @@ func DefaultConfig() Config {
 
 // Validate reports invalid cache configuration values.
 func (c Config) Validate() error {
-	// --- Capacity and lifecycle ---
 	if c.MaxSize < 0 {
 		return newConfigError("MaxSize", c.MaxSize, "must be >= 0")
 	}
@@ -101,7 +100,6 @@ func (c Config) Validate() error {
 		return newConfigError("DefaultTTL", c.DefaultTTL, "must be >= 0 or NoExpiration")
 	}
 
-	// --- Eviction policy ---
 	if c.EvictionPolicy < DefaultEvictionPolicy || c.EvictionPolicy > SieveTinyLFU {
 		return newConfigError("EvictionPolicy", c.EvictionPolicy, "must be a known eviction policy")
 	}
@@ -118,7 +116,6 @@ func (c Config) Validate() error {
 		return newConfigError("CostAdmission", c.CostAdmission, "must be a known cost admission mode")
 	}
 
-	// --- SieveTinyLFU tuning ratios (% of capacity) ---
 	if c.ProbationRatio > 100 {
 		return newConfigError("ProbationRatio", c.ProbationRatio, "must be <= 100")
 	}
@@ -126,7 +123,6 @@ func (c Config) Validate() error {
 		return newConfigError("GhostRatio", c.GhostRatio, "must be <= 100")
 	}
 
-	// --- Async write pipeline ---
 	if c.WriteBufferSize < 0 {
 		return newConfigError("WriteBufferSize", c.WriteBufferSize, "must be >= 0")
 	}

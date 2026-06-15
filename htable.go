@@ -17,14 +17,10 @@ import (
 // before the item is published and never mutated afterwards;
 // a value update allocates a fresh item and swaps it in.
 type htable[K comparable, V any] struct {
-	data  atomic.Pointer[htableData[K, V]]
-	live  int // writer
-	tombs int // writer
-
-	// pinned is the slot a probe cursor is waiting to fill (htNoPin when none).
-	// Evictions run between probe and publish so reclaimTombs treats this slot
-	// as a barrier: never clear it and never let it count as the empty slot.
-	pinned uint64 // writer
+	data   atomic.Pointer[htableData[K, V]]
+	live   int
+	tombs  int
+	pinned uint64
 }
 
 // htNoPin marks no probe cursor in flight; no real slot index reaches 2^64-1.
@@ -48,10 +44,8 @@ type htableData[K comparable, V any] struct {
 
 const (
 	htMinSlots = 8
-	// rehash/grow when (live+tombs)/slots reaches 3/4. Open addressing degrades
-	// sharply past this load and probes walk tombstones until then.
-	htLoadNum = 3
-	htLoadDen = 4
+	htLoadNum  = 3
+	htLoadDen  = 4
 )
 
 func newHtable[K comparable, V any](capacityHint int) *htable[K, V] {
@@ -131,7 +125,7 @@ func (t *htable[K, V]) store(it *cacheItem[K, V]) (prev *cacheItem[K, V]) {
 type htCursor[K comparable, V any] struct {
 	d    *htableData[K, V]
 	slot uint64
-	tomb bool // the slot was a tombstone at probe time (publish reclaims it)
+	tomb bool
 }
 
 // probe walks for key in one pass. If the key already exists, it returns the
@@ -141,11 +135,9 @@ type htCursor[K comparable, V any] struct {
 // WITHOUT inserting, so a SieveTinyLFU candidate can run admission before it ever
 // becomes visible to lock-free readers. Caller holds the shard write lock.
 //
-// This is store's probe walk - the same tag sentinels and first-tombstone reuse -
-// diverging only at the empty slot, where store commits in place and probe defers
-// to publish. The two walks must stay in sync: a change to tombstone reuse or tag
-// handling here belongs in store (and the read-only walks in lookup/removeExact)
-// too.
+// This mirrors store's walk, diverging only at the empty slot (store commits, probe
+// defers to publish); keep tombstone/tag handling in sync with store, lookup and
+// removeExact.
 func (t *htable[K, V]) probe(hash uint64, key K) (prev *cacheItem[K, V], slot *htslot[K, V], cur htCursor[K, V]) {
 	tag := htNormHash(hash)
 	d := t.data.Load()
@@ -230,21 +222,17 @@ func (t *htable[K, V]) removeExact(it *cacheItem[K, V]) bool {
 	}
 }
 
-// reclaimTombs converts the tombstone at i, and any tombstones immediately
-// before it, back to empty when the following slot is empty. A tombstone at the
-// end of its probe cluster lies on no live item's probe path: any walk through
-// it would stop at the empty slot right after, and a live item past an empty
-// slot would already be unreachable. So clearing is safe even under concurrent
-// lock-free lookups: a reader that sees the new empty just stops one slot
-// earlier with the same result. Trimming cluster tails keeps miss probes short
-// and puts off same-size rehashes on eviction-heavy shards.
+// reclaimTombs converts the tombstone at i, and any tombstones immediately before
+// it, back to empty when the following slot is empty. A tombstone at the end of its
+// probe cluster lies on no live item's probe path (any walk stops at the empty slot
+// after it), so clearing is safe under concurrent lock-free lookups: a reader sees
+// the new empty and stops one slot earlier with the same result. Trimming cluster
+// tails keeps miss probes short and defers same-size rehashes on eviction-heavy shards.
 func (t *htable[K, V]) reclaimTombs(d *htableData[K, V], i uint64) {
 	next := (i + 1) & d.mask
 	if next == t.pinned || d.slots[next].tag.Load() != 0 {
 		return
 	}
-	// terminates: the load-factor bound guarantees empty slots so the walk
-	// cannot lap the table.
 	for i != t.pinned && d.slots[i].tag.Load() == 1 {
 		d.slots[i].tag.Store(0)
 		t.tombs--

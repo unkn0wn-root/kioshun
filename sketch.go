@@ -9,8 +9,8 @@ const (
 	sketchCounterBits     = 4
 	sketchCounterMask     = (1 << sketchCounterBits) - 1
 	sketchMaxCounter      = sketchCounterMask
-	// aging shifts packed 4-bit counters right by one; this mask clears bits
-	// that would bleed. Keep tied to sketchCounterBits.
+	// aging shifts packed 4-bit counters right by one.
+	// this mask clears bits that would bleed. Keep tied to sketchCounterBits.
 	sketchCounterAgingMask = 0x7777777777777777
 
 	// counters are grouped into cache-line blocks of 8 words (128 4-bit
@@ -88,7 +88,7 @@ func (d *doorkeeper) set(i uint64) {
 // all-time totals.
 type countMinSketch struct {
 	counters  []uint64
-	blockMask uint64 // block count - 1; counters holds blockCount*8 words
+	blockMask uint64 // block count - 1
 	samples   uint64
 	resetAt   uint64
 }
@@ -133,13 +133,12 @@ func (s *countMinSketch) estimate(av uint64) uint8 {
 	return s.minCounter(s.indexes(av))
 }
 
-// indexes maps av to four counter cells inside one block. The block comes from
-// the low bits; the in-block offsets start at bit 21, which stays clear of the
-// block mask up to 2^21 blocks (256M counters - no per-shard sketch gets
-// anywhere near that). Past it the first offset would share bits with block
-// selection: a mild correlation, not an error. Two offsets can land on the
-// same cell, costing one effective row, but that loss is small next to what
-// the single cache line per access buys.
+// indexes maps av to four counter cells inside one block. The block comes from the
+// low bits; the in-block offsets start at bit 21, clear of the block mask up to 2^21
+// blocks (256M counters - far beyond any per-shard sketch). Past that the first
+// offset shares bits with block selection (a mild correlation, not an error), and
+// two offsets can collide on one cell, costing a row - both small next to the single
+// cache line per access.
 func (s *countMinSketch) indexes(av uint64) [4]uint64 {
 	base := (av & s.blockMask) * sketchBlockCounters
 	return [4]uint64{

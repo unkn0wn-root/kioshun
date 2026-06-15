@@ -71,24 +71,18 @@ func (c *Cache[K, V]) set(key K, value V, ttl time.Duration, callback func(K, V)
 	return c.enqueue(s, cmd)
 }
 
-// tryApplyInline opportunistically applies a Set synchronously when the shard is
-// completely uncontended: the drain token is free, the write queue is fully
-// quiescent (no slot reserved or published), and the shard lock is immediately
-// available. Applying inline gives immediate read-after-write visibility and skips
-// the async handoff, which otherwise lets a re-read miss the not-yet-applied write
-// and enqueue a redundant Set.
+// tryApplyInline applies a Set synchronously when the shard is completely
+// uncontended: the drain token is free, the write queue is fully quiescent (no slot
+// reserved or published), and the shard lock is immediately available. Inline apply
+// gives immediate read-after-write visibility and skips the async handoff that would
+// otherwise let a re-read miss the not-yet-applied write and enqueue a redundant Set.
 //
-// Holding the drain token makes this the sole shard consumer, and quiescent rules
-// out any accepted-but-unpublished write, so applying ahead of the queue cannot
-// reorder against a queued write. It mirrors the worker's drain order - buffered
-// reads are replayed into the frequency sketch before admission - so an inline Set
-// makes the same SieveTinyLFU decision a queued one would.
-//
-// Every acquisition is non-blocking (TryLock), so this never delays SetAsync: any
-// contention - a busy drain worker, queued or in-flight writes, or an active
-// reader/writer on the shard - makes it return false and leave the write for the
-// async queue, preserving both the enqueue-only SetAsync contract and the batching
-// that amortizes eviction on write-heavy shards.
+// Holding the drain token makes this the sole consumer and quiescent rules out any
+// accepted-but-unpublished write, so applying ahead of the queue cannot reorder
+// against a queued write; mirroring the worker's drain order (buffered reads replay
+// into the sketch before admission) makes the inline Set decide admission identically.
+// Every acquisition is non-blocking, so contention just returns false and leaves the
+// write for the async queue, preserving the SetAsync contract and write batching.
 func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	if !s.queue.quiescent() {
 		return false
@@ -100,11 +94,6 @@ func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bo
 		s.drainMu.Unlock()
 		return false
 	}
-
-	// Replay buffered reads into the sketch before admission so the inline apply
-	// makes the same SieveTinyLFU decision a queued write would. This runs only
-	// after winning s.mu, so a SetAsync that cannot commit inline bails to the
-	// queue cheaply; the worker drains read samples before applying it anyway.
 	s.drainReadSamples()
 	c.stampExpireTimeNow(cmd)
 	committed := c.applySet(s, cmd)
@@ -321,12 +310,11 @@ func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 	for {
 		select {
 		case <-s.wake:
-			// Drain, then re-arm under the wake-coalescing protocol. Clearing
-			// wakeState before re-checking ready() is what makes a missed signal
-			// impossible: a producer that publishes after this drain either becomes
-			// visible to ready() (so the loop re-arms and drains it) or finds
-			// wakeState already 0 and sends a fresh token. A failed re-arm CAS means
-			// a producer set wakeState and left a token, so break and let the next
+			// Drain, then re-arm under the wake-coalescing protocol. Clearing wakeState
+			// before re-checking ready() makes a missed signal impossible: a producer
+			// publishing after this drain either becomes visible to ready() (the loop
+			// re-arms and drains it) or finds wakeState 0 and sends a fresh token. A
+			// failed re-arm CAS means a producer left a token, so break and let the next
 			// select consume it.
 			for {
 				c.drainShard(s)
@@ -364,13 +352,11 @@ func (c *Cache[K, V]) drainShard(s *shard[K, V]) {
 }
 
 // drainMissAndLookup restores read-after-write visibility for the lock-free read
-// path. A SieveTinyLFU read takes no lock, so it never waits for the write
-// worker; a miss may therefore be a Set still sitting in this shard's async
-// queue. When the queue is non-empty this drains it (without blocking - it only
-// helps when it can claim the single-consumer token) and re-checks, so a Get that
-// races a Set of the same key still observes it. This keeps writes batched (the
-// async pipeline is untouched) while paying the catch-up cost only on the miss
-// path, where a stale miss would otherwise re-enqueue a redundant Set.
+// path. A SieveTinyLFU read never waits for the write worker, so a miss may be a Set
+// still queued for this shard. When the queue is non-empty it drains (without
+// blocking - only if it can claim the single-consumer token) and re-checks, so a Get
+// racing a Set of the same key still observes it. Writes stay batched; the catch-up
+// cost is paid only on the miss path, where a stale miss would re-enqueue a Set.
 func (c *Cache[K, V]) drainMissAndLookup(s *shard[K, V], kh uint64, key K) (*cacheItem[K, V], bool) {
 	if s.queue.quiescent() || !s.drainMu.TryLock() {
 		return nil, false
@@ -485,13 +471,12 @@ func (c *Cache[K, V]) applySet(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	return true
 }
 
-// applySieve is the SieveTinyLFU write path. probe makes the insert/update
-// decision in one walk: an update swaps the new immutable item in place, while an
-// insert is published late. A new candidate runs admission while it is live in
-// the policy queues but absent from the table, so a rejected candidate is
-// unlinked policy-only and never touches the table (no store, no removeExact, no
-// tombstone) and is never visible to a lock-free Get. Only an admitted candidate
-// is published, at the slot probe located. Caller must hold s.mu.
+// applySieve is the SieveTinyLFU write path. probe makes the insert/update decision
+// in one walk: an update swaps the new immutable item in place, an insert is
+// published late. A candidate runs admission while live in the policy queues but
+// absent from the table, so a rejected one is unlinked policy-only - never stored,
+// never tombstoned, never visible to a lock-free Get. Only an admitted candidate is
+// published, at the slot probe located. Caller must hold s.mu.
 func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	warmup := s.belowSieveWarmup()
 	prev, slot, cur := s.tab.probe(cmd.hash, cmd.key)
@@ -534,9 +519,8 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 		s.sieve.stats.Admits++
 		return true
 	}
-	// rejected: enforceSieveCapacity already unlinked the candidate from policy and
-	// decremented size via the unpublished-aware drop; nothing was ever stored, so
-	// release the probe cursor's reclamation barrier.
+	// rejected: enforceSieveCapacity already unlinked the candidate and decremented
+	// size (unpublished-aware drop); nothing was stored, so release the probe barrier.
 	s.tab.unpin()
 	s.sieve.stats.Rejects++
 	return false

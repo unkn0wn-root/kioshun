@@ -150,36 +150,31 @@ func (q *sieveQueue[K, V]) holds(it *cacheItem[K, V]) bool {
 }
 
 // adaptiveController accumulates the per-cycle signals that drive probation/main
-// resizing. Every counter is maintained exclusively on the single consumer
-// maintenance path (the write worker or a caller holding the shard write lock),
-// so all increments, reads and resets are plain
-//
-// mainSurvivals counts main queue residents the SIEVE hand spared during
-// eviction sweeps (a set visited bit buys a second chance). It is the
-// maintenance path proxy for "the main cache is earning its capacity" and
-// replaces a per-read main hit counter whose increment contended on the
-// read hot path. Counting survivors instead of raw hits also tracks how many
-// distinct main items reads keep alive, rather than being skewed by a single
-// "hammered" key.
+// resizing. Every counter lives only on the single consumer maintenance path (the
+// write worker or a caller holding the shard write lock), so all increments, reads
+// and resets are unsynchronized.
 type adaptiveController struct {
-	ghostHits           uint64
-	probationEvictions  uint64
-	promotions          uint64
+	ghostHits          uint64
+	probationEvictions uint64
+	promotions         uint64
+	// mainSurvivals counts main residents the SIEVE hand spared during eviction
+	// sweeps (a set visited bit buys a second chance): the maintenance-path proxy
+	// for "main is earning its capacity", replacing a per-read hit counter that
+	// contended on the read path. Counting distinct survivors also avoids being
+	// skewed by one hammered key.
 	mainSurvivals       uint64
 	observationsInCycle uint64
 
-	// cost for the admission tuner: evictions are residents displaced to
-	// stay in capacity, rejects are admitted candidates dropped again. Their sum
-	// falls when admission keeps a stable working set and rises when it thrashes,
-	// so it is the maintenance path proxy the admission tuner watches.
+	// admission-tuner cost: evictions are residents displaced to stay in capacity,
+	// rejects are admitted candidates dropped again. Their sum falls when admission
+	// keeps a stable working set and rises when it thrashes.
 	cycleEvictions uint64
 	cycleRejects   uint64
 
-	// per-cycle dual-ghost signals. cycleMainEvicts counts main victims dropped
-	// this cycle; cycleB2Hits counts inserts whose key was a recent main victim
-	// (a resurrection). The rate cycleB2Hits/cycleMainEvicts is high
-	// on loops (we keep evicting items we still need) and near zero on
-	// shifting/bursty/zipf workloads which is what the admission tuner keys on.
+	// per-cycle dual-ghost signals. cycleMainEvicts counts main victims dropped this
+	// cycle; cycleB2Hits counts inserts whose key was a recent main victim (a
+	// resurrection). cycleB2Hits/cycleMainEvicts is high on loops (evicting items
+	// still needed), near zero on shifting/bursty/zipf - what the tuner keys on.
 	cycleMainEvicts uint64
 	cycleB2Hits     uint64
 }
@@ -195,10 +190,9 @@ func (c *adaptiveController) churnCost() float64 {
 // resurrectionRate is the share of this cycle's main eviction victims that were
 // reinserted while still in the B2 ghost: near 1 when a working set larger than
 // capacity keeps evicting items it still needs (a cyclic "loop"), near 0 when
-// evicted victims are abandoned (a shifting hot set). It is the central
-// dual-ghost signal both self-tuning controllers key off - the admission tuner
-// to trial frequency, the segment sizer to grow the recency window so it is
-// named once here. Zero when main is not evicting (no signal).
+// victims are abandoned (a shifting hot set). It is the central dual-ghost signal
+// both self-tuning controllers key off - the admission tuner to trial frequency,
+// the segment sizer to grow the recency window. Zero when main is not evicting.
 func (c *adaptiveController) resurrectionRate() float64 {
 	if c.cycleMainEvicts == 0 {
 		return 0
@@ -206,20 +200,19 @@ func (c *adaptiveController) resurrectionRate() float64 {
 	return float64(c.cycleB2Hits) / float64(c.cycleMainEvicts)
 }
 
-// selects how shouldAdmit breaks frequency ties between an
-// in-flight candidate and the SIEVE victim it would replace. The admission tuner
-// switches a shard between the two automatically; neither is configurable.
+// admissionMode selects how shouldAdmit breaks frequency ties between an in-flight
+// candidate and the SIEVE victim it would replace. The admission tuner switches a
+// shard between the two automatically; neither is configurable.
 type admissionMode uint8
 
 const (
-	// default. Candidates with proven short-term reuse (ghost
-	// hits, probation promotions) win ties, which captures shifting and bursty
-	// working sets quickly. The cost is thrashing on stationary cyclic workloads
-	// whose footprint exceeds capacity.
+	// admitRecency (default): candidates with proven short-term reuse (ghost hits,
+	// probation promotions) win ties, capturing shifting and bursty sets quickly.
+	// The cost is thrashing on stationary cyclic workloads larger than capacity.
 	admitRecency admissionMode = iota
-	// plain TinyLFU: a candidate is admitted only when its
-	// frequency estimate strictly beats the victim's, so the incumbent wins ties.
-	// This pins a stable resident set for loop-like workloads.
+	// admitFrequency is plain TinyLFU: a candidate is admitted only when its
+	// frequency strictly beats the victim's, so the incumbent wins ties and a stable
+	// resident set is pinned for loop-like workloads.
 	admitFrequency
 )
 
@@ -246,13 +239,12 @@ const (
 )
 
 // admissionTuner self-selects a shard's admissionMode with no configuration. It
-// defaults to recency and switches to frequency only after the B2 ghost shows
-// the loop signature; main eviction victims that keep resurrecting, i.e. the
-// cache evicting items it still needs. A guarded one-cycle trial confirms
-// frequency actually cuts churn before committing and a committed shard reverts
-// (with backoff) the moment churn climbs back, so a workload that
-// shifts out of its loop is not starved. All state is maintained on the
-// single consumer maintenance path (see tick) so the fields are plain.
+// defaults to recency and switches to frequency only after the B2 ghost shows the
+// loop signature (main victims that keep resurrecting - the cache evicting items it
+// still needs). A guarded one-cycle trial confirms frequency cuts churn before
+// committing, and a committed shard reverts with backoff once churn climbs back, so
+// a workload shifting out of its loop is not starved. All state lives on the single
+// consumer maintenance path (see tick), so the fields are unsynchronized.
 type admissionTuner struct {
 	mode      admissionMode
 	state     tunerState
@@ -304,7 +296,7 @@ type sieveTinyLFU[K comparable, V any] struct {
 	maxProbationCap int64
 	adaptStep       int64
 	costAdmission   CostAdmission
-	owner           uint8 // shard index stamped onto this shard's queue instances
+	owner           uint8
 }
 
 // newSieveTinyLFU builds the per-shard admission state for a bounded shard.
@@ -347,7 +339,7 @@ func newSieveTinyLFU[K comparable, V any](c int64, owner uint8, pr, gr uint8, mo
 	p.tuner.reset()
 	samples := uint64(max(c*10, int64(sketchMinCounters)))
 	p.ghost = newGhostQueue(int(gc))
-	// B2 holds roughly one shard-capacity of recent main-eviction fingerprints,
+	// B2 holds roughly one shard capacity of recent main-eviction fingerprints,
 	// enough to detect a loop whose footprint exceeds capacity.
 	p.mghost = newGhostQueue(int(c))
 	p.sketch = newCountMinSketch(samples)
@@ -355,15 +347,11 @@ func newSieveTinyLFU[K comparable, V any](c int64, owner uint8, pr, gr uint8, mo
 	return p
 }
 
-// recordAccess counts one insert attempt. The Get miss behind it was never
-// sampled on the read path (misses feed frequency only through the write
-// path), so the insert stands in for two observations - the miss and the Set -
-// and always advances the estimator timebase by two. Sketch aging and the
-// adaptive cycle cadence therefore run the same in every regime; the only
-// adaptive part is whether the second observation also deposits into the
-// doorkeeper/sketch (see insertWeightShifting vs insertWeightStationary).
-// adaptSize picks the weight from the same cycle signals that size the
-// probation window.
+// recordAccess counts one insert attempt. The Get miss behind it was never sampled
+// on the read path, so the insert stands in for two observations (the miss and the
+// Set) and always advances the estimator timebase by two. The only adaptive part is
+// whether the second observation also deposits into the doorkeeper/sketch
+// (insertWeightShifting vs insertWeightStationary, chosen by adaptSize).
 func (p *sieveTinyLFU[K, V]) recordAccess(h uint64) {
 	p.incrementFrequency(h)
 	if p.insertWeight > 1 {
@@ -386,7 +374,7 @@ func (p *sieveTinyLFU[K, V]) incrementFrequency(h uint64) {
 }
 
 // tickObservation advances the estimator timebase by one observation. Sketch
-// aging and the adaptive-cycle window count observed traffic, not deposits
+// aging and the adaptive cycle window count observed traffic, not deposits
 // (the doorkeeper already withholds first-touch ones), so the timebase can
 // advance without writing to the doorkeeper or sketch at all.
 func (p *sieveTinyLFU[K, V]) tickObservation() {
@@ -409,20 +397,16 @@ func (p *sieveTinyLFU[K, V]) estimate(h uint64) uint8 {
 	return e
 }
 
-// owns reports whether it currently resides in either SIEVE queue (probation or main).
 func (p *sieveTinyLFU[K, V]) owns(it *cacheItem[K, V]) bool {
 	return p.probation.holds(it) || p.main.holds(it)
 }
 
 func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
-	// reads only set the visited bit. markSieveItemVisited is a conditional atomic
-	// store (skipped once the bit is set) so a hot item costs at most one
-	// shared-state load here. The read is lock-free, so it must not inspect queue
-	// ownership (it.queue is writer-only and would race the maintenance path); a
-	// resident table hit is in a SIEVE queue by construction, and setting the bit
-	// on an item the writer is concurrently moving or evicting is harmless. The
-	// adaptive controller's "main is useful" signal is gathered on the maintenance
-	// path (see findMainVictim), so the read path stays free of contended writes.
+	// reads only set the visited bit via markSieveItemVisited, a conditional atomic
+	// store (skipped once set) so a hot item costs at most one shared load. Being
+	// lock-free, the read must not inspect queue ownership (it.queue is writer-only
+	// and would race maintenance); a table hit is in a SIEVE queue by construction,
+	// and setting the bit on an item the writer is moving or evicting is harmless.
 	markSieveItemVisited(it)
 }
 
@@ -472,7 +456,6 @@ func (p *sieveTinyLFU[K, V]) insert(it *cacheItem[K, V], gh bool) {
 	p.probation.pushFront(it)
 }
 
-// insertMain creates a visited main queue resident and seeds the SIEVE hand.
 func (p *sieveTinyLFU[K, V]) insertMain(it *cacheItem[K, V]) {
 	it.queue = mainQueue
 	it.reuse = 1
@@ -616,14 +599,6 @@ func (s *shard[K, V]) evictMain(
 	force bool,
 ) bool {
 	p := s.sieve
-	// policy ownership is the liveness signal for the in-flight candidate, and a
-	// table-identity check would be both redundant and wrong here. At a writer
-	// decision point under s.mu the invariant holds: a published, policy-owned item
-	// is table-resident (eviction resets queue in lockstep with the table removal,
-	// so owns can never outlive the slot), so re-checking the table would only
-	// confirm what owns already implies; while an unpublished insert is
-	// intentionally table-absent until admission, so looking it up would wrongly
-	// reject it.
 	if in != nil && !p.owns(in) {
 		in = nil
 		tie = false
@@ -683,10 +658,9 @@ func (s *shard[K, V]) enforceSieveCapacity(
 				in.queue == probationQueue &&
 				p.probation.size <= p.probationCap
 
-			// loopish mirrors adaptSize: a cyclic workload is being pinned by, or is
-			// accumulating evidence toward, frequency admission. Checking evidence (not
-			// just the committed mode) keeps shouldKeep from churning main at a cycle
-			// boundary, where the current-cycle resurrection counter has just reset.
+			// loopish mirrors adaptSize: a cyclic workload is pinned by, or accruing
+			// evidence toward, frequency admission. Checking evidence (not just the
+			// committed mode) keeps shouldKeep from churning main at a cycle boundary.
 			loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
 
 			shouldKeep := inProbation &&
@@ -697,13 +671,11 @@ func (s *shard[K, V]) enforceSieveCapacity(
 					p.controller.resurrectionRate() < probationResurrectLow)
 
 			if shouldKeep {
-				// probation (the recency admission window) is below target on an
-				// unweighted, non-loop, frequency-mode shard: keep the new first-touch
-				// resident and make main yield a slot instead of forcing it to beat
-				// stale sketch history before it can prove reuse. Gated off for weighted
-				// caches (costCap > 0), where keeping one large cold item would evict
-				// several main entries to free cost, and once the tuner has loop evidence
-				// or is pinning a loop, where churning main hurts the resident set.
+				// probation (the recency window) is below target on an unweighted,
+				// non-loop, frequency-mode shard: keep the new first-touch resident and
+				// make main yield a slot instead of forcing it to beat stale sketch
+				// history first. Gated off for weighted caches (one large cold item would
+				// evict several main entries) and once the tuner sees a loop.
 				evictIn, evictTie = nil, false
 			}
 			if s.evictMain(stats, evictIn, evictTie, defaultMainVictimScan, false) {
@@ -721,9 +693,6 @@ func (s *shard[K, V]) enforceSieveCapacity(
 		return
 	}
 
-	// A Set can only overfill the shard by one item but the bounded pass above
-	// may spend its work budget promoting probation entries instead of dropping
-	// them. The forced tail keeps admission bounded while restoring capacity.
 	if (p.probation.size > p.probationCap || s.overCapacity()) && !p.probation.empty() {
 		admitFromProbation()
 	}
@@ -738,8 +707,6 @@ func (s *shard[K, V]) enforceSieveCapacity(
 }
 
 func (s *shard[K, V]) overCapacity() bool {
-	// warm fill to the shard cap; enforce probation/main pressure only after a
-	// new admission would exceed resident capacity.
 	if s.cap > 0 && atomic.LoadInt64(&s.size) > s.cap {
 		return true
 	}
@@ -787,9 +754,6 @@ func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K
 		}
 		if sieveItemVisited(it) {
 			clearSieveItemVisited(it)
-			// a maintenance path observation that reads are keeping main entries
-			// alive. This is the signal the adaptive shrink decision consumes,
-			// gathered here instead of via a contended counter on every main read hit.
 			p.controller.mainSurvivals++
 			if it.reuse > 0 {
 				it.reuse--
@@ -844,9 +808,6 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 		return p.compareAdmissionScore(in, v) > 0
 	}
 
-	// ghost hit or probation promotion has already proven short-term reuse.
-	// Once SIEVE finds an unvisited victim, that recency proof should beat stale
-	// sketch history.
 	if tie && !sieveItemVisited(v) {
 		return true
 	}
@@ -948,39 +909,29 @@ func (p *sieveTinyLFU[K, V]) tick() {
 }
 
 // adaptSize moves capacity between probation (the recency window for new entries)
-// and main (the frequency-protected SIEVE queue), reading only counters already
-// maintained on this single consumer maintenance path.
+// and main (the frequency-protected SIEVE queue), reading only counters already on
+// this single consumer maintenance path.
 //
-// The hard case is telling a stationary skew (which wants a tiny probation so
-// main pins the hot set) apart from a shifting hot set (which wants a large
-// recency window, like LRU): both show heavy probation churn and frequent B1
-// ghost hits, so neither signal separates them. The dual-ghost resurrection rate
-// does. When main is churning yet its victims are abandoned (they do not come
-// back - low cycleB2Hits/cycleMainEvicts) while probation keeps reevicting
-// entries that DO return (ghostHits > promotions), the working set is shifting
-// out from under main, so the recency window is grown aggressively. The
-// mainEvicts>promotions gate keeps a stable main (where mainEvicts is ~0, making
-// the resurrection rate read as 0) from being mistaken for a shift, and the
-// loop guard keeps a cyclic workload - which the admission tuner is pinning with
-// frequency - on a small probation.
+// The hard case is separating a stationary skew (wants a tiny probation so main
+// pins the hot set) from a shifting hot set (wants a large LRU-like recency
+// window): both show heavy probation churn and frequent B1 ghost hits. The
+// dual-ghost resurrection rate breaks the tie - when main churns but its victims
+// are abandoned (low cycleB2Hits/cycleMainEvicts) while probation keeps reevicting
+// entries that DO return (ghostHits > promotions), the working set is shifting, so
+// the recency window grows aggressively. The mainEvicts>promotions gate stops a
+// stable main (resurrection rate reads 0) from looking like a shift, and the loop
+// guard keeps a cyclic workload (pinned by frequency admission) on a small
+// probation. Otherwise the older heuristic applies: grow when B1 hits dominate
+// probation evictions without resurrection, shrink when probation churns far more
+// than it promotes while main keeps earning its keep.
 //
-// Otherwise it falls back to the original recency heuristic: grow modestly when
-// B1 ghost hits dominate probation evictions and the dual-ghost signal says
-// main victims are not resurrecting, shrink when probation churns far more than
-// it promotes while main keeps earning its keep (probation too large for a
-// stationary workload).
-//
-// The same regime classification also picks insertWeight: the shifting
-// branches keep candidates inflated, the stationary branch (and a loop
-// signature) drops back to plain per-request deposits so a stable frequency
-// core stops yielding to unproven candidates. A cycle that matches no branch
-// keeps the last weight rather than flapping it.
+// The same classification picks insertWeight: shifting branches inflate candidates,
+// the stationary branch and loop signature drop back to plain per-request deposits
+// so a stable frequency core stops yielding to unproven candidates. An unmatched
+// cycle keeps the last weight rather than flapping.
 func (p *sieveTinyLFU[K, V]) adaptSize() {
 	c := &p.controller
 	resurrect := c.resurrectionRate()
-	// cyclic ("loop") workload is identified by the admission tuner accumulating
-	// resurrection evidence (or already committed to frequency); while that
-	// signature is present probation stays small so the pinned set holds.
 	loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
 	if loopish {
 		p.insertWeight = insertWeightStationary
@@ -1002,8 +953,7 @@ func (p *sieveTinyLFU[K, V]) adaptSize() {
 			p.setProbationCap(p.probationCap + p.adaptStep)
 		}
 	case c.probationEvictions > c.promotions*2 && c.mainSurvivals > c.promotions:
-		// stationary skew: main is earning its capacity, so candidates compete
-		// at plain per-request deposits.
+		// main is earning its capacity, so candidates compete at plain per-request deposits.
 		p.insertWeight = insertWeightStationary
 		if p.probationCap > p.minProbationCap {
 			p.setProbationCap(p.probationCap - p.adaptStep)
@@ -1012,14 +962,12 @@ func (p *sieveTinyLFU[K, V]) adaptSize() {
 }
 
 // tuneAdmission self-selects this shard's admission mode from the dual-ghost
-// signal, with no configuration. It defaults to recency. When evicted main
-// victims keep resurrecting (the B2 ghost) - the cache discarding items it still
-// needs, the signature of a cyclic working set larger than capacity - it
-// accumulates evidence, then runs a one-cycle frequency trial. The trial commits
-// only if it cuts churn cost. A committed shard reverts (with exponential
-// backoff) the moment churn climbs back, so a workload that shifts out of its
-// loop is never starved. Churn cost (evictions+rejects) tracks the miss rate, so
-// it doubles as a maintenance-path proxy for "is this mode helping".
+// signal, no configuration. It defaults to recency; when evicted main victims keep
+// resurrecting (B2 ghost - a cyclic working set larger than capacity) it accrues
+// evidence, then runs a one-cycle frequency trial that commits only if it cuts
+// churn cost. A committed shard reverts with exponential backoff once churn climbs
+// back, so a workload shifting out of its loop is never starved. Churn cost
+// (evictions+rejects) tracks the miss rate, doubling as the "is this helping" proxy.
 func (p *sieveTinyLFU[K, V]) tuneAdmission() {
 	t := &p.tuner
 	churn := p.controller.churnCost()
@@ -1046,7 +994,6 @@ func (p *sieveTinyLFU[K, V]) tuneAdmission() {
 			t.mode = admitFrequency
 			t.state = tunerTrial
 		}
-
 	case tunerTrial:
 		if churn < t.baseChurn*admissionCommitFactor {
 			t.state = tunerFrequency
@@ -1055,7 +1002,6 @@ func (p *sieveTinyLFU[K, V]) tuneAdmission() {
 		} else {
 			t.revertToRecency()
 		}
-
 	case tunerFrequency:
 		// escape when climbs above the pinned low reference (the workload
 		// shifted out from under the pinned set) or back toward the recency

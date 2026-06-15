@@ -26,9 +26,8 @@ func (r RemovalReason) String() string {
 	}
 }
 
-// evictor removes one resident item from a bounded shard.
-// Callers hold the shard lock; only choose the victim and leave
-// table removal, policy unlinking and statistics to shard.dropItem.
+// evictor selects one victim to remove from a bounded shard. Callers hold the shard
+// lock; table removal, policy unlinking and statistics are left to shard.dropItem.
 type evictor[K comparable, V any] interface {
 	evict(s *shard[K, V], statsEnabled bool)
 }
@@ -50,8 +49,6 @@ func (e lfuEvictor[K, V]) evict(s *shard[K, V], statsEnabled bool) {
 	if lfu == nil {
 		return
 	}
-	// removeLFU already unlinked the LFU bucket; dropLRU unlinks the shared LRU
-	// list and table without a redundant lookup.
 	s.dropItem(lfu, statsEnabled, RemovedCapacity, dropLRU)
 }
 
@@ -67,8 +64,6 @@ func (e fifoEvictor[K, V]) evict(s *shard[K, V], statsEnabled bool) {
 	s.dropItem(s.tail.prev, statsEnabled, RemovedCapacity, dropLRU)
 }
 
-// createEvictor returns the non-Sieve replacement policy for a shard.
-// Public config is normalized and validated before this point.
 func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 	switch policy {
 	case LRU:
@@ -115,16 +110,12 @@ func WithOnEvict[K comparable, V any](listener func(key K, value V)) Option[K, V
 	return func(c *Cache[K, V]) { c.onEvict = listener }
 }
 
-// removedEntry stages a removed (key, value, reason) for async delivery to
-// removal listeners; removeNotifyWorker drains them once the lock is released.
 type removedEntry[K comparable, V any] struct {
 	key    K
 	value  V
 	reason RemovalReason
 }
 
-// listenerNotifyMask reports which removal reasons need staging for the
-// configured listeners.
 func (c *Cache[K, V]) listenerNotifyMask() removalNotifyMask {
 	var mask removalNotifyMask
 	if c.onRemove != nil {
@@ -153,7 +144,6 @@ func (c *Cache[K, V]) removeNotifyWorker() {
 	}
 }
 
-// drainRemovals hands each shard's staged removals to configured listeners.
 func (c *Cache[K, V]) drainRemovals() {
 	for _, s := range c.shards {
 		if !s.removePending.Load() {

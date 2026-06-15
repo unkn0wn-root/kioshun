@@ -40,14 +40,12 @@ type readBuffer struct {
 	stripes []readStripe
 	mask    uint64
 
-	// dirty has one bit per stripe: producers set it on a stripe's first
-	// sample, the consumer clears it only when the stripe turns out to be
-	// quiet. The write path asks "any samples pending?" constantly, and the
-	// mask makes that one word instead of a walk over every stripe's cursors.
-	// A busy stripe's bit just stays set, so neither side pays a
-	// read-modify-write in steady state. Lossy like the stripes themselves: a
-	// sample racing the clear is delayed until the stripe's next sample
-	// re-arms the bit, not lost.
+	// dirty has one bit per stripe: producers set it on a stripe's first sample, the
+	// consumer clears it only when the stripe turns out quiet. The write path's
+	// constant "any samples pending?" check is then one word, not a walk over every
+	// stripe's cursors, and a busy stripe's bit just stays set (no steady-state
+	// read-modify-write). Lossy: a sample racing the clear is delayed to the next
+	// sample, not lost.
 	dirty atomic.Uint32
 }
 
@@ -59,17 +57,15 @@ func newReadBuffer() readBuffer {
 	}
 }
 
-// sample records an access fingerprint into the stripe picked by the caller's
-// id (see stripeID) and returns that stripe's index plus whether the
-// consumer has fallen a full window behind. Once tail-head reaches
-// readStripeSlots, the next producer writes begin overwriting unread samples;
-// the caller can drain exactly that stripe or wake the worker. The head load
-// is a hint: head only advances, so a stale read can over-report backlog and
-// cause an extra drain, but it cannot hide a full window that existed before
-// the sample. Lossy by design.
+// sample records an access fingerprint into the stripe picked by the caller's id
+// and returns that stripe's index plus whether the consumer has fallen a full window
+// behind. Past readStripeSlots of backlog, producers overwrite unread samples, so
+// the caller drains that stripe or wakes the worker. The head load is a hint (head
+// only advances): a stale read may over-report backlog and cause an extra drain, but
+// cannot hide a full window. Lossy by design.
 func (rb *readBuffer) sample(h, id uint64) (stripe int, needDrain bool) {
 	if h == 0 {
-		h = 1 // reserve 0 as the empty slot sentinel
+		h = 1
 	}
 	idx := id & rb.mask
 	st := &rb.stripes[idx]
