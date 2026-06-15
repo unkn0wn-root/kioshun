@@ -18,7 +18,7 @@ import (
 type cacheItem[K comparable, V any] struct {
 	value      V
 	expireTime int64 // cache-relative monotonic ns; 0 => no expiration
-	cost       int64 // weigher-reported capacity cost;
+	cost       int64 // weigher-reported capacity cost
 	prev       *cacheItem[K, V]
 	next       *cacheItem[K, V]
 	key        K // original key for deletions
@@ -46,9 +46,8 @@ type shard[K comparable, V any] struct {
 	// write and read sampling pings it when a stripe fills. Buffered size 1.
 	wake chan struct{}
 
-	// keeps the MPSC queue single consumer while allowing synchronous
-	// callers to help drain their own shard instead of always waiting for the
-	// background worker to run.
+	// lets synchronous callers help drain their own shard while keeping the queue
+	// single-consumer.
 	drainMu    sync.Mutex
 	writeBatch []writeCommand[K, V]
 
@@ -104,12 +103,10 @@ func dropModeFor(policy EvictionPolicy) itemDropMode {
 	}
 }
 
-// dropItem removes a resident item from the table and unlinks its policy
-// metadata. removeExact both rejects stale queue or hand pointers (it only
-// removes when the slot still holds exactly this item) and frees the slot in a
-// single probe, so the downstream unlinks always operate on a confirmed resident.
-// The item itself is not recycled: a lock-free reader may still hold it, so the
-// GC reclaims it.
+// dropItem removes a resident item from the table and unlinks its policy metadata.
+// removeExact rejects stale queue/hand pointers (it removes only when the slot still
+// holds exactly this item) and frees the slot in one probe, so the downstream
+// unlinks always operate on a confirmed resident.
 func (s *shard[K, V]) dropItem(
 	item *cacheItem[K, V],
 	statsEnabled bool,
@@ -119,10 +116,9 @@ func (s *shard[K, V]) dropItem(
 	if item == nil {
 		return false
 	}
-	// an unpublished SieveTinyLFU candidate is live in the policy queues but was
-	// never stored, so it has no table slot to reclaim; unlink policy-only. Every
-	// other item is a confirmed resident and removeExact both rejects stale
-	// queue/hand pointers and frees the slot.
+	// an unpublished SieveTinyLFU candidate was never stored, so it has no table slot
+	// to reclaim; unlink policy-only. Every other item is a confirmed resident that
+	// removeExact frees.
 	if item.unpublished {
 		item.unpublished = false
 	} else if !s.tab.removeExact(item) {
@@ -172,11 +168,10 @@ func (s *shard[K, V]) belowSieveWarmup() bool {
 	return s.cap > 0 && atomic.LoadInt64(&s.size)*2 < s.cap
 }
 
-// sampleRead records a read access into the per-shard read buffer. sample()
-// reports backlog when the consumer has fallen a full window behind; the reader
-// then drains that one stripe itself if it can claim the single-consumer token
-// without blocking (bounding inline work to a single stripe), otherwise it wakes
-// the worker. Below that backlog this is just the buffer append.
+// sampleRead records a read access into the per-shard read buffer. On backlog (the
+// consumer a full window behind) the reader drains that one stripe itself if it can
+// claim the single-consumer token without blocking, else it wakes the worker. Below
+// backlog this is just the buffer append.
 func (s *shard[K, V]) sampleRead(h, id uint64) {
 	if s.wake == nil {
 		return

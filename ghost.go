@@ -5,22 +5,17 @@ import (
 	"github.com/unkn0wn-root/kioshun/internal/mathx"
 )
 
-// ghostQueue is a fixed size FIFO of recently evicted item fingerprints. A hit
-// is evidence that the queue the item came from was too small for the current
+// ghostQueue is a fixed-size FIFO of recently evicted item fingerprints (full
+// 64-bit key hashes). A hit means the queue the item came from was too small for the
 // workload, so SieveTinyLFU readmits the item directly into main and may grow
 // probation.
 //
-// A fingerprint is the full 64-bit key hash, which identifies an item as
-// precisely as the cache can. The ring keeps fingerprints in FIFO order; an
-// open-addressed index maps a fingerprint back to its ring slot so contains,
-// add and remove are O(1). The index is a flat uint32 slice
-// (probe position -> ring slot + 1, 0 meaning empty).
-//
-// All operations run on the single-consumer maintenance path under the shard
-// write lock so the index needs no synchronization. Membership lives in the
-// index, not the ring values, so fingerprint 0 (a zero integer key hashes to
-// 0) is tracked like any other: a cleared ring slot reads as 0 but is
-// distinguished from a tracked 0 by having no index entry point at it.
+// The ring holds fingerprints in FIFO order; an open-addressed index (a flat uint32
+// slice, probe pos -> ring slot + 1, 0 = empty) maps a fingerprint back to its slot
+// so contains/add/remove are O(1). All operations run on the single consumer
+// maintenance path under the shard write lock, so the index needs no synchronization.
+// Membership lives in the index, not the ring values, so fingerprint 0 is tracked
+// like any other: a cleared slot reads as 0 but has no index entry pointing at it.
 type ghostQueue struct {
 	entries []uint64
 	slots   []uint32 // probe pos -> ring index + 1 (0 = empty)
@@ -42,9 +37,9 @@ func newGhostQueue(n int) ghostQueue {
 	}
 }
 
-// probeStart de-correlates the fingerprint before masking. Within a shard every
-// stored hash shares the same low bits (those select the shard) so masking the
-// raw hash would cluster every entry into one probe chain
+// probeStart de-correlates the fingerprint before masking: within a shard every
+// stored hash shares the same low bits (those select the shard), so masking the raw
+// hash would cluster every entry into one probe chain.
 func (g *ghostQueue) probeStart(h uint64) uint64 {
 	return keyhash.Avalanche(h) & g.mask
 }

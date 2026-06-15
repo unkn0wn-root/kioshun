@@ -141,11 +141,9 @@ type htCursor[K comparable, V any] struct {
 // WITHOUT inserting, so a SieveTinyLFU candidate can run admission before it ever
 // becomes visible to lock-free readers. Caller holds the shard write lock.
 //
-// This is store's probe walk - the same tag sentinels and first-tombstone reuse -
-// diverging only at the empty slot, where store commits in place and probe defers
-// to publish. The two walks must stay in sync: a change to tombstone reuse or tag
-// handling here belongs in store (and the read-only walks in lookup/removeExact)
-// too.
+// This mirrors store's walk, diverging only at the empty slot (store commits, probe
+// defers to publish); keep tombstone/tag handling in sync with store, lookup and
+// removeExact.
 func (t *htable[K, V]) probe(hash uint64, key K) (prev *cacheItem[K, V], slot *htslot[K, V], cur htCursor[K, V]) {
 	tag := htNormHash(hash)
 	d := t.data.Load()
@@ -230,14 +228,12 @@ func (t *htable[K, V]) removeExact(it *cacheItem[K, V]) bool {
 	}
 }
 
-// reclaimTombs converts the tombstone at i, and any tombstones immediately
-// before it, back to empty when the following slot is empty. A tombstone at the
-// end of its probe cluster lies on no live item's probe path: any walk through
-// it would stop at the empty slot right after, and a live item past an empty
-// slot would already be unreachable. So clearing is safe even under concurrent
-// lock-free lookups: a reader that sees the new empty just stops one slot
-// earlier with the same result. Trimming cluster tails keeps miss probes short
-// and puts off same-size rehashes on eviction-heavy shards.
+// reclaimTombs converts the tombstone at i, and any tombstones immediately before
+// it, back to empty when the following slot is empty. A tombstone at the end of its
+// probe cluster lies on no live item's probe path (any walk stops at the empty slot
+// after it), so clearing is safe under concurrent lock-free lookups: a reader sees
+// the new empty and stops one slot earlier with the same result. Trimming cluster
+// tails keeps miss probes short and defers same-size rehashes on eviction-heavy shards.
 func (t *htable[K, V]) reclaimTombs(d *htableData[K, V], i uint64) {
 	next := (i + 1) & d.mask
 	if next == t.pinned || d.slots[next].tag.Load() != 0 {

@@ -12,11 +12,10 @@ const (
 	stripeIDCap   = stripeIDWords * 64
 )
 
-// stripeIDs hands out the lowest free index and takes it back when the owning
-// token is GCed, so the indices held by live tokens are always
-// distinct - the property P ids gave us for free. Random indices would not
-// be: with about as many producers as stripes, some producers would share a
-// stripe and keep bouncing its cache line between their cores.
+// stripeIDs hands out the lowest free index and reclaims it when the owning token
+// is GCed, so the indices held by live tokens stay distinct. Random indices would
+// not: with about as many producers as stripes, some would collide on a stripe and
+// bounce its cache line between cores.
 var stripeIDs stripeIDAlloc
 
 type stripeIDAlloc struct {
@@ -51,13 +50,12 @@ func (a *stripeIDAlloc) release(id uint64) {
 	a.mu.Unlock()
 }
 
-// stripeTokens holds roughly one stripeToken per P: sync.Pool's private slot
-// returns the token last released on the current P so repeated calls on the
-// same P see the same id and stripe choice follows the P. One process wide
-// pool is enough - the id only spreads producers across stripes, there is
-// nothing cache specific to keep. New tokens are issued rarely (at startup,
-// or after an idle P's token was collected) which keeps the allocator mutex
-// and the cleanup registration off the hot path.
+// stripeTokens holds roughly one stripeToken per P: sync.Pool's private slot returns
+// the token last released on the current P, so repeated calls on the same P reuse
+// the same id and the stripe choice follows the P. One process-wide pool suffices -
+// the id only spreads producers across stripes. New tokens issue rarely (startup, or
+// after an idle P's token was collected), keeping the allocator mutex and cleanup
+// registration off the hot path.
 var stripeTokens = sync.Pool{New: newStripeToken}
 
 // stripeToken has a pointer field for one reason: it keeps the token off the
@@ -77,11 +75,11 @@ func newStripeToken() any {
 	return t
 }
 
-// stripeID returns the caller's index into the striped structures
-// (read-sample rings, stat counters). Thi is best effort here: a goroutine
-// preempted between Get and Put or a GOMAXPROCS change at runtime, can leave
-// two producers on the same stripe for a while. Every striped consumer
-// tolerates that and callers mask the value so it cannot index out of range.
+// stripeID returns the caller's index into the striped structures (read-sample
+// rings, stat counters). Best-effort: a goroutine preempted between Get and Put, or
+// a GOMAXPROCS change, can leave two producers on the same stripe briefly. Every
+// striped consumer tolerates that, and callers mask the value so it cannot index out
+// of range.
 func stripeID() uint64 {
 	t := stripeTokens.Get().(*stripeToken)
 	idx := t.idx

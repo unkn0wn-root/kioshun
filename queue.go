@@ -9,8 +9,7 @@ import (
 // cacheLinePadding isolates contended atomics onto their own cache lines.
 const cacheLinePadding = 64
 
-// signal performs wake on a size-1 channel:
-// if a token is already pending the wake is a no-op.
+// signal wakes a size-1 channel; a no-op if a token is already pending.
 func signal(ch chan struct{}) {
 	select {
 	case ch <- struct{}{}:
@@ -24,11 +23,10 @@ type mpscCell[K comparable, V any] struct {
 	cmd writeCommand[K, V]
 }
 
-// mpscQueue connects cache producers to a shard's single write worker. It is a
-// bounded Vyukov MPSC ring: sequence numbers distinguish free, published and
-// stale slots across laps without a producer-side lock. The queue applies
-// back-pressure instead of dropping writes; on shutdown it wakes blocked
-// producers.
+// mpscQueue is a bounded Vyukov MPSC ring linking cache producers to a shard's
+// single write worker. Per-cell sequence numbers order free/published/stale slots
+// across laps without a producer lock; full producers block (back-pressure, not
+// drop) until the consumer frees a slot or the cache closes.
 type mpscQueue[K comparable, V any] struct {
 	mask    uint64
 	buffer  []mpscCell[K, V]
@@ -46,9 +44,8 @@ type mpscQueue[K comparable, V any] struct {
 }
 
 func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) *mpscQueue[K, V] {
-	// Vyukov ring needs >= 2 slots: at size 1 a cell's "published" sequence
-	// is indistinguishable from its "freed" sequence so the next enqueue would
-	// overwrite an un-dequeued item.
+	// Vyukov ring needs >= 2 slots: at size 1 a cell's published and freed
+	// sequences coincide, so the next enqueue could overwrite an un-dequeued item.
 	n := max(mathx.NextPowerOf2(size), 2)
 	q := &mpscQueue[K, V]{
 		mask:    uint64(n - 1),
@@ -74,22 +71,17 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 			if q.head.CompareAndSwap(pos, pos+1) {
 				cell.cmd = cmd
 				cell.seq.Store(pos + 1) // publish (release) for the consumer
-				// Signal only when this publish makes an otherwise idle queue
-				// non-empty: tail == pos means the slot just filled is the one the
-				// consumer reads next and the wakeState CAS claims the single
-				// outstanding wake. When an earlier slot is still unconsumed
-				// (tail != pos) or a wake is already outstanding (wakeState == 1),
-				// the consumer reaches this item without another signal. The skip is
-				// safe because the consumer decides there is work from the ring
-				// itself (ready), never from wakeState - see writeWorker.
+				// Wake only when this publish fills the consumer's next slot
+				// (tail == pos) and claims the lone outstanding wake (wakeState CAS).
+				// Skipping is safe: the consumer detects work from the ring (ready),
+				// not from wakeState.
 				if q.tail.Load() == pos && q.wakeState.CompareAndSwap(0, 1) {
 					signal(q.wake)
 				}
 				return nil
 			}
 		case dif < 0:
-			// full: this slot still holds an item one lap behind that the
-			// consumer has not freed. Wait for room or shutdown.
+			// full: slot still holds an unfreed item from the previous lap.
 			select {
 			case <-q.space:
 			case <-q.closeCh:
@@ -101,21 +93,17 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 	}
 }
 
-// quiescent reports whether the queue holds no in-flight writes: head == tail
-// means every reserved slot has been consumed so there is neither a published
-// command waiting nor a slot a producer has reserved (advanced head) but not yet
-// published. Both ends are read atomically, so this is safe to call without the
-// drain token (e.g. on the lock-free read miss path) - it is only a hint: a
-// producer may reserve a slot, or the consumer may advance tail, right after it
-// returns, which the caller re-checks under the drain token before acting.
+// quiescent reports whether no writes are in flight (head == tail: every reserved
+// slot consumed). Lock-free and safe off the drain token, but only a hint - a
+// producer or the consumer may move either end right after it returns, so callers
+// re-check under the token before acting.
 func (q *mpscQueue[K, V]) quiescent() bool {
 	return q.head.Load() == q.tail.Load()
 }
 
-// ready reports whether a command is published at the consumer's tail, so the
-// next tryDequeue would return it. It is the wake protocol's source of truth for
-// "is there work". Only the consumer (writeWorker) may call it: it reads tail
-// unsynchronized, which is stable solely for the single consumer.
+// ready reports whether a command is published at tail (the next tryDequeue would
+// return it) - the wake protocol's source of truth for "is there work". Consumer
+// only: it reads tail unsynchronized.
 func (q *mpscQueue[K, V]) ready() bool {
 	pos := q.tail.Load()
 	cell := &q.buffer[pos&q.mask]
