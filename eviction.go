@@ -26,9 +26,8 @@ func (r RemovalReason) String() string {
 	}
 }
 
-// evictor removes one resident item from a bounded shard.
-// Callers hold the shard lock; only choose the victim and leave
-// table removal, policy unlinking and statistics to shard.dropItem.
+// evictor selects one victim to remove from a bounded shard. Callers hold the shard
+// lock; table removal, policy unlinking and statistics are left to shard.dropItem.
 type evictor[K comparable, V any] interface {
 	evict(s *shard[K, V], statsEnabled bool)
 }

@@ -22,28 +22,28 @@ type Store[K comparable, V any] interface {
 
 var _ Store[string, int] = (*Cache[string, int])(nil)
 
-// Stats exposes approx. telemetry aggregated across shards.
+// Stats is approximate telemetry aggregated across shards.
 type Stats struct {
-	Hits        int64
-	Misses      int64
-	Evictions   int64
-	Expirations int64
-	Size        int64
-	Cost        int64
-	Capacity    int64
-	MaxCost     int64
-	HitRatio    float64
-	Shards      int
+	Hits        int64   // lookups that found a live entry
+	Misses      int64   // lookups that found nothing or an expired entry
+	Evictions   int64   // entries removed to stay within capacity
+	Expirations int64   // entries removed because their TTL elapsed
+	Size        int64   // resident item count
+	Cost        int64   // resident weighted cost (equals Size when unweighted)
+	Capacity    int64   // configured MaxSize; 0 => unlimited
+	MaxCost     int64   // configured MaxCost; 0 => disabled
+	HitRatio    float64 // Hits/(Hits + Misses); 0 when no lookups
+	Shards      int     // shard count
 }
 
 // PolicyStats exposes SieveTinyLFU admission and replacement decisions.
 type PolicyStats struct {
-	Admits             int64
-	Rejects            int64
-	GhostHits          int64
-	Promotions         int64
-	ProbationEvictions int64
-	MainEvictions      int64
+	Admits             int64 // candidates admitted into the cache
+	Rejects            int64 // candidates TinyLFU declined to admit
+	GhostHits          int64 // inserts whose key was a recent eviction (B1 ghost hit)
+	Promotions         int64 // probation entries promoted to the main (protected) queue
+	ProbationEvictions int64 // entries evicted from the probation queue
+	MainEvictions      int64 // entries evicted from the main queue
 }
 
 // Cache is a sharded in-memory cache with per-policy metadata. SieveTinyLFU reads
@@ -191,7 +191,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 				config.GhostRatio,
 				config.CostAdmission,
 			)
-			s.readBuf = newReadBuffer() // pershard read sampling for the sketch
+			s.readBuf = newReadBuffer() // per-shard read sampling for the sketch
 		}
 		// Only policies backed by the shared LRU list need its sentinels; bounded
 		// SieveTinyLFU keeps residents in its own queues, so it skips them.
@@ -228,9 +228,8 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 	return cache, nil
 }
 
-// NewDefault constructs a Cache with DefaultConfig.
-// It panics only if the built-in default configuration is invalid,
-// which is programmer error and should never happen.
+// NewDefault constructs a Cache with DefaultConfig. It panics only if the
+// built-in default config is invalid (your fault).
 func NewDefault[K comparable, V any]() *Cache[K, V] {
 	cache, err := New[K, V](DefaultConfig())
 	if err != nil {
@@ -285,7 +284,7 @@ func (c *Cache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callbac
 	return c.setAndWait(key, value, ttl, callback)
 }
 
-// Delete removes a key (if present), unlinks it from lists and recycles the node.
+// Delete removes key if present, reporting whether it was.
 func (c *Cache[K, V]) Delete(key K) bool {
 	kh := c.hasher.Sum(key)
 	deleted, err := c.deleteSync(c.shardByHash(kh), kh, key)
@@ -295,7 +294,7 @@ func (c *Cache[K, V]) Delete(key K) bool {
 	return deleted
 }
 
-// Clear empties all shards and reinitializes policy structures (resets SieveTinyLFU state).
+// Clear empties all shards and resets policy state.
 func (c *Cache[K, V]) Clear() {
 	_ = c.enqueueAllAndWait(writeClear)
 }
@@ -477,10 +476,9 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 	kh := c.hasher.Sum(key)
 	shard := c.shardByHash(kh)
 
-	// bounded SieveTinyLFU reads are lock-free via getSieve. An unlimited (cap==0)
-	// sieve cache has no policy state (shard.sieve == nil) and never evicts so it
-	// falls through to the lock-based path below with no per-read policy update -
-	// the same as FIFO.
+	// bounded SieveTinyLFU reads are lock-free via getSieve. An unbounded (cap==0)
+	// sieve has no policy state (shard.sieve == nil) and never evicts, so it falls
+	// through to the lock path below with no per-read update - the same as FIFO.
 	if shard.sieve != nil {
 		return c.getSieve(key, kh, shard)
 	}
@@ -559,27 +557,23 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 	}
 }
 
-// getSieve is the lock-free SieveTinyLFU read path. It probes the shard table
-// without taking any lock; the only shared state a hit writes is the visited bit
-// (a conditional atomic store). Item value/key/hash/expireTime are immutable
-// after publication, so a reader that races an eviction still reads a consistent
-// snapshot - the evicted item stays alive until the reader (and the GC) are done.
+// getSieve is the lock-free SieveTinyLFU read path: it probes the table without a
+// lock, and a hit's only shared write is the visited bit. Item fields are
+// immutable after publication, so a reader racing an eviction still gets a
+// consistent snapshot - the item lives until both reader and GC are done.
 func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V] {
 	item, exists := shard.tab.lookup(kh, key)
 
-	// during warmup admission is unconditional, so the frequency sketch is never
-	// consulted; skip both the visited-bit update and read sampling so a working
-	// set that fits under capacity (and therefore never leaves warmup) pays none
-	// of the sketch-feeding cost on its read hot path.
+	// during warmup admission is unconditional, so the sketch is never consulted;
+	// skip the visited-bit update and read sampling so a working set that fits under
+	// capacity (never leaving warmup) pays no sketch-feeding cost on reads.
 	warmup := shard.belowSieveWarmup()
 
 	if !exists {
-		// a read never waits for the writer, so a miss may be a Set still
-		// queued for this shard. Drain pending writes and re-check
-		// before declaring a miss so a Get racing a Set of the same key still sees
-		// it without making writes synchronous. The miss itself is not sampled:
-		// a miss that becomes a Set is counted by recordAccess at insert, and
-		// one that never does is not an admission candidate.
+		// a read never waits for the writer, so a miss may be a Set still queued for
+		// this shard. Drain and re-check before declaring a miss, so a Get racing a
+		// Set of the same key sees it without making writes synchronous. The miss is
+		// not sampled: if it becomes a Set, recordAccess counts it at insert.
 		if it, ok := c.drainMissAndLookup(shard, kh, key); ok {
 			item = it
 			warmup = shard.belowSieveWarmup()
@@ -642,9 +636,9 @@ func (c *Cache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
 }
 
-// nowNano is the cache's clock: monotonic nanoseconds since clockBase. Item
-// expiry is stamped and compared in this domain, so TTLs ignore wall-clock jumps
-// (NTP steps, manual changes). Every expiry read and stamp goes through it.
+// nowNano is the cache's clock: monotonic nanoseconds since clockBase. Item expiry
+// is stamped and compared in this domain, so TTLs ignore wall-clock jumps (NTP
+// steps, manual changes).
 func (c *Cache[K, V]) nowNano() int64 {
 	return time.Since(c.clockBase).Nanoseconds()
 }
