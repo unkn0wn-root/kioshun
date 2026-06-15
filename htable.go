@@ -17,14 +17,10 @@ import (
 // before the item is published and never mutated afterwards;
 // a value update allocates a fresh item and swaps it in.
 type htable[K comparable, V any] struct {
-	data  atomic.Pointer[htableData[K, V]]
-	live  int // writer
-	tombs int // writer
-
-	// pinned is the slot a probe cursor is waiting to fill (htNoPin when none).
-	// Evictions run between probe and publish so reclaimTombs treats this slot
-	// as a barrier: never clear it and never let it count as the empty slot.
-	pinned uint64 // writer
+	data   atomic.Pointer[htableData[K, V]]
+	live   int
+	tombs  int
+	pinned uint64
 }
 
 // htNoPin marks no probe cursor in flight; no real slot index reaches 2^64-1.
@@ -48,10 +44,8 @@ type htableData[K comparable, V any] struct {
 
 const (
 	htMinSlots = 8
-	// rehash/grow when (live+tombs)/slots reaches 3/4. Open addressing degrades
-	// sharply past this load and probes walk tombstones until then.
-	htLoadNum = 3
-	htLoadDen = 4
+	htLoadNum  = 3
+	htLoadDen  = 4
 )
 
 func newHtable[K comparable, V any](capacityHint int) *htable[K, V] {
@@ -131,7 +125,7 @@ func (t *htable[K, V]) store(it *cacheItem[K, V]) (prev *cacheItem[K, V]) {
 type htCursor[K comparable, V any] struct {
 	d    *htableData[K, V]
 	slot uint64
-	tomb bool // the slot was a tombstone at probe time (publish reclaims it)
+	tomb bool
 }
 
 // probe walks for key in one pass. If the key already exists, it returns the
@@ -239,8 +233,6 @@ func (t *htable[K, V]) reclaimTombs(d *htableData[K, V], i uint64) {
 	if next == t.pinned || d.slots[next].tag.Load() != 0 {
 		return
 	}
-	// terminates: the load-factor bound guarantees empty slots so the walk
-	// cannot lap the table.
 	for i != t.pinned && d.slots[i].tag.Load() == 1 {
 		d.slots[i].tag.Store(0)
 		t.tombs--

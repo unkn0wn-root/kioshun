@@ -601,11 +601,6 @@ func (s *shard[K, V]) evictMain(
 	force bool,
 ) bool {
 	p := s.sieve
-	// policy ownership is the candidate's liveness signal; a table-identity check
-	// would be redundant and wrong. Under s.mu, a published policy-owned item is
-	// table-resident (eviction resets queue in lockstep with table removal, so owns
-	// never outlives the slot), while an unpublished insert is intentionally
-	// table-absent until admission, so a lookup would wrongly reject it.
 	if in != nil && !p.owns(in) {
 		in = nil
 		tie = false
@@ -700,9 +695,6 @@ func (s *shard[K, V]) enforceSieveCapacity(
 		return
 	}
 
-	// A Set can only overfill the shard by one item but the bounded pass above
-	// may spend its work budget promoting probation entries instead of dropping
-	// them. The forced tail keeps admission bounded while restoring capacity.
 	if (p.probation.size > p.probationCap || s.overCapacity()) && !p.probation.empty() {
 		admitFromProbation()
 	}
@@ -717,8 +709,6 @@ func (s *shard[K, V]) enforceSieveCapacity(
 }
 
 func (s *shard[K, V]) overCapacity() bool {
-	// warm fill to the shard cap; enforce probation/main pressure only after a
-	// new admission would exceed resident capacity.
 	if s.cap > 0 && atomic.LoadInt64(&s.size) > s.cap {
 		return true
 	}
@@ -766,9 +756,6 @@ func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K
 		}
 		if sieveItemVisited(it) {
 			clearSieveItemVisited(it)
-			// a maintenance path observation that reads are keeping main entries
-			// alive. This is the signal the adaptive shrink decision consumes,
-			// gathered here instead of via a contended counter on every main read hit.
 			p.controller.mainSurvivals++
 			if it.reuse > 0 {
 				it.reuse--
@@ -823,9 +810,6 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 		return p.compareAdmissionScore(in, v) > 0
 	}
 
-	// ghost hit or probation promotion has already proven short-term reuse.
-	// Once SIEVE finds an unvisited victim, that recency proof should beat stale
-	// sketch history.
 	if tie && !sieveItemVisited(v) {
 		return true
 	}
@@ -950,9 +934,6 @@ func (p *sieveTinyLFU[K, V]) tick() {
 func (p *sieveTinyLFU[K, V]) adaptSize() {
 	c := &p.controller
 	resurrect := c.resurrectionRate()
-	// cyclic ("loop") workload is identified by the admission tuner accumulating
-	// resurrection evidence (or already committed to frequency); while that
-	// signature is present probation stays small so the pinned set holds.
 	loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
 	if loopish {
 		p.insertWeight = insertWeightStationary
@@ -974,7 +955,7 @@ func (p *sieveTinyLFU[K, V]) adaptSize() {
 			p.setProbationCap(p.probationCap + p.adaptStep)
 		}
 	case c.probationEvictions > c.promotions*2 && c.mainSurvivals > c.promotions:
-		// stationary skew: main is earning its capacity, so candidates compete
+		// main is earning its capacity, so candidates compete
 		// at plain per-request deposits.
 		p.insertWeight = insertWeightStationary
 		if p.probationCap > p.minProbationCap {

@@ -65,7 +65,7 @@ func newReadBuffer() readBuffer {
 // cannot hide a full window. Lossy by design.
 func (rb *readBuffer) sample(h, id uint64) (stripe int, needDrain bool) {
 	if h == 0 {
-		h = 1 // reserve 0 as the empty slot sentinel
+		h = 1
 	}
 	idx := id & rb.mask
 	st := &rb.stripes[idx]
