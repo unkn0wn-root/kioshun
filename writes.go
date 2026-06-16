@@ -26,7 +26,7 @@ type writeCommand[K comparable, V any] struct {
 	expireTime int64
 	cost       int64
 	op         writeOp
-	result     chan struct{} // completion signal; nil when no ack is needed
+	result     chan struct{}
 	extra      *writeExtra[K, V]
 }
 

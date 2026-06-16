@@ -28,9 +28,9 @@ const (
 // are overwritten - acceptable because samples only feed the frequency sketch,
 // where a dropped sample costs a little accuracy but never correctness.
 type readStripe struct {
-	tail atomic.Uint64                  // next write index (producers)
-	head atomic.Uint64                  // next read index (consumer-written, producer-read as a hint)
-	buf  [readStripeSlots]atomic.Uint64 // fingerprints; 0 == empty slot
+	tail atomic.Uint64
+	head atomic.Uint64
+	buf  [readStripeSlots]atomic.Uint64
 }
 
 // readBuffer is the per-shard BP-Wrapper read buffer: a small set of striped

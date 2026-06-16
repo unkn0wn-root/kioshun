@@ -6,9 +6,6 @@ import (
 	"github.com/unkn0wn-root/kioshun/internal/mathx"
 )
 
-// cacheLinePadding isolates contended atomics onto their own cache lines.
-const cacheLinePadding = 64
-
 // signal wakes a size-1 channel; a no-op if a token is already pending.
 func signal(ch chan struct{}) {
 	select {
