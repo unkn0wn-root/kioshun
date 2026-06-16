@@ -271,15 +271,15 @@ func TestSieveTinyLFURecordReadHitMarksVisitedOnly(t *testing.T) {
 	// A read hit only sets the visited bit for items the policy owns; it must
 	// never touch the adaptive controller. The "main is useful" signal is
 	// gathered on the eviction sweep (findMainVictim), not on the read path.
-	clearSieveItemVisited(probationItem)
+	clearItemVisited(probationItem)
 	a.recordReadHit(probationItem)
-	if !sieveItemVisited(probationItem) {
+	if !itemVisited(probationItem) {
 		t.Fatal("probation read did not mark item visited")
 	}
 
-	clearSieveItemVisited(mainItem)
+	clearItemVisited(mainItem)
 	a.recordReadHit(mainItem)
-	if !sieveItemVisited(mainItem) {
+	if !itemVisited(mainItem) {
 		t.Fatal("main read did not mark item visited")
 	}
 
@@ -456,7 +456,7 @@ func TestSieveTinyLFUMainSweepCountsSurvivals(t *testing.T) {
 
 	// Leave spared visited (it earns a second chance and should be counted), and
 	// make victim the unvisited tail-ward node the hand evicts.
-	clearSieveItemVisited(victim)
+	clearItemVisited(victim)
 	a.hand = spared
 
 	got := a.findMainVictim(defaultMainVictimScan, false)
@@ -470,7 +470,7 @@ func TestSieveTinyLFUMainSweepCountsSurvivals(t *testing.T) {
 	if a.controller.mainSurvivals != 1 {
 		t.Fatalf("mainSurvivals=%d, want 1 (one visited resident spared)", a.controller.mainSurvivals)
 	}
-	if sieveItemVisited(spared) {
+	if itemVisited(spared) {
 		t.Fatal("sweep should have cleared the spared resident's visited bit")
 	}
 }
@@ -711,7 +711,7 @@ func TestSieveTinyLFUBoundedVictimNeedsForce(t *testing.T) {
 		a.insertMain(&cacheItem[int, int]{
 			key:     k,
 			hash:    uint64(k),
-			visited: sieveVisited,
+			visited: visitedBit,
 			reuse:   1,
 		})
 	}
@@ -723,7 +723,7 @@ func TestSieveTinyLFUBoundedVictimNeedsForce(t *testing.T) {
 	cleared := 0
 	it := a.main.head.next
 	for it != &a.main.tail {
-		if !sieveItemVisited(it) {
+		if !itemVisited(it) {
 			cleared++
 		}
 		it = it.next
@@ -810,7 +810,7 @@ func TestSieveTinyLFUMaintainForcesCapacityAfterBoundedScan(t *testing.T) {
 			key:     k,
 			hash:    uint64(k),
 			reuse:   1,
-			visited: sieveVisited,
+			visited: visitedBit,
 		}
 		s.tab.store(it)
 		s.sieve.insertMain(it)
@@ -1044,7 +1044,7 @@ func TestSieveTinyLFUMainSieveEvictionClearsVisited(t *testing.T) {
 			key:     k,
 			hash:    uint64(k),
 			reuse:   1,
-			visited: sieveVisited,
+			visited: visitedBit,
 		}
 		s.tab.store(it)
 		s.sieve.insertMain(it)
@@ -1062,7 +1062,7 @@ func TestSieveTinyLFUMainSieveEvictionClearsVisited(t *testing.T) {
 		if it == nil {
 			t.Fatalf("item %d missing", k)
 		}
-		if sieveItemVisited(it) {
+		if itemVisited(it) {
 			t.Fatalf("item %d visited bit still set after sweep", k)
 		}
 	}
@@ -1095,7 +1095,7 @@ func TestSieveTinyLFUEqualFrequencyTieRejection(t *testing.T) {
 	}
 
 	v.reuse = 0
-	clearSieveItemVisited(v)
+	clearItemVisited(v)
 	if !a.shouldAdmit(in, v, false) {
 		t.Fatal("unvisited zero-reuse victim should lose equal-frequency tie")
 	}
@@ -1187,7 +1187,7 @@ func TestSieveRejectedCandidateNeverPublished(t *testing.T) {
 		it := &cacheItem[int, int]{key: k, value: k, hash: c.hasher.Sum(k)}
 		s.tab.store(it)
 		p.insertMain(it)
-		clearSieveItemVisited(it) // no second chance: the hand evicts on first pass
+		clearItemVisited(it) // no second chance: the hand evicts on first pass
 		it.reuse = 0
 		atomic.AddInt64(&s.size, 1)
 		for range 8 {

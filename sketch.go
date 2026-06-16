@@ -9,9 +9,9 @@ const (
 	sketchCounterBits     = 4
 	sketchCounterMask     = (1 << sketchCounterBits) - 1
 	sketchMaxCounter      = sketchCounterMask
-	// aging shifts packed 4-bit counters right by one.
-	// this mask clears bits that would bleed. Keep tied to sketchCounterBits.
-	sketchCounterAgingMask = 0x7777777777777777
+	// Aging shifts packed counters right by one. Keep the low bits of each
+	// counter and clear bits that shifted across counter boundaries.
+	sketchCounterAgingMask = (^uint64(0) / sketchCounterMask) * (sketchCounterMask >> 1)
 
 	// counters are grouped into cache-line blocks of 8 words (128 4-bit
 	// counters). One access touches a single block - selected by the low bits
@@ -88,7 +88,7 @@ func (d *doorkeeper) set(i uint64) {
 // all-time totals.
 type countMinSketch struct {
 	counters  []uint64
-	blockMask uint64 // block count - 1
+	blockMask uint64
 	samples   uint64
 	resetAt   uint64
 }

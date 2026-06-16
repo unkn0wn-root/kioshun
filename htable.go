@@ -23,7 +23,8 @@ type htable[K comparable, V any] struct {
 	pinned uint64
 }
 
-// htNoPin marks no probe cursor in flight; no real slot index reaches 2^64-1.
+// htNoPin marks no probe cursor in flight
+// no real slot index reaches 2^64-1.
 const htNoPin = ^uint64(0)
 
 // htslot is one colocated cell. tag pre-filters probes without dereferencing
@@ -134,10 +135,6 @@ type htCursor[K comparable, V any] struct {
 // it returns prev=nil plus a cursor at the slot a later publish should fill,
 // WITHOUT inserting, so a SieveTinyLFU candidate can run admission before it ever
 // becomes visible to lock-free readers. Caller holds the shard write lock.
-//
-// This mirrors store's walk, diverging only at the empty slot (store commits, probe
-// defers to publish); keep tombstone/tag handling in sync with store, lookup and
-// removeExact.
 func (t *htable[K, V]) probe(hash uint64, key K) (prev *cacheItem[K, V], slot *htslot[K, V], cur htCursor[K, V]) {
 	tag := htNormHash(hash)
 	d := t.data.Load()

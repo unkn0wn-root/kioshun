@@ -8,9 +8,6 @@ import (
 	"sync"
 )
 
-// globalManager backs the package-level cache helpers (RegisterGlobalCache,
-// GetGlobalCache and friends). Caches created through it live for the lifetime
-// of the process unless released with CloseAllGlobalCaches.
 var globalManager = NewManager()
 
 type statser interface {
@@ -25,7 +22,7 @@ type cacheRegistration struct {
 
 // Manager owns named cache instances and their registered configurations.
 type Manager struct {
-	caches        sync.Map // name -> *Cache[K, V]; each name is written once, read many.
+	caches        sync.Map
 	registrations map[string]cacheRegistration
 	configMu      sync.RWMutex
 }
@@ -117,8 +114,6 @@ func GetCacheWithConfig[K comparable, V any](
 	return createCache(m, name, cacheRegistration{config: config}, opts...)
 }
 
-// createCache builds a cache from config and races to publish it under name.
-// LoadOrStore closes the loser of a concurrent create so its workers do not leak.
 func createCache[K comparable, V any](
 	m *Manager,
 	name string,

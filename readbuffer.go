@@ -10,14 +10,11 @@ import (
 const (
 	// readStripeSlots is how many access fingerprints a stripe buffers before
 	// producers begin overwriting the oldest unread sample.
-	// It also sets the drain-signal: one wake per filled stripe.
 	// Note: must be 2^n.
 	readStripeSlots = 64
 	readSlotMask    = readStripeSlots - 1
 
-	// caps per-shard striping. Shards already partition keys, so
-	// matching common GOMAXPROCS values spreads hot shard readers without
-	// allocating an unbounded number of per shard rings.
+	// caps per-shard striping.
 	// Must stay <= 32 so one uint32 can hold a dirty bit per stripe.
 	maxReadStripes = 16
 )
@@ -35,7 +32,7 @@ type readStripe struct {
 
 // readBuffer is the per-shard BP-Wrapper read buffer: a small set of striped
 // rings indexed by a per-P stripe id to reduce contention on hot shards. The
-// zero value is unused (no stripes); only SieveTinyLFU shards allocate one.
+// zero value is unused (no stripes).
 type readBuffer struct {
 	stripes []readStripe
 	mask    uint64

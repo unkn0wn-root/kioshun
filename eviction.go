@@ -79,7 +79,6 @@ func createEvictor[K comparable, V any](policy EvictionPolicy) evictor[K, V] {
 
 type removalNotifyMask uint8
 
-// each reason's notify bit is its position in the RemovalReason enum.
 const (
 	notifyRemovedCapacity removalNotifyMask = 1 << RemovedCapacity
 	notifyRemovedRejected removalNotifyMask = 1 << RemovedRejected
