@@ -52,23 +52,23 @@ type Cache[K comparable, V any] struct {
 	shards       []*shard[K, V] // tables + lists + counters
 	shardMask    uint64         // shards is 2^n; mask = shards-1
 	config       Config
-	perShardCap  int64     // floor(MaxSize/shards); 0 => unlimited
-	perShardCost int64     // floor(MaxCost/shards); 0 => unlimited
-	clockBase    time.Time // monotonic epoch; nowNano and item expiry measure from here
+	perShardCap  int64
+	perShardCost int64
+	clockBase    time.Time
 	closeCh      chan struct{}
 	closeOnce    sync.Once
-	closed       atomic.Bool // set once by Close
+	closed       atomic.Bool
 	workers      sync.WaitGroup
-	waiterPool   sync.Pool // write ack waiters for sync mutation paths
+	waiterPool   sync.Pool
 	hasher       keyhash.Hasher[K]
 	weigher      Weigher[K, V]
 	trackCost    bool
-	evictor      evictor[K, V] // nil for SieveTinyLFU; evicts through shard admission state
+	evictor      evictor[K, V] // nil for SieveTinyLFU
 	onRemove     func(K, V, RemovalReason)
 	onEvict      func(K, V)
 	removeWake   chan struct{}
 
-	stats *stats // per-P striped telemetry; nil unless StatsEnabled
+	stats *stats // per-P; nil unless StatsEnabled
 }
 
 type Option[K comparable, V any] func(*Cache[K, V])
@@ -111,8 +111,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		shardCount = min(shardCount, maxShardCount)
 	}
 
-	// bound shards by capacity so tiny MaxSize/MaxCost values do not create
-	// empty shards.
+	// bound shards by capacity so tiny MaxSize/MaxCost values do not create empty shards.
 	if config.MaxSize > 0 {
 		shardCount = min(shardCount, int(mathx.PrevPowerOf2(min(config.MaxSize, int64(maxShardCount)))))
 	}
@@ -414,7 +413,6 @@ func (c *Cache[K, V]) PolicyStats() PolicyStats {
 // Close shuts down background work (idempotently), clears shards and marks the cache closed.
 func (c *Cache[K, V]) Close() error {
 	c.closeOnce.Do(func() {
-		// stop accepting new producer writes (sequential Set-after-Close fails).
 		c.closed.Store(true)
 		// Drain everything accepted so far via a barrier, then broadcast shutdown:
 		// workers do a final drain and exit; producers blocked on a full queue wake

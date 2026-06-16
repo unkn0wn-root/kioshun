@@ -59,21 +59,21 @@ const (
 	mainQueue
 )
 
-// sieveVisited marks recent reuse. Readers set it on access, while the
+// visitedBit marks recent reuse. Readers set it on access, while the
 // serialized maintenance path consumes and clears it during SIEVE scans.
-const sieveVisited = uint32(1)
+const visitedBit = uint32(1)
 
-func sieveItemVisited[K comparable, V any](it *cacheItem[K, V]) bool {
+func itemVisited[K comparable, V any](it *cacheItem[K, V]) bool {
 	return it != nil && atomic.LoadUint32(&it.visited) != 0
 }
 
-func markSieveItemVisited[K comparable, V any](it *cacheItem[K, V]) {
+func markItemVisited[K comparable, V any](it *cacheItem[K, V]) {
 	if it != nil && atomic.LoadUint32(&it.visited) == 0 {
-		atomic.StoreUint32(&it.visited, sieveVisited)
+		atomic.StoreUint32(&it.visited, visitedBit)
 	}
 }
 
-func clearSieveItemVisited[K comparable, V any](it *cacheItem[K, V]) {
+func clearItemVisited[K comparable, V any](it *cacheItem[K, V]) {
 	if it != nil {
 		atomic.StoreUint32(&it.visited, 0)
 	}
@@ -402,12 +402,12 @@ func (p *sieveTinyLFU[K, V]) owns(it *cacheItem[K, V]) bool {
 }
 
 func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
-	// reads only set the visited bit via markSieveItemVisited, a conditional atomic
+	// reads only set the visited bit via markItemVisited, a conditional atomic
 	// store (skipped once set) so a hot item costs at most one shared load. Being
 	// lock-free, the read must not inspect queue ownership (it.queue is writer-only
 	// and would race maintenance); a table hit is in a SIEVE queue by construction,
 	// and setting the bit on an item the writer is moving or evicting is harmless.
-	markSieveItemVisited(it)
+	markItemVisited(it)
 }
 
 // recordUpdate handles Set on an existing resident. Updates are treated as
@@ -416,19 +416,19 @@ func (p *sieveTinyLFU[K, V]) recordReadHit(it *cacheItem[K, V]) {
 func (p *sieveTinyLFU[K, V]) recordUpdate(it *cacheItem[K, V]) {
 	switch it.queue {
 	case mainQueue:
-		markSieveItemVisited(it)
+		markItemVisited(it)
 		if it.reuse < maxItemReuse {
 			it.reuse++
 		}
 	case probationQueue:
-		wasVisited := sieveItemVisited(it)
+		wasVisited := itemVisited(it)
 		if it.reuse < maxItemReuse {
 			it.reuse++
 		}
 		if (wasVisited || it.reuse >= probationPromotionReuse) && p.mainCap > 0 {
 			p.promote(it)
 		} else {
-			markSieveItemVisited(it)
+			markItemVisited(it)
 		}
 	}
 }
@@ -452,14 +452,14 @@ func (p *sieveTinyLFU[K, V]) insert(it *cacheItem[K, V], gh bool) {
 
 	it.queue = probationQueue
 	it.reuse = 0
-	clearSieveItemVisited(it)
+	clearItemVisited(it)
 	p.probation.pushFront(it)
 }
 
 func (p *sieveTinyLFU[K, V]) insertMain(it *cacheItem[K, V]) {
 	it.queue = mainQueue
 	it.reuse = 1
-	markSieveItemVisited(it)
+	markItemVisited(it)
 	p.main.pushFront(it)
 	if p.hand == nil {
 		p.hand = it
@@ -493,7 +493,7 @@ func (p *sieveTinyLFU[K, V]) remove(it *cacheItem[K, V]) bool {
 
 	// queue was reset to queueNone by the queue's remove; just clear recency.
 	it.reuse = 0
-	clearSieveItemVisited(it)
+	clearItemVisited(it)
 	return true
 }
 
@@ -539,8 +539,8 @@ func (p *sieveTinyLFU[K, V]) replaceNode(old, new *cacheItem[K, V]) {
 	if old.next != nil {
 		old.next.prev = new
 	}
-	if sieveItemVisited(old) {
-		markSieveItemVisited(new)
+	if itemVisited(old) {
+		markItemVisited(new)
 	}
 	if p.hand == old {
 		p.hand = new
@@ -578,7 +578,7 @@ func (s *shard[K, V]) evictProbation(stats bool) *cacheItem[K, V] {
 	if !p.probation.holds(it) {
 		return nil
 	}
-	if it.reuse >= probationPromotionReuse || sieveItemVisited(it) {
+	if it.reuse >= probationPromotionReuse || itemVisited(it) {
 		p.promote(it)
 		return it
 	}
@@ -700,7 +700,7 @@ func (s *shard[K, V]) enforceSieveCapacity(
 		s.evictMain(stats, in, tie, defaultMainVictimScan, true)
 	}
 	for s.overCapacity() && s.tab.length() > 0 {
-		if !s.forceDropSieveItem(stats) {
+		if !s.forceEvictSieveItem(stats) {
 			return
 		}
 	}
@@ -752,8 +752,8 @@ func (p *sieveTinyLFU[K, V]) findMainVictim(scan int64, force bool) *cacheItem[K
 		if it, ok = p.mainCandidate(it); !ok {
 			return nil
 		}
-		if sieveItemVisited(it) {
-			clearSieveItemVisited(it)
+		if itemVisited(it) {
+			clearItemVisited(it)
 			p.controller.mainSurvivals++
 			if it.reuse > 0 {
 				it.reuse--
@@ -808,7 +808,7 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 		return p.compareAdmissionScore(in, v) > 0
 	}
 
-	if tie && !sieveItemVisited(v) {
+	if tie && !itemVisited(v) {
 		return true
 	}
 
@@ -818,7 +818,7 @@ func (p *sieveTinyLFU[K, V]) shouldAdmit(in, v *cacheItem[K, V], tie bool) bool 
 	case c < 0:
 		return tie && p.closeAdmissionScore(in, v)
 	default:
-		return tie || (!sieveItemVisited(v) && v.reuse == 0)
+		return tie || (!itemVisited(v) && v.reuse == 0)
 	}
 }
 
@@ -933,13 +933,21 @@ func (p *sieveTinyLFU[K, V]) adaptSize() {
 	c := &p.controller
 	resurrect := c.resurrectionRate()
 	loopish := p.tuner.mode == admitFrequency || p.tuner.evidence > 0
+	shifting := !loopish && resurrect < probationResurrectLow
+	fastGrowth := shifting &&
+		c.cycleMainEvicts > c.promotions &&
+		c.ghostHits > c.promotions
+	growth := shifting &&
+		c.ghostHits > c.probationEvictions/4
+	shrink := c.probationEvictions > c.promotions*2 &&
+		c.mainSurvivals > c.promotions
+
 	if loopish {
 		p.insertWeight = insertWeightStationary
 	}
 
 	switch {
-	case !loopish && c.cycleMainEvicts > c.promotions &&
-		resurrect < probationResurrectLow && c.ghostHits > c.promotions:
+	case fastGrowth:
 		// shifting hot set: grow the recency window quickly so newly hot entries
 		// survive to their reuse instead of being evicted from a tiny probation.
 		p.insertWeight = insertWeightShifting
@@ -947,12 +955,12 @@ func (p *sieveTinyLFU[K, V]) adaptSize() {
 			step := max(int64(1), p.capacity*probationGrowStepPct/100)
 			p.setProbationCap(p.probationCap + step)
 		}
-	case !loopish && resurrect < probationResurrectLow && c.ghostHits > c.probationEvictions/4:
+	case growth:
 		p.insertWeight = insertWeightShifting
 		if p.probationCap < p.maxProbationCap {
 			p.setProbationCap(p.probationCap + p.adaptStep)
 		}
-	case c.probationEvictions > c.promotions*2 && c.mainSurvivals > c.promotions:
+	case shrink:
 		// main is earning its capacity, so candidates compete at plain per-request deposits.
 		p.insertWeight = insertWeightStationary
 		if p.probationCap > p.minProbationCap {
@@ -1031,9 +1039,9 @@ func (p *sieveTinyLFU[K, V]) setProbationCap(n int64) {
 	p.mainCap = p.capacity - n
 }
 
-// forceDropSieveItem is the final capacity repair path. It removes the
+// forceEvictSieveItem is the final capacity repair path. It removes the
 // probation tail first, then a forced main victim if probation is empty.
-func (s *shard[K, V]) forceDropSieveItem(stats bool) bool {
+func (s *shard[K, V]) forceEvictSieveItem(stats bool) bool {
 	p := s.sieve
 	if !p.probation.empty() {
 		it := p.probation.tail.prev

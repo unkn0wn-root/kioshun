@@ -1,8 +1,7 @@
 package kioshun
 
 // freqNode buckets items by exact frequency.
-// Empty non-sentinel buckets are removed eagerly,
-// so head.next is always the current minimum.
+// Empty non-sentinel buckets are removed eagerly so head.next is always the current minimum.
 type freqNode[K comparable, V any] struct {
 	freq  int64
 	items map[*cacheItem[K, V]]struct{}
