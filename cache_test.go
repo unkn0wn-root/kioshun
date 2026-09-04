@@ -1,4 +1,3 @@
-// cache_test.go - Comprehensive unit tests
 package kioshun
 
 import (
@@ -42,7 +41,6 @@ func TestCacheBasicOperations(t *testing.T) {
 	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
-	// Test Set and Get
 	cache.Set("key1", "value1", 1*time.Minute)
 	waitForWrites(t, cache)
 
@@ -50,12 +48,10 @@ func TestCacheBasicOperations(t *testing.T) {
 		t.Errorf("Expected 'value1', got '%s', found: %v", value, found)
 	}
 
-	// Test non-existent key
 	if _, found := cache.Get("nonexistent"); found {
 		t.Error("Expected key to not exist")
 	}
 
-	// Test Delete
 	if !cache.Delete("key1") {
 		t.Error("Expected delete to return true")
 	}
@@ -69,19 +65,15 @@ func TestCacheExpiration(t *testing.T) {
 	cache := newDefaultTestCache[string, string](t)
 	defer cache.Close()
 
-	// Set value with short TTL
 	cache.Set("expiring", "value", 100*time.Millisecond)
 	waitForWrites(t, cache)
 
-	// Should be available immediately
 	if _, found := cache.Get("expiring"); !found {
 		t.Error("Expected key to exist immediately after set")
 	}
 
-	// Wait for expiration
 	time.Sleep(200 * time.Millisecond)
 
-	// Should be expired
 	if _, found := cache.Get("expiring"); found {
 		t.Error("Expected key to be expired")
 	}
@@ -109,33 +101,28 @@ func TestCacheTTL(t *testing.T) {
 func TestCacheLRUEviction(t *testing.T) {
 	config := Config{
 		MaxSize:         3,
-		ShardCount:      1, // Use single shard for predictable eviction
-		CleanupInterval: 0, // Disable cleanup for this test
+		ShardCount:      1,
+		CleanupInterval: 0,
 		DefaultTTL:      1 * time.Hour,
 		EvictionPolicy:  LRU,
 	}
 	cache := newTestCache[string, string](t, config)
 	defer cache.Close()
 
-	// Fill cache to capacity
 	cache.Set("key1", "value1", 1*time.Hour)
 	cache.Set("key2", "value2", 1*time.Hour)
 	cache.Set("key3", "value3", 1*time.Hour)
 	waitForWrites(t, cache)
 
-	// Access key1 to make it more recently used
 	cache.Get("key1")
 
-	// Add one more item, should evict key2 (least recently used)
 	cache.Set("key4", "value4", 1*time.Hour)
 	waitForWrites(t, cache)
 
-	// key2 should be evicted
 	if _, found := cache.Get("key2"); found {
 		t.Error("Expected key2 to be evicted")
 	}
 
-	// key1 should still exist (was accessed recently)
 	if _, found := cache.Get("key1"); !found {
 		t.Error("Expected key1 to still exist")
 	}
@@ -147,24 +134,20 @@ func TestCacheStats(t *testing.T) {
 	cache := newTestCache[string, string](t, config)
 	defer cache.Close()
 
-	// Initial stats
 	stats := cache.Stats()
 	if stats.Hits != 0 || stats.Misses != 0 {
 		t.Error("Expected initial stats to be zero")
 	}
 
-	// Set a value
 	cache.Set("key1", "value1", 1*time.Minute)
 	waitForWrites(t, cache)
 
-	// Hit
 	cache.Get("key1")
 	stats = cache.Stats()
 	if stats.Hits != 1 {
 		t.Errorf("Expected 1 hit, got %d", stats.Hits)
 	}
 
-	// Miss
 	cache.Get("nonexistent")
 	stats = cache.Stats()
 	if stats.Misses != 1 {
@@ -218,7 +201,6 @@ func TestCacheConcurrency(t *testing.T) {
 	numGoroutines := 100
 	numOperations := 100
 
-	// Concurrent writes
 	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
@@ -230,7 +212,6 @@ func TestCacheConcurrency(t *testing.T) {
 		}(i)
 	}
 
-	// Concurrent reads
 	for i := 0; i < numGoroutines/2; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -245,7 +226,6 @@ func TestCacheConcurrency(t *testing.T) {
 	wg.Wait()
 	waitForWrites(t, cache)
 
-	// Verify no data races occurred
 	stats := cache.Stats()
 	if stats.Size < 0 {
 		t.Error("Invalid cache size after concurrent operations")
@@ -262,19 +242,15 @@ func TestCacheCleanup(t *testing.T) {
 	cache := newTestCache[string, string](t, config)
 	defer cache.Close()
 
-	// Add items that will expire
 	cache.Set("key1", "value1", 100*time.Millisecond)
 	cache.Set("key2", "value2", 100*time.Millisecond)
 	waitForWrites(t, cache)
 
-	// Wait for items to expire
 	time.Sleep(150 * time.Millisecond)
 
-	// Force cleanup
 	cache.Cleanup()
 	time.Sleep(50 * time.Millisecond)
 
-	// Items should be cleaned up
 	if cache.Exists("key1") || cache.Exists("key2") {
 		t.Error("Expected expired items to be cleaned up")
 	}
@@ -303,7 +279,6 @@ func TestCacheCallback(t *testing.T) {
 	})
 	waitForWrites(t, cache)
 
-	// Wait for expiration
 	time.Sleep(200 * time.Millisecond)
 
 	if atomic.LoadInt32(&callbackCalled) != 1 {
@@ -321,27 +296,23 @@ func TestCacheManager(t *testing.T) {
 	manager := NewManager()
 	defer manager.CloseAll()
 
-	// Register cache
 	config := DefaultConfig()
 	err := manager.Register("test", config)
 	if err != nil {
 		t.Errorf("Expected no error registering cache, got %v", err)
 	}
 
-	// Get cache
 	cache, err := GetCache[string, string](manager, "test")
 	if err != nil {
 		t.Errorf("Expected no error getting cache, got %v", err)
 	}
 
-	// Use cache
 	cache.Set("key1", "value1", 1*time.Minute)
 	waitForWrites(t, cache)
 	if value, found := cache.Get("key1"); !found || value != "value1" {
 		t.Errorf("Expected 'value1', got '%s', found: %v", value, found)
 	}
 
-	// Get stats
 	stats := manager.Stats()
 	if len(stats) != 1 {
 		t.Errorf("Expected 1 cache in stats, got %d", len(stats))
@@ -349,7 +320,6 @@ func TestCacheManager(t *testing.T) {
 }
 
 func TestCacheGenerics(t *testing.T) {
-	// Test with different types
 	stringCache := newDefaultTestCache[string, string](t)
 	defer stringCache.Close()
 
@@ -359,21 +329,18 @@ func TestCacheGenerics(t *testing.T) {
 	structCache := newDefaultTestCache[string, User](t)
 	defer structCache.Close()
 
-	// Test string cache
 	stringCache.Set("key", "value", 1*time.Minute)
 	waitForWrites(t, stringCache)
 	if value, found := stringCache.Get("key"); !found || value != "value" {
 		t.Error("String cache failed")
 	}
 
-	// Test int cache
 	intCache.Set(123, "int_value", 1*time.Minute)
 	waitForWrites(t, intCache)
 	if value, found := intCache.Get(123); !found || value != "int_value" {
 		t.Error("Int cache failed")
 	}
 
-	// Test struct cache
 	user := User{ID: "123", Name: "Test User", Email: "test@example.com"}
 	structCache.Set("user:123", user, 1*time.Minute)
 	waitForWrites(t, structCache)
@@ -611,8 +578,7 @@ func TestManagerRemoveDropsConfig(t *testing.T) {
 		t.Fatalf("Remove() error = %v", err)
 	}
 
-	// Remove drops the registration, so the name is gone until it is
-	// registered again or recreated explicitly via GetCacheWithConfig.
+	// Remove also drops the registration.
 	if _, err := GetCache[string, int](manager, "c"); !errors.Is(err, ErrCacheNotRegistered) {
 		t.Fatalf("GetCache() after Remove error = %v, want ErrCacheNotRegistered", err)
 	}
@@ -647,8 +613,7 @@ func TestManagerCloseAllPreservesConfigs(t *testing.T) {
 		t.Fatalf("CloseAll() error = %v", err)
 	}
 
-	// CloseAll closes instances but keeps registrations, so the name rebuilds
-	// from its registered config.
+	// CloseAll keeps registrations.
 	cache, err := GetCache[string, int](manager, "c")
 	if err != nil {
 		t.Fatalf("GetCache() after CloseAll error = %v", err)
@@ -698,7 +663,6 @@ func TestGetCacheWithConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxSize = firstMaxSize
 
-	// No prior Register: the cache is created from the passed config.
 	first, err := GetCacheWithConfig[string, int](manager, "c", cfg)
 	if err != nil {
 		t.Fatalf("GetCacheWithConfig() error = %v", err)
@@ -707,8 +671,7 @@ func TestGetCacheWithConfig(t *testing.T) {
 		t.Fatalf("Capacity = %d, want %d", got, firstMaxSize)
 	}
 
-	// Existing entry: the passed config is ignored (get-or-create) and the same
-	// instance is returned, never reconfigured.
+	// An existing cache ignores the new configuration.
 	other := DefaultConfig()
 	other.MaxSize = 9999
 	second, err := GetCacheWithConfig[string, int](manager, "c", other)
@@ -722,7 +685,6 @@ func TestGetCacheWithConfig(t *testing.T) {
 		t.Fatalf("Capacity after second call = %d, want unchanged %d", got, firstMaxSize)
 	}
 
-	// Type mismatch is reported, mirroring GetCache.
 	if _, err := GetCacheWithConfig[string, string](manager, "c", cfg); !errors.Is(err, ErrTypeMismatch) {
 		t.Fatalf("GetCacheWithConfig() type mismatch error = %v, want ErrTypeMismatch", err)
 	}
@@ -764,16 +726,13 @@ func TestGetCacheWithConfigAppliesTypedOptions(t *testing.T) {
 func TestCacheCloseBehavior(t *testing.T) {
 	cache := newDefaultTestCache[string, string](t)
 
-	// Set a value
 	cache.Set("key1", "value1", 1*time.Minute)
 
-	// Close the cache
 	err := cache.Close()
 	if err != nil {
 		t.Errorf("Expected no error closing cache, got %v", err)
 	}
 
-	// Operations after close should fail gracefully
 	err = cache.Set("key2", "value2", 1*time.Minute)
 	if err == nil {
 		t.Error("Expected error when setting after close")
@@ -783,7 +742,6 @@ func TestCacheCloseBehavior(t *testing.T) {
 		t.Error("Expected get to fail after close")
 	}
 
-	// Double close should be safe
 	err = cache.Close()
 	if err != nil {
 		t.Errorf("Expected no error on double close, got %v", err)
@@ -950,8 +908,7 @@ func TestSetAsyncAppliesInlineWhenUncontended(t *testing.T) {
 		if err := cache.SetAsync(i, i*7, time.Hour); err != nil {
 			t.Fatalf("SetAsync(%d): %v", i, err)
 		}
-		// No Sync between the write and the read: an uncontended SetAsync must
-		// have applied inline for the key to be visible here.
+		// No Sync: an idle shard must apply SetAsync before returning.
 		if v, ok := cache.Get(i); !ok || v != i*7 {
 			t.Fatalf("key %d not visible after uncontended SetAsync; got %d ok=%v", i, v, ok)
 		}
@@ -977,31 +934,25 @@ func TestSetInPlaceUpdate(t *testing.T) {
 	cache := newTestCache[string, string](t, config)
 	defer cache.Close()
 
-	// Set initial value
 	cache.Set("key1", "value1", time.Hour)
 	waitForWrites(t, cache)
 
-	// Verify initial state
 	if value, found := cache.Get("key1"); !found || value != "value1" {
 		t.Errorf("Expected initial value 'value1', got '%s', found: %v", value, found)
 	}
 
-	// Get the item pointer before update (if we could access it)
 	shard := cache.getShard("key1")
 	shard.mu.RLock()
 	originalItem, _ := shard.tab.lookup(cache.hasher.Sum("key1"), "key1")
 	shard.mu.RUnlock()
 
-	// Update the same key - should reuse the item
 	cache.Set("key1", "value2", time.Hour)
 	waitForWrites(t, cache)
 
-	// Verify update worked
 	if value, found := cache.Get("key1"); !found || value != "value2" {
 		t.Errorf("Expected updated value 'value2', got '%s', found: %v", value, found)
 	}
 
-	// Check that item was reused (same pointer)
 	shard.mu.RLock()
 	updatedItem, _ := shard.tab.lookup(cache.hasher.Sum("key1"), "key1")
 	shard.mu.RUnlock()
@@ -1010,7 +961,6 @@ func TestSetInPlaceUpdate(t *testing.T) {
 		t.Error("Expected in-place update to reuse the same cacheItem, but got different pointers")
 	}
 
-	// Verify size didn't change (no new allocation)
 	stats := cache.Stats()
 	if stats.Size != 1 {
 		t.Errorf("Expected size 1 after update, got %d", stats.Size)
@@ -1029,31 +979,24 @@ func TestSetLFUFrequencyReset(t *testing.T) {
 	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
-	// Add items
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
 	waitForWrites(t, cache)
 
-	// Access "a" multiple times to increase frequency
 	for range 10 {
 		cache.Get("a")
 	}
 
-	// Access other items less
 	cache.Get("b")
 	cache.Get("c")
 
-	// Update "a" with new value - frequency should reset to 1
 	cache.Set("a", 999, time.Hour)
 	waitForWrites(t, cache)
 
-	// Now add a new item to trigger eviction
-	// "a" should now be evicted since its frequency was reset
 	cache.Set("d", 4, time.Hour)
 	waitForWrites(t, cache)
 
-	// Verify that "a" was evicted (due to frequency reset)
 	if _, found := cache.Get("a"); found {
 		t.Error("Item 'a' should have been evicted after frequency reset")
 	}

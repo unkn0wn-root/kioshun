@@ -125,8 +125,7 @@ func TestUnboundedSieveAllowsNoEviction(t *testing.T) {
 	}
 	defer cache.Close()
 
-	// No capacity bound means nothing to size or evict, so the policy state is
-	// never allocated and the cache grows without dropping entries.
+	// An unbounded cache does not allocate eviction policy state.
 	if cache.shards[0].sieve != nil {
 		t.Fatal("unbounded Sieve shard allocated policy state")
 	}
@@ -148,8 +147,7 @@ func TestCostOnlyLRUEnforcesBudget(t *testing.T) {
 	cfg.CleanupInterval = 0
 	cfg.EvictionPolicy = LRU
 
-	// Non-Sieve policies size from a tail-eviction list, not a frequency sketch,
-	// so a cost-only budget without MaxSize is valid for them.
+	// Policies other than SieveTinyLFU support a cost-only limit.
 	cache, err := New[int, int](cfg, WithWeigher(func(_ int, value int) int64 {
 		return int64(value)
 	}))
@@ -218,9 +216,8 @@ func TestWeightedSieveEnforcesCostDuringWarmup(t *testing.T) {
 }
 
 func TestSieveCostAdmissionScores(t *testing.T) {
-	// Cost-aware modes read the denominator from item.cost; the smaller, denser
-	// candidate (cost 1) should beat the larger victim (cost 64) once cost weights
-	// the frequencies, while frequency-only admission keeps the hotter victim.
+	// Weighted modes should prefer the smaller candidate; frequency-only mode
+	// should keep the more frequently accessed victim.
 	in := &cacheItem[int, int]{key: 1, hash: 1, cost: 1}
 	victim := &cacheItem[int, int]{key: 2, hash: 2, cost: 64}
 

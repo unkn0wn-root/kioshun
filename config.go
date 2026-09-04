@@ -16,7 +16,6 @@ const (
 	defaultWriteBufferSize = 256
 	defaultWriteBatchSize  = 64
 
-	// scale by CPUs and round to 2^n
 	maxShardCount   = 256
 	shardMultiplier = 4
 )
@@ -31,23 +30,20 @@ const (
 	SieveTinyLFU
 )
 
-// CostAdmission controls how SieveTinyLFU compares an incoming weighted item
-// against a resident victim when MaxCost/WithWeigher are used.
+// CostAdmission controls how SieveTinyLFU compares weighted items.
 type CostAdmission int
 
 const (
-	// CostAdmissionFrequency compares estimate(candidate) > estimate(victim).
+	// CostAdmissionFrequency compares estimated access counts.
 	CostAdmissionFrequency CostAdmission = iota
-	// CostAdmissionBalanced compares frequency / sqrt(cost): a middle ground
-	// between request-hit and byte-hit objectives.
+	// CostAdmissionBalanced favors frequent items without letting cost dominate.
 	CostAdmissionBalanced
-	// CostAdmissionDensity compares frequency / cost, favoring dense hot entries
-	// when request hit ratio matters more than byte hit ratio.
+	// CostAdmissionDensity favors items with the most accesses per unit of cost.
 	CostAdmissionDensity
 )
 
-// Config controls cache capacity, sharding, eviction, and the async write
-// pipeline. Use DefaultConfig for recommended settings.
+// Config controls capacity, sharding, eviction, and queued writes. Start with
+// DefaultConfig and change the fields your application needs.
 type Config struct {
 	MaxSize         int64          // max resident items; 0 => unlimited
 	MaxCost         int64          // max total weighted cost; 0 => disabled
@@ -55,7 +51,7 @@ type Config struct {
 	CleanupInterval time.Duration  // expired-item sweep interval; 0 => no sweep
 	DefaultTTL      time.Duration  // TTL for Set with DefaultExpiration; NoExpiration => none
 	EvictionPolicy  EvictionPolicy // replacement policy; default SieveTinyLFU
-	StatsEnabled    bool           // collect hit/miss/eviction telemetry (off by default)
+	StatsEnabled    bool           // collect hit, miss, and eviction counts
 	ProbationRatio  uint8          // SieveTinyLFU probation window, % of capacity; 0 => default
 	GhostRatio      uint8          // SieveTinyLFU B1 ghost size, % of main; 0 => default
 	CostAdmission   CostAdmission  // how weighted items compete at admission
@@ -63,8 +59,8 @@ type Config struct {
 	WriteBatchSize  int            // max writes applied per drain batch; 0 => default
 }
 
-// DefaultConfig returns self-tuning SieveTinyLFU with stats disabled and shard
-// count scaled to the number of CPUs.
+// DefaultConfig returns the recommended SieveTinyLFU settings. It chooses the
+// shard count from the number of CPUs and leaves statistics disabled.
 func DefaultConfig() Config {
 	return Config{
 		MaxSize:         defaultMaxSize,
@@ -107,8 +103,8 @@ func (c Config) Validate() error {
 	if policy == DefaultEvictionPolicy {
 		policy = DefaultConfig().EvictionPolicy
 	}
-	// SieveTinyLFU sizes its sketch/ghost/probation split from an item count, so a
-	// cost-only budget would mis-size them: a weighted Sieve cache must bound items too.
+	// SieveTinyLFU sizes its internal structures from the item limit, so a
+	// weighted cache must also set MaxSize.
 	if policy == SieveTinyLFU && c.MaxSize <= 0 && c.MaxCost > 0 {
 		return newConfigError("MaxSize", c.MaxSize, "must be > 0 for SieveTinyLFU when MaxCost is set")
 	}

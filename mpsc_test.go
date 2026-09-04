@@ -18,8 +18,7 @@ func drainAll(q *mpscQueue[int, int], buf []writeCommand[int, int]) []writeComma
 }
 
 func TestMPSCQueueMinimumRingSize(t *testing.T) {
-	// WriteBufferSize 0/1 must still yield a usable ring (>= 2 slots), or the
-	// Vyukov sequence math would let an enqueue overwrite an un-dequeued item.
+	// Sizes 0 and 1 must still allocate the algorithm's minimum two slots.
 	for _, size := range []int{0, 1} {
 		q := newMPSCQueue[int, int](size, make(chan struct{}, 1), make(chan struct{}))
 		if len(q.buffer) < 2 {
@@ -40,7 +39,7 @@ func TestMPSCQueueMinimumRingSize(t *testing.T) {
 
 func TestMPSCQueueFIFOSingleProducer(t *testing.T) {
 	q := newMPSCQueue[int, int](8, make(chan struct{}, 1), make(chan struct{}))
-	buf := make([]writeCommand[int, int], 3) // small batch to exercise multi-pass drain
+	buf := make([]writeCommand[int, int], 3)
 	for i := range 6 {
 		if err := q.enqueue(writeCommand[int, int]{hash: uint64(i)}); err != nil {
 			t.Fatal(err)
@@ -59,7 +58,6 @@ func TestMPSCQueueFIFOSingleProducer(t *testing.T) {
 
 func TestMPSCQueueBackpressureBlocksUntilDrain(t *testing.T) {
 	q := newMPSCQueue[int, int](2, make(chan struct{}, 1), make(chan struct{}))
-	// Fill the ring (2 slots).
 	for i := range 2 {
 		if err := q.enqueue(writeCommand[int, int]{hash: uint64(i)}); err != nil {
 			t.Fatal(err)
@@ -75,7 +73,6 @@ func TestMPSCQueueBackpressureBlocksUntilDrain(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	// Free a slot; the blocked producer must now complete.
 	if n := q.tryDequeue(make([]writeCommand[int, int], 1)); n != 1 {
 		t.Fatalf("dequeued %d, want 1", n)
 	}
@@ -107,7 +104,7 @@ func TestMPSCQueueCloseWakesBlockedProducer(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	close(closeCh) // shutdown must wake the blocked producer
+	close(closeCh)
 	select {
 	case err := <-blocked:
 		if err != ErrCacheClosed {
@@ -124,7 +121,7 @@ func TestMPSCQueueConcurrentProducersNoLoss(t *testing.T) {
 	q := newMPSCQueue[int, int](64, make(chan struct{}, 1), make(chan struct{}))
 
 	want := producers * perProducer
-	counts := make([]int, producers) // next expected seq per producer
+	counts := make([]int, producers)
 	got := 0
 	done := make(chan struct{})
 

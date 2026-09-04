@@ -70,10 +70,8 @@ func TestGhostBasic(t *testing.T) {
 	if !g.contains(10) || !g.contains(40) {
 		t.Fatal("expected 10..40 present in a full cap-4 ring")
 	}
-	// dedup: re-adding a present fingerprint is a no-op (does not refresh recency).
+	// Re-adding a key does not refresh its FIFO position.
 	g.add(10)
-	// fifth distinct insert evicts the oldest live fingerprint (10), not the
-	// re-added one - the dedup did not advance the FIFO cursor.
 	g.add(50)
 	if g.contains(10) {
 		t.Fatal("10 should have been FIFO-evicted")
@@ -81,7 +79,6 @@ func TestGhostBasic(t *testing.T) {
 	if !g.contains(50) || !g.contains(40) || !g.contains(30) || !g.contains(20) {
 		t.Fatal("20,30,40,50 expected present")
 	}
-	// remove frees membership.
 	if !g.remove(20) || g.contains(20) {
 		t.Fatal("remove(20) should drop it")
 	}
@@ -109,11 +106,10 @@ func TestGhostDifferentialFuzz(t *testing.T) {
 			r := rand.New(rand.NewSource(seed*1000 + int64(n)))
 			g := newGhostQueue(n)
 			ref := newRefGhost(n)
-			// Small fingerprint domain forces frequent collisions, dedups and
-			// re-adds of evicted keys - the corner cases of the ring/index dance.
+			// A small key range exercises collisions, duplicates, and reinsertions.
 			dom := uint64(n*3 + 2)
 			for step := range 2000 {
-				h := uint64(r.Intn(int(dom))) // includes 0: a real, trackable fingerprint
+				h := uint64(r.Intn(int(dom)))
 				switch r.Intn(3) {
 				case 0, 1:
 					g.add(h)
@@ -123,7 +119,6 @@ func TestGhostDifferentialFuzz(t *testing.T) {
 						t.Fatalf("n=%d seed=%d step=%d remove(%d) mismatch", n, seed, step, h)
 					}
 				}
-				// Full-domain membership cross-check every few steps.
 				if step%7 == 0 {
 					for q := uint64(0); q <= dom+1; q++ {
 						if g.contains(q) != ref.contains(q) {

@@ -1,7 +1,7 @@
 package kioshun
 
-// freqNode buckets items by exact frequency.
-// Empty non-sentinel buckets are removed eagerly so head.next is always the current minimum.
+// freqNode groups items with the same access count. Empty nodes are removed, so
+// head.next is always the least frequently used group.
 type freqNode[K comparable, V any] struct {
 	freq  int64
 	items map[*cacheItem[K, V]]struct{}
@@ -57,9 +57,8 @@ func (l *lfuList[K, V]) increment(item *cacheItem[K, V]) {
 func (l *lfuList[K, V]) removeLFU() *cacheItem[K, V] {
 	node := l.head.next
 	if node == l.head {
-		return nil // list is empty
+		return nil
 	}
-	// non-sentinel buckets are never empty.
 	var victim *cacheItem[K, V]
 	for it := range node.items {
 		victim = it
@@ -77,7 +76,7 @@ func (l *lfuList[K, V]) removeLFU() *cacheItem[K, V] {
 func (l *lfuList[K, V]) remove(item *cacheItem[K, V]) {
 	node := l.itemFreq[item]
 	if node == nil {
-		return // item not tracked
+		return
 	}
 
 	delete(node.items, item)

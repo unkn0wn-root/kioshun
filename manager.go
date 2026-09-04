@@ -27,17 +27,15 @@ type Manager struct {
 	configMu      sync.RWMutex
 }
 
-// NewManager returns an empty Manager with no registered configurations or caches.
+// NewManager returns an empty Manager.
 func NewManager() *Manager {
 	return &Manager{
 		registrations: make(map[string]cacheRegistration),
 	}
 }
 
-// Register registers a configuration for a named cache.
-// A name is bound to its configuration by the first GetCache call so
-// registering a name that already has a live cache does not change that
-// instance; register before first use.
+// Register stores the configuration for a named cache. Register a name before
+// its first GetCache call.
 func (m *Manager) Register(name string, config Config) error {
 	if err := config.Validate(); err != nil {
 		return newCacheError("register", name, err)
@@ -46,8 +44,7 @@ func (m *Manager) Register(name string, config Config) error {
 	return m.register(name, cacheRegistration{config: config})
 }
 
-// RegisterCache registers a typed cache factory for a named cache. Use this when
-// the cache needs typed options such as WithWeigher, WithOnRemove or WithOnEvict.
+// RegisterCache registers a named cache with typed options such as WithWeigher.
 func RegisterCache[K comparable, V any](m *Manager, name string, config Config, opts ...Option[K, V]) error {
 	if err := config.Validate(); err != nil {
 		return newCacheError("register", name, err)
@@ -76,10 +73,8 @@ func (m *Manager) register(name string, reg cacheRegistration) error {
 	return nil
 }
 
-// GetCache returns the named typed cache, creating it from the registered
-// configuration on first use. A name that was never registered (or whose
-// registration was dropped by Remove) returns ErrCacheNotRegistered; use
-// GetCacheWithConfig to get-or-create without registering first.
+// GetCache returns the named cache, creating it from its registered configuration
+// on first use. It returns ErrCacheNotRegistered for an unknown name.
 func GetCache[K comparable, V any](m *Manager, name string) (*Cache[K, V], error) {
 	if cached, ok := m.caches.Load(name); ok {
 		return assertCache[K, V](name, cached)
@@ -99,9 +94,8 @@ func GetCache[K comparable, V any](m *Manager, name string) (*Cache[K, V], error
 	return createCache[K, V](m, name, reg)
 }
 
-// GetCacheWithConfig returns the named typed cache, creating it from config when
-// it does not yet exist, and needs no prior Register call. If the cache already
-// exists the existing instance is returned and config is ignored (get-or-create).
+// GetCacheWithConfig returns the named cache, creating it from config if needed.
+// If it already exists, config and opts are ignored.
 func GetCacheWithConfig[K comparable, V any](
 	m *Manager,
 	name string,
@@ -171,9 +165,8 @@ func (m *Manager) Stats() map[string]Stats {
 	return stats
 }
 
-// CloseAll closes and removes every managed cache instance.
-// Registered configurations are left intact, so the same names
-// can be recreated from this manager afterwards.
+// CloseAll closes and removes every cache instance. Registrations remain, so a
+// later GetCache can recreate them.
 func (m *Manager) CloseAll() error {
 	var errs []error
 
@@ -190,8 +183,7 @@ func (m *Manager) CloseAll() error {
 	return errors.Join(errs...)
 }
 
-// Remove closes and removes the named cache instance and drops its registered
-// configuration.
+// Remove closes the named cache and removes its registration.
 func (m *Manager) Remove(name string) error {
 	m.configMu.Lock()
 	delete(m.registrations, name)
@@ -216,16 +208,14 @@ func RegisterGlobalTypedCache[K comparable, V any](name string, config Config, o
 	return RegisterCache(globalManager, name, config, opts...)
 }
 
-// GetGlobalCache retrieves the named cache from the global manager, creating
-// it from its registered configuration on first use. An unregistered name
-// returns ErrCacheNotRegistered (see GetCache). Caches created this way live
-// for the lifetime of the process unless released with CloseAllGlobalCaches.
+// GetGlobalCache returns a named cache from the global manager, creating it from
+// its registration on first use.
 func GetGlobalCache[K comparable, V any](name string) (*Cache[K, V], error) {
 	return GetCache[K, V](globalManager, name)
 }
 
-// GetGlobalCacheWithConfig retrieves or creates a global cache from config and
-// typed options when it does not yet exist.
+// GetGlobalCacheWithConfig returns a named global cache, creating it from config
+// and opts if needed.
 func GetGlobalCacheWithConfig[K comparable, V any](
 	name string,
 	config Config,

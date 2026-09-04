@@ -111,7 +111,7 @@ func TestHtableReclaimTombsAtClusterTail(t *testing.T) {
 	tab.store(b)
 	tab.store(c)
 
-	// c is the cluster tail (slot 3 is empty): its tombstone reclaims at once.
+	// The deleted slot at the cluster tail can become empty immediately.
 	if !tab.removeExact(c) {
 		t.Fatal("removeExact(c) failed")
 	}
@@ -119,7 +119,7 @@ func TestHtableReclaimTombsAtClusterTail(t *testing.T) {
 		t.Fatalf("tail tombstone not reclaimed: tombs=%d", tab.tombs)
 	}
 
-	// a is mid-cluster (b is live after it): its tombstone must survive.
+	// A deleted slot inside the cluster must remain searchable.
 	if !tab.removeExact(a) {
 		t.Fatal("removeExact(a) failed")
 	}
@@ -127,8 +127,7 @@ func TestHtableReclaimTombsAtClusterTail(t *testing.T) {
 		t.Fatalf("mid-cluster tombstone reclaimed early: tombs=%d", tab.tombs)
 	}
 
-	// removing b makes b's slot the new tail; the sweep must also clear the
-	// chained tombstone at a's slot.
+	// Removing the final live item clears both trailing deleted slots.
 	if !tab.removeExact(b) {
 		t.Fatal("removeExact(b) failed")
 	}
@@ -153,16 +152,14 @@ func TestHtableReclaimTombsRespectsPin(t *testing.T) {
 		t.Fatal("removeExact(a) failed")
 	}
 
-	// probe for an absent colliding key: the cursor takes a's tombstone and
-	// pins slot 0.
+	// Reserve the deleted slot before removing the rest of the cluster.
 	c := htItem(3, 48)
 	prev, _, cur := tab.probe(c.hash, c.key)
 	if prev != nil || !cur.tomb || cur.slot != 0 {
 		t.Fatalf("cursor (tomb=%v slot=%d), want tombstone cursor at slot 0", cur.tomb, cur.slot)
 	}
 
-	// an eviction between probe and publish: b's removal makes slot 1 a cluster
-	// tail, and the backward sweep must stop at the pinned slot 0.
+	// Reclaiming the tail must stop before the reserved slot.
 	if !tab.removeExact(b) {
 		t.Fatal("removeExact(b) failed")
 	}
@@ -196,15 +193,14 @@ func TestHtableReclaimTombsPinnedEmptyTrigger(t *testing.T) {
 	tab.store(a)
 	tab.store(b)
 
-	// probe for an absent colliding key: the cursor takes the first empty slot
-	// (2) and pins it.
+	// Reserve the first empty slot after the cluster.
 	c := htItem(3, 48)
 	prev, _, cur := tab.probe(c.hash, c.key)
 	if prev != nil || cur.tomb || cur.slot != 2 {
 		t.Fatalf("cursor (tomb=%v slot=%d), want empty cursor at slot 2", cur.tomb, cur.slot)
 	}
 
-	// b's removal sees the pinned empty at slot 2 next to it: no sweep.
+	// The reserved empty slot cannot end a reclaim scan.
 	if !tab.removeExact(b) {
 		t.Fatal("removeExact(b) failed")
 	}
@@ -237,7 +233,7 @@ func TestHtablePublishTombAccountingDefensive(t *testing.T) {
 		t.Fatal("cursor should target the tombstone")
 	}
 
-	// simulate the tombstone being reclaimed out from under the cursor.
+	// Simulate defensive handling of a stale cursor.
 	cur.d.slots[cur.slot].tag.Store(0)
 	tab.tombs--
 

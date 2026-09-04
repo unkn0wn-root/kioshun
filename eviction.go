@@ -26,8 +26,6 @@ func (r RemovalReason) String() string {
 	}
 }
 
-// evictor selects one victim to remove from a bounded shard. Callers hold the shard
-// lock; table removal, policy unlinking and statistics are left to shard.dropItem.
 type evictor[K comparable, V any] interface {
 	evict(s *shard[K, V], statsEnabled bool)
 }
@@ -91,20 +89,14 @@ func removalNotifyBit(reason RemovalReason) removalNotifyMask {
 	return removalNotifyMask(1) << reason
 }
 
-// WithOnRemove registers a listener invoked once for every key removed from the
-// cache, with a RemovalReason describing why: RemovedCapacity (a resident was
-// displaced to stay within capacity), RemovedRejected (SieveTinyLFU declined to
-// keep a candidate), RemovedExpired (TTL) or RemovedDeleted (Delete). It is not
-// called for Clear or when an existing key's value is replaced. Only
-// RemovedCapacity removals are counted in Stats().Evictions, so the notification
-// volume can legitimately exceed that counter.
+// WithOnRemove registers a listener for capacity eviction, admission rejection,
+// expiration, and deletion. Clear and value replacement do not call it. Only
+// capacity removals increase Stats().Evictions.
 func WithOnRemove[K comparable, V any](listener func(key K, value V, reason RemovalReason)) Option[K, V] {
 	return func(c *Cache[K, V]) { c.onRemove = listener }
 }
 
-// WithOnEvict registers a listener invoked only when an existing cache entry is
-// displaced to keep the shard within capacity. It is a narrow convenience for
-// callers that do not need delete, expiry or admission rejection notifications.
+// WithOnEvict registers a listener for entries removed to stay within capacity.
 func WithOnEvict[K comparable, V any](listener func(key K, value V)) Option[K, V] {
 	return func(c *Cache[K, V]) { c.onEvict = listener }
 }
@@ -126,10 +118,8 @@ func (c *Cache[K, V]) listenerNotifyMask() removalNotifyMask {
 	return mask
 }
 
-// removeNotifyWorker delivers buffered removal notifications to configured
-// listeners. It runs only when a listener is configured. The worker holds no
-// shard lock while invoking the listener so the listener may reenter the cache
-// without risking deadlock or reentrancy on the shard mutex.
+// removeNotifyWorker calls listeners without holding a shard lock, allowing a
+// listener to use the cache safely.
 func (c *Cache[K, V]) removeNotifyWorker() {
 	defer c.workers.Done()
 	for {

@@ -22,7 +22,7 @@ type Store[K comparable, V any] interface {
 
 var _ Store[string, int] = (*Cache[string, int])(nil)
 
-// Stats is approximate telemetry aggregated across shards.
+// Stats contains approximate counters summed across shards.
 type Stats struct {
 	Hits        int64   // lookups that found a live entry
 	Misses      int64   // lookups that found nothing or an expired entry
@@ -46,11 +46,11 @@ type PolicyStats struct {
 	MainEvictions      int64 // entries evicted from the main queue
 }
 
-// Cache is a sharded in-memory cache with per-policy metadata. SieveTinyLFU reads
-// are lock-free; writers (and other policies' reads) are serialized per shard.
+// Cache is a sharded in-memory cache. SieveTinyLFU reads are lock-free. Writes
+// and reads for the other policies are serialized within each shard.
 type Cache[K comparable, V any] struct {
-	shards       []*shard[K, V] // tables + lists + counters
-	shardMask    uint64         // shards is 2^n; mask = shards-1
+	shards       []*shard[K, V]
+	shardMask    uint64 // len(shards) is a power of two
 	config       Config
 	perShardCap  int64
 	perShardCost int64
@@ -68,7 +68,7 @@ type Cache[K comparable, V any] struct {
 	onEvict      func(K, V)
 	removeWake   chan struct{}
 
-	stats *stats // per-P; nil unless StatsEnabled
+	stats *stats // nil unless StatsEnabled
 }
 
 type Option[K comparable, V any] func(*Cache[K, V])
@@ -77,8 +77,8 @@ type Option[K comparable, V any] func(*Cache[K, V])
 // cost is 1, preserving entry count when MaxCost is unset.
 type Weigher[K comparable, V any] func(K, V) int64
 
-// WithWeigher configures typed item weights for MaxCost enforcement and
-// cost-aware SieveTinyLFU admission. A nil weigher is ignored.
+// WithWeigher sets the item weights used by MaxCost and weighted SieveTinyLFU
+// admission. A nil weigher is ignored.
 func WithWeigher[K comparable, V any](weigher Weigher[K, V]) Option[K, V] {
 	return func(c *Cache[K, V]) {
 		if weigher != nil {
@@ -88,9 +88,8 @@ func WithWeigher[K comparable, V any](weigher Weigher[K, V]) Option[K, V] {
 	}
 }
 
-// New constructs a Cache from config, returning an error if config is invalid.
-// Shard count is normalized to 2^n (and bounded by MaxSize); background
-// workers start immediately so callers must Close the cache to release them.
+// New constructs a Cache from config. It starts background workers, so callers
+// must call Close when the cache is no longer needed.
 func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V], error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -111,7 +110,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		shardCount = min(shardCount, maxShardCount)
 	}
 
-	// bound shards by capacity so tiny MaxSize/MaxCost values do not create empty shards.
+	// Do not create more shards than the capacity can use.
 	if config.MaxSize > 0 {
 		shardCount = min(shardCount, int(mathx.PrevPowerOf2(min(config.MaxSize, int64(maxShardCount)))))
 	}
@@ -132,8 +131,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		},
 	}
 
-	// precompute the base per-shard capacity. Individual shards receive the
-	// remainder below so the aggregate capacity is exactly MaxSize.
+	// The first few shards receive the remainder so their limits add up exactly.
 	if config.MaxSize > 0 {
 		cache.perShardCap = config.MaxSize / int64(shardCount)
 	}
@@ -177,12 +175,9 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 		if config.EvictionPolicy == LFU {
 			s.lfuList = newLFUList[K, V]()
 		}
-		// Config.Validate rejects SieveTinyLFU with a cost budget but no MaxSize so
-		// a bounded Sieve shard always has s.cap > 0 to size its policy from; an
-		// unbounded cache (no MaxSize, no MaxCost) keeps s.sieve nil and never evicts.
+		// SieveTinyLFU needs an item limit to size its policy. Validate rejects a
+		// cost-only limit, while a fully unbounded cache needs no policy state.
 		if config.EvictionPolicy == SieveTinyLFU && s.cap > 0 {
-			// shard index is the queue owner tag; shardCount <= maxShardCount (256)
-			// so it fits a byte and is unique per shard.
 			s.sieve = newSieveTinyLFU[K, V](
 				s.cap,
 				uint8(i),
@@ -190,10 +185,9 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 				config.GhostRatio,
 				config.CostAdmission,
 			)
-			s.readBuf = newReadBuffer() // per-shard read sampling for the sketch
+			s.readBuf = newReadBuffer()
 		}
-		// Only policies backed by the shared LRU list need its sentinels; bounded
-		// SieveTinyLFU keeps residents in its own queues, so it skips them.
+		// SieveTinyLFU uses its own queues instead of the shared linked list.
 		if s.sieve == nil {
 			s.initLRU()
 		}
@@ -228,7 +222,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 }
 
 // NewDefault constructs a Cache with DefaultConfig. It panics only if the
-// built-in default config is invalid (your fault).
+// built-in configuration is invalid.
 func NewDefault[K comparable, V any]() *Cache[K, V] {
 	cache, err := New[K, V](DefaultConfig())
 	if err != nil {
@@ -269,10 +263,9 @@ func (c *Cache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	return c.setAndWait(key, value, ttl, nil)
 }
 
-// SetAsync accepts an insert/update command for key with TTL. A nil error means
-// the command was accepted. When the owning shard is uncontended the write is
-// applied inline before returning (immediate visibility, no async handoff);
-// otherwise it is queued without blocking and Sync gives committed visibility.
+// SetAsync accepts an insert or update. It applies the write before returning
+// when the shard is idle; otherwise it queues the write. Call Sync when later
+// reads must see all accepted writes.
 func (c *Cache[K, V]) SetAsync(key K, value V, ttl time.Duration) error {
 	return c.set(key, value, ttl, nil)
 }
@@ -410,13 +403,12 @@ func (c *Cache[K, V]) PolicyStats() PolicyStats {
 	return ps
 }
 
-// Close shuts down background work (idempotently), clears shards and marks the cache closed.
+// Close stops background work and clears the cache. It is safe to call more than once.
 func (c *Cache[K, V]) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
-		// Drain everything accepted so far via a barrier, then broadcast shutdown:
-		// workers do a final drain and exit; producers blocked on a full queue wake
-		// and return ErrCacheClosed. No queue is ever closed out from under a sender.
+		// Drain accepted writes before waking blocked producers and stopping workers.
+		// The queues remain open, so no sender can race a channel close.
 		c.flush()
 		close(c.closeCh)
 		c.workers.Wait()
@@ -451,7 +443,6 @@ func (c *Cache[K, V]) cleanupWorker() {
 	}
 }
 
-// isClosed reports whether Close has been called.
 func (c *Cache[K, V]) isClosed() bool {
 	return c.closed.Load()
 }
@@ -474,9 +465,7 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 	kh := c.hasher.Sum(key)
 	shard := c.shardByHash(kh)
 
-	// bounded SieveTinyLFU reads are lock-free via getSieve. An unbounded (cap==0)
-	// sieve has no policy state (shard.sieve == nil) and never evicts, so it falls
-	// through to the lock path below with no per-read update - the same as FIFO.
+	// An unbounded SieveTinyLFU cache has no policy state and uses the locked path.
 	if shard.sieve != nil {
 		return c.getSieve(key, kh, shard)
 	}
@@ -521,7 +510,7 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 					}
 					return getResult[V]{now: now}
 				}
-				// might have been refreshed while upgrading the lock; re-evaluate.
+				// The entry may have been refreshed while the lock was upgraded.
 				continue
 			}
 
@@ -555,23 +544,17 @@ func (c *Cache[K, V]) get(key K) getResult[V] {
 	}
 }
 
-// getSieve is the lock-free SieveTinyLFU read path: it probes the table without a
-// lock, and a hit's only shared write is the visited bit. Item fields are
-// immutable after publication, so a reader racing an eviction still gets a
-// consistent snapshot - the item lives until both reader and GC are done.
+// getSieve is the lock-free SieveTinyLFU read path. Published items are
+// immutable, so a reader that races an eviction still sees a complete value.
 func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V] {
 	item, exists := shard.tab.lookup(kh, key)
 
-	// during warmup admission is unconditional, so the sketch is never consulted;
-	// skip the visited-bit update and read sampling so a working set that fits under
-	// capacity (never leaving warmup) pays no sketch-feeding cost on reads.
+	// Warmup admits every item, so it does not need frequency samples.
 	warmup := shard.belowSieveWarmup()
 
 	if !exists {
-		// a read never waits for the writer, so a miss may be a Set still queued for
-		// this shard. Drain and re-check before declaring a miss, so a Get racing a
-		// Set of the same key sees it without making writes synchronous. The miss is
-		// not sampled: if it becomes a Set, recordAccess counts it at insert.
+		// A miss may be a Set still queued for this shard. Drain and check again
+		// without making every read wait for the writer.
 		if it, ok := c.drainMissAndLookup(shard, kh, key); ok {
 			item = it
 			warmup = shard.belowSieveWarmup()
@@ -593,9 +576,8 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		ok:         true,
 	}
 
-	// resolve expiry off the hot path; only an expired hit takes the write lock to
-	// remove the entry. recordReadHit above only set the visited bit, so recording
-	// a read on an entry we then find expired is harmless.
+	// Only entries with a TTL read the clock. An expired entry takes the lock for
+	// removal; setting its visited bit above is harmless.
 	if res.expireTime > 0 {
 		res.now = c.nowNano()
 		if res.now > res.expireTime {
@@ -615,14 +597,13 @@ func (c *Cache[K, V]) getSieve(key K, kh uint64, shard *shard[K, V]) getResult[V
 		}
 	}
 
-	// fetch the stripe id once; the hit counter and the read sample share it.
+	// The hit counter and read sample use the same stripe.
 	if c.config.StatsEnabled || !warmup {
 		id := stripeID()
 		if c.config.StatsEnabled {
 			c.stats.recordHit(id)
 		}
-		// feed the read into the frequency sketch via the per-shard read buffer
-		// so TinyLFU admission reflects read popularity, not just write traffic.
+		// Buffer the sample so readers do not update the sketch directly.
 		if !warmup {
 			shard.sampleRead(kh, id)
 		}
@@ -634,9 +615,8 @@ func (c *Cache[K, V]) shardByHash(hash uint64) *shard[K, V] {
 	return c.shards[hash&c.shardMask]
 }
 
-// nowNano is the cache's clock: monotonic nanoseconds since clockBase. Item expiry
-// is stamped and compared in this domain, so TTLs ignore wall-clock jumps (NTP
-// steps, manual changes).
+// nowNano returns monotonic nanoseconds since the cache was created. TTL checks
+// therefore ignore wall-clock changes.
 func (c *Cache[K, V]) nowNano() int64 {
 	return time.Since(c.clockBase).Nanoseconds()
 }

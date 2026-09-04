@@ -215,9 +215,7 @@ func TestOnRemove_CapacityEvictionAccounting(t *testing.T) {
 			if rec.repeats != 0 {
 				t.Fatalf("got %d duplicate eviction notifications", rec.repeats)
 			}
-			// Set with NoExpiration and no Delete, so every notification is a
-			// capacity removal - except SieveTinyLFU, which may also reject a
-			// candidate that loses admission (RemovedRejected).
+			// Only SieveTinyLFU can reject a candidate instead of evicting a resident.
 			for _, rsn := range rec.allReasons() {
 				switch policy {
 				case SieveTinyLFU:
@@ -230,7 +228,6 @@ func TestOnRemove_CapacityEvictionAccounting(t *testing.T) {
 					}
 				}
 			}
-			// Spot-check that delivered values match their keys.
 			for k := 0; k < total; k += 137 {
 				if v, ok := rec.value(k); ok && v != valFor(k) {
 					t.Fatalf("evicted key %d carried value %q, want %q", k, v, valFor(k))
@@ -288,7 +285,6 @@ func TestOnRemove_TTLExpiration(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 
-	// The background cleanup worker expires the entry and notifies.
 	waitFor(t, func() bool {
 		v, ok := rec.value(3)
 		return ok && v == "three"
@@ -300,8 +296,7 @@ func TestOnRemove_TTLExpiration(t *testing.T) {
 
 func TestOnRemove_ExpirationOnAccess(t *testing.T) {
 	rec := newEvictRecorder()
-	// CleanupInterval 0 disables the background sweeper, so the only way the
-	// expired entry leaves is the lazy removal on Get.
+	// With cleanup disabled, Get must remove the expired entry.
 	c, err := New(
 		Config{MaxSize: 100, ShardCount: 2, CleanupInterval: 0, EvictionPolicy: LRU, StatsEnabled: true},
 		WithOnRemove(rec.record),
@@ -350,7 +345,7 @@ func TestOnRemove_NotFiredOnOverwrite(t *testing.T) {
 	if err := c.Sync(); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	// Allow any (erroneous) notification to be delivered before asserting.
+	// Wait long enough to catch an incorrect asynchronous notification.
 	time.Sleep(50 * time.Millisecond)
 	if n := rec.count(); n != 0 {
 		t.Fatalf("overwrite produced %d eviction notifications, want 0", n)
@@ -417,37 +412,30 @@ func TestAllEvictionPolicies(t *testing.T) {
 			cache := newTestCache[string, int](t, config)
 			defer cache.Close()
 
-			// Fill cache beyond capacity to trigger eviction
 			for j := range 10 {
 				cache.Set(string(rune('a'+j)), j, time.Hour)
 			}
 			waitForWrites(t, cache)
 
-			// Verify cache doesn't exceed capacity
 			stats := cache.Stats()
 			if stats.Size > 5 {
 				t.Errorf("Cache size %d exceeds max capacity 5 for policy %s", stats.Size, policyNames[i])
 			}
 
-			// Verify evictions occurred (except for SieveTinyLFU which may prevent them)
 			if stats.Evictions == 0 && policies[i] != SieveTinyLFU {
 				t.Errorf("Expected evictions for policy %s, got 0", policyNames[i])
 			}
 
-			// For SieveTinyLFU, low evictions are expected due to admission control
 			if policies[i] == SieveTinyLFU && stats.Evictions == 0 {
 				t.Logf("SieveTinyLFU prevented evictions through admission control - this is correct behavior")
 			}
 
-			// Test that cache still works
 			cache.Set("test", 999, time.Hour)
 			waitForWrites(t, cache)
 
-			// For SieveTinyLFU, the test item might be rejected by admission control
 			if policies[i] == SieveTinyLFU {
-				// Try accessing the item to build frequency for admission
 				cache.Get("test")
-				cache.Set("test", 999, time.Hour) // Try again with higher chance
+				cache.Set("test", 999, time.Hour)
 				waitForWrites(t, cache)
 			}
 
@@ -473,28 +461,21 @@ func TestLFUSpecificBehavior(t *testing.T) {
 	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
-	// Add items
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
 	waitForWrites(t, cache)
 
-	// Access "a" multiple times to increase frequency
 	for i := 0; i < 5; i++ {
 		cache.Get("a")
 	}
 
-	// Access "b" fewer times
 	cache.Get("b")
 	cache.Get("b")
 
-	// Don't access "c" at all after insertion
-
-	// Add new item to trigger eviction - "c" should be evicted (lowest frequency)
 	cache.Set("d", 4, time.Hour)
 	waitForWrites(t, cache)
 
-	// "c" should be gone, "a" and "b" should remain
 	if _, found := cache.Get("c"); found {
 		t.Error("Item 'c' should have been evicted (LFU)")
 	}
@@ -517,20 +498,16 @@ func TestLRUSpecificBehavior(t *testing.T) {
 	cache := newTestCache[string, int](t, config)
 	defer cache.Close()
 
-	// Add items in order
 	cache.Set("a", 1, time.Hour)
 	cache.Set("b", 2, time.Hour)
 	cache.Set("c", 3, time.Hour)
 	waitForWrites(t, cache)
 
-	// Access "a" to make it most recently used
 	cache.Get("a")
 
-	// Add new item to trigger eviction - "b" should be evicted (least recently used)
 	cache.Set("d", 4, time.Hour)
 	waitForWrites(t, cache)
 
-	// "b" should be gone, others should remain
 	if _, found := cache.Get("b"); found {
 		t.Error("Item 'b' should have been evicted (LRU)")
 	}

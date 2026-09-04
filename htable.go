@@ -6,16 +6,11 @@ import (
 	"github.com/unkn0wn-root/kioshun/internal/mathx"
 )
 
-// htable is the per-shard key/value store: a single-writer/multi-reader
-// open-addressing hash table with lock-free reads.
+// htable is a linear-probing table with one writer and lock-free readers.
 //
-// Reads (lookup) take no lock - they snapshot the slot array and linear probe a
-// dense array of co-located {tag, item} cells, dereferencing an item only
-// on a tag match. Safety of lock-free reads rests on item immutability:
-// a reader may still hold an item the writer has evicted,
-// so reader-visible item fields (key, hash, value, expireTime) are written
-// before the item is published and never mutated afterwards;
-// a value update allocates a fresh item and swaps it in.
+// A reader first compares the hash tag and loads the item only on a match.
+// Published items are immutable because a reader may retain one after eviction.
+// Updating a value therefore allocates and publishes a new item.
 type htable[K comparable, V any] struct {
 	data   atomic.Pointer[htableData[K, V]]
 	live   int
@@ -23,16 +18,12 @@ type htable[K comparable, V any] struct {
 	pinned uint64
 }
 
-// htNoPin marks no probe cursor in flight
-// no real slot index reaches 2^64-1.
+// htNoPin cannot be a real slot index.
 const htNoPin = ^uint64(0)
 
-// htslot is one colocated cell. tag pre-filters probes without dereferencing
-// the item: 0 = empty (a lookup stops), 1 = tombstone (a lookup continues past
-// it), any other value = the slot's normalized item hash.
-// Publication order makes a matching tag imply a readable item: store writes the
-// item pointer before the tag and remove writes the tombstone tag before
-// clearing the pointer.
+// htslot uses tag 0 for empty, 1 for deleted, and all other values for item
+// hashes. Writers publish the item before its tag and mark it deleted before
+// clearing the pointer, so a matching tag always has a readable item.
 type htslot[K comparable, V any] struct {
 	tag  atomic.Uint64
 	item atomic.Pointer[cacheItem[K, V]]
@@ -56,9 +47,7 @@ func newHtable[K comparable, V any](capacityHint int) *htable[K, V] {
 	return t
 }
 
-// htNormHash keeps stored tags out of the 0 (empty) and 1 (tombstone) sentinel
-// space. A real avalanche hash hitting {0,1} is unlikely,
-// and remapping it only risks an extra key comparison.
+// htNormHash reserves tags 0 and 1 for empty and deleted slots.
 func htNormHash(h uint64) uint64 {
 	if h < 2 {
 		return h + 2
@@ -93,8 +82,6 @@ func (t *htable[K, V]) store(it *cacheItem[K, V]) (prev *cacheItem[K, V]) {
 		s := &d.slots[i]
 		switch s.tag.Load() {
 		case 0:
-			// key absent (probed to an empty slot): insert, reusing the first
-			// tombstone seen on the way if there was one.
 			dst := s
 			if firstTomb >= 0 {
 				dst = &d.slots[firstTomb]
@@ -111,7 +98,7 @@ func (t *htable[K, V]) store(it *cacheItem[K, V]) (prev *cacheItem[K, V]) {
 			}
 		case tag:
 			if cur := s.item.Load(); cur != nil && cur.key == it.key {
-				s.item.Store(it) // same tag, swap the value-carrying item
+				s.item.Store(it)
 				return cur
 			}
 		}
@@ -119,22 +106,16 @@ func (t *htable[K, V]) store(it *cacheItem[K, V]) (prev *cacheItem[K, V]) {
 	}
 }
 
-// htCursor captures where a deferred insert will be published. It is produced by
-// probe and consumed by publish under the same shard write lock. The captured
-// htableData pointer lets publish detect (and fall back from) a rehash that
-// happened in between, though eviction never rehashes today.
+// htCursor records where a deferred insert belongs. Its table pointer detects a
+// rehash between probe and publish.
 type htCursor[K comparable, V any] struct {
 	d    *htableData[K, V]
 	slot uint64
 	tomb bool
 }
 
-// probe walks for key in one pass. If the key already exists, it returns the
-// resident item and its slot so the caller can build the replacement item and
-// swap it in - an update completes without a second walk. If the key is absent,
-// it returns prev=nil plus a cursor at the slot a later publish should fill,
-// WITHOUT inserting, so a SieveTinyLFU candidate can run admission before it ever
-// becomes visible to lock-free readers. Caller holds the shard write lock.
+// probe finds an existing item or reserves a slot for a later publish. Deferring
+// publication lets SieveTinyLFU reject a candidate before readers can see it.
 func (t *htable[K, V]) probe(hash uint64, key K) (prev *cacheItem[K, V], slot *htslot[K, V], cur htCursor[K, V]) {
 	tag := htNormHash(hash)
 	d := t.data.Load()
@@ -148,7 +129,7 @@ func (t *htable[K, V]) probe(hash uint64, key K) (prev *cacheItem[K, V], slot *h
 			if firstTomb >= 0 {
 				at, tomb = uint64(firstTomb), true
 			}
-			t.pinned = at // barrier for reclaimTombs until publish or unpin
+			t.pinned = at
 			return nil, nil, htCursor[K, V]{d: d, slot: at, tomb: tomb}
 		case 1:
 			if firstTomb < 0 {
@@ -163,9 +144,7 @@ func (t *htable[K, V]) probe(hash uint64, key K) (prev *cacheItem[K, V], slot *h
 	}
 }
 
-// publish completes a deferred insert at cur, mirroring store's empty-slot arm.
-// If the table was rehashed or cleared since probe (defensive: eviction never
-// rehashes), the cursor is stale, so it falls back to a full store.
+// publish completes a deferred insert. A stale cursor falls back to store.
 func (t *htable[K, V]) publish(it *cacheItem[K, V], cur htCursor[K, V]) {
 	t.pinned = htNoPin
 	if cur.d != t.data.Load() {
@@ -173,8 +152,7 @@ func (t *htable[K, V]) publish(it *cacheItem[K, V], cur htCursor[K, V]) {
 		return
 	}
 	s := &cur.d.slots[cur.slot]
-	// an eviction between probe and publish may have reclaimed the cursor's
-	// tombstone (reclaimTombs), so only credit a tombstone that still exists.
+	// An eviction may have reclaimed this deleted slot after probe.
 	wasTomb := cur.tomb && s.tag.Load() == 1
 	s.item.Store(it)
 	s.tag.Store(htNormHash(it.hash))
@@ -185,17 +163,14 @@ func (t *htable[K, V]) publish(it *cacheItem[K, V], cur htCursor[K, V]) {
 	t.maybeGrow()
 }
 
-// swapAt swaps a fresh item into a slot probe already matched for the same
-// key. The pointer store alone publishes it: the hash didn't change so the
-// tag doesn't either, and a reader racing the swap gets the old item or the
-// new one - both are complete snapshots of the key.
+// swapAt publishes a replacement for the same key. A racing reader sees either
+// complete item because the tag does not change.
 func (t *htable[K, V]) swapAt(slot *htslot[K, V], it *cacheItem[K, V]) {
 	slot.item.Store(it)
 }
 
-// removeExact tombstones the slot only if it still holds exactly it, returning
-// whether it did. The identity check rejects stale hand/queue pointers whose
-// slot another mutation already replaced or removed.
+// removeExact removes the slot only if it still points to the given item. This
+// rejects stale policy pointers after a replacement or earlier removal.
 func (t *htable[K, V]) removeExact(it *cacheItem[K, V]) bool {
 	tag := htNormHash(it.hash)
 	d := t.data.Load()
@@ -219,12 +194,9 @@ func (t *htable[K, V]) removeExact(it *cacheItem[K, V]) bool {
 	}
 }
 
-// reclaimTombs converts the tombstone at i, and any tombstones immediately before
-// it, back to empty when the following slot is empty. A tombstone at the end of its
-// probe cluster lies on no live item's probe path (any walk stops at the empty slot
-// after it), so clearing is safe under concurrent lock-free lookups: a reader sees
-// the new empty and stops one slot earlier with the same result. Trimming cluster
-// tails keeps miss probes short and defers same-size rehashes on eviction-heavy shards.
+// reclaimTombs clears deleted slots from the end of a probe cluster. No live
+// lookup crosses these slots because the following empty slot already ends the
+// search. pinned protects a slot reserved by probe but not yet published.
 func (t *htable[K, V]) reclaimTombs(d *htableData[K, V], i uint64) {
 	next := (i + 1) & d.mask
 	if next == t.pinned || d.slots[next].tag.Load() != 0 {
@@ -237,8 +209,6 @@ func (t *htable[K, V]) reclaimTombs(d *htableData[K, V], i uint64) {
 	}
 }
 
-// unpin releases a probe cursor that will never be published
-// (the candidate was rejected by admission).
 func (t *htable[K, V]) unpin() { t.pinned = htNoPin }
 
 func (t *htable[K, V]) length() int { return t.live }
@@ -256,8 +226,7 @@ func (t *htable[K, V]) forEach(fn func(*cacheItem[K, V]) bool) {
 	}
 }
 
-// clear publishes a fresh empty table of the same size. In-flight readers keep
-// reading their old immutable snapshot until they finish.
+// clear publishes a new empty table. Existing readers may finish on the old one.
 func (t *htable[K, V]) clear() {
 	d := t.data.Load()
 	n := len(d.slots)
@@ -267,9 +236,7 @@ func (t *htable[K, V]) clear() {
 	t.pinned = htNoPin
 }
 
-// maybeGrow rehashes when the table is too full. A table dense with live items
-// grows; one merely full of tombstones is rebuilt at the same size to reclaim
-// them.
+// maybeGrow expands a table full of live items or rebuilds one full of deleted slots.
 func (t *htable[K, V]) maybeGrow() {
 	d := t.data.Load()
 	n := len(d.slots)
@@ -284,9 +251,8 @@ func (t *htable[K, V]) maybeGrow() {
 	t.rehash(newN)
 }
 
-// rehash rebuilds the slot array at newN slots dropping tombstones, then
-// publishes it atomically so a concurrent reader observes either the complete
-// old table or the complete new one.
+// rehash publishes a rebuilt table without deleted slots. Readers see either the
+// complete old table or the complete new one.
 func (t *htable[K, V]) rehash(newN int) {
 	d := t.data.Load()
 	nd := &htableData[K, V]{slots: make([]htslot[K, V], newN), mask: uint64(newN - 1)}

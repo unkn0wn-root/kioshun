@@ -6,86 +6,67 @@ import (
 	"sync/atomic"
 )
 
-// cacheItem is the entry stored in the shard table. It carries value/expiry
-// metadata plus the links and policy state used by LRU, LFU and SieveTinyLFU so
-// policy maintenance does not allocate wrapper nodes.
+// cacheItem stores a value and the links used by the eviction policies.
 //
-// Reader-visible fields (key, hash, value, expireTime) are written before the
-// item is published into the table and never mutated afterwards: lock-free reads
-// may hold an item past its eviction so a value update allocates a fresh item
-// rather than mutating in place, and evicted items are reclaimed by the GC rather
-// than pooled.
+// Fields read without a lock are immutable after publication. A lock-free reader
+// may retain an item after eviction, so updates allocate a new item and the
+// garbage collector reclaims old ones.
 type cacheItem[K comparable, V any] struct {
 	value      V
-	expireTime int64 // cache-relative monotonic ns; 0 => no expiration
-	cost       int64 // weigher-reported capacity cost
+	expireTime int64 // monotonic nanoseconds since cache creation; 0 means no expiry
+	cost       int64
 	prev       *cacheItem[K, V]
 	next       *cacheItem[K, V]
-	key        K // original key for deletions
+	key        K
 	hash       uint64
-	queue      sieveQueueID // which SIEVE queue role owns this (queueNone = unlinked)
+	queue      sieveQueueID
 	queueOwner uint8
 	reuse      uint8
-	// unpublished marks a SieveTinyLFU candidate that is live in the policy
-	// queues but not yet stored in the table: admission is still deciding its
-	// fate, so there is no slot to reclaim on removal.
+	// unpublished marks a candidate in a SIEVE queue but not yet in the table.
 	unpublished bool
 	visited     uint32
 }
 
 type shard[K comparable, V any] struct {
-	// read-path hot: read on every Get - tab for the lookup, cap for the
-	// warmup gate, sieve on a hit. Pinned to their own cache line, away from the
-	// writer's mutex and the size/cost counters below, so a concurrent write
-	// does not invalidate the line readers depend on.
+	// These fields share a cache line because every lock-free Get reads them.
 	tab   *htable[K, V]
 	sieve *sieveTinyLFU[K, V]
 	cap   int64 // resident item limit for this shard; 0 => unlimited
 	_     [cacheLinePadding]byte
 
-	mu      sync.RWMutex     // serializes writers (and cold scans); reads of tab are lock-free
-	stats   *stats           // shared per-P telemetry
-	costCap int64            // resident cost limit for this shard; 0 => unlimited
-	queue   *mpscQueue[K, V] // async mutation transport consumed by this shard's worker
+	mu      sync.RWMutex // serializes writers and scans
+	stats   *stats
+	costCap int64 // resident cost limit for this shard; 0 => unlimited
+	queue   *mpscQueue[K, V]
 
-	// worker's wake-up: producers ping it after enqueuing a
-	// write and read sampling pings it when a stripe fills. Buffered size 1.
+	// wake has capacity one and is shared by writes and full read-sample rings.
 	wake chan struct{}
 
-	// lets synchronous callers help drain their own shard while keeping the queue
-	// single-consumer.
+	// drainMu ensures there is only one queue consumer.
 	drainMu    sync.Mutex
 	writeBatch []writeCommand[K, V]
 
-	// BP-Wrapper read sampling (SieveTinyLFU only). Readers push access
-	// fingerprints into readBuf without taking the shard lock; the write worker
-	// drains them into the frequency sketch on each wake.
+	// SieveTinyLFU readers append key hashes here without taking the shard lock.
 	readBuf readBuffer
 
-	// LRU list sentinels (head.next = MRU, tail.prev = LRU).
-	// head.prev == nil, tail.next == nil, and the head-to-tail chain is linked.
+	// Shared list for LRU, LFU, and FIFO. head.next is newest; tail.prev is oldest.
 	head *cacheItem[K, V]
 	tail *cacheItem[K, V]
 
-	lfuList *lfuList[K, V] // allocated only for pure LFU policy.
+	lfuList *lfuList[K, V]
 
 	size int64 // live items
 	cost int64 // live item cost
 
-	// removal notification staging, used only when the cache has at least one
-	// listener (removeWake is the shared worker wakeup, nil otherwise). dropItem
-	// and cleanup append removed (key, value, reason) to removeBuf under
-	// mu; the notify worker drains it after the lock is released. removePending
-	// lets the worker skip shards with nothing staged without taking the lock.
+	// Removed entries are buffered under mu and delivered after releasing it.
+	// removeWake is nil when no listener is registered.
 	removeWake       chan struct{}
 	removeNotifyMask removalNotifyMask
 	removeBuf        []removedEntry[K, V]
 	removePending    atomic.Bool
 }
 
-// itemDropMode selects which policy owns an item's intrusive links.
-// Sieve and LFU maintain extra metadata, so generic removal must know which
-// unlink path keeps auxiliary state consistent with data.
+// itemDropMode selects the policy state that must be unlinked with an item.
 type itemDropMode uint8
 
 const (
@@ -94,8 +75,6 @@ const (
 	dropSieve
 )
 
-// dropModeFor maps an eviction policy to the unlink path that keeps its
-// auxiliary state consistent.
 func dropModeFor(policy EvictionPolicy) itemDropMode {
 	switch policy {
 	case LFU:
@@ -107,10 +86,8 @@ func dropModeFor(policy EvictionPolicy) itemDropMode {
 	}
 }
 
-// dropItem removes a resident item from the table and unlinks its policy metadata.
-// removeExact rejects stale queue/hand pointers (it removes only when the slot still
-// holds exactly this item) and frees the slot in one probe, so the downstream
-// unlinks always operate on a confirmed resident.
+// dropItem removes an item from the table and its eviction policy. removeExact
+// protects against stale policy pointers.
 func (s *shard[K, V]) dropItem(
 	item *cacheItem[K, V],
 	statsEnabled bool,
@@ -120,9 +97,7 @@ func (s *shard[K, V]) dropItem(
 	if item == nil {
 		return false
 	}
-	// an unpublished SieveTinyLFU candidate was never stored, so it has no table slot
-	// to reclaim; unlink policy-only. Every other item is a confirmed resident that
-	// removeExact frees.
+	// An unpublished candidate has policy state but no table slot.
 	if item.unpublished {
 		item.unpublished = false
 	} else if !s.tab.removeExact(item) {
@@ -165,17 +140,13 @@ func (s *shard[K, V]) stageRemoval(key K, value V, reason RemovalReason) bool {
 	return true
 }
 
-// belowSieveWarmup reports the initial fill phase for bounded SieveTinyLFU
-// shards. During warmup admission is unconditional so the cache can seed resident
-// state before the frequency sketch starts rejecting candidates.
+// belowSieveWarmup reports whether admission is still unconditional.
 func (s *shard[K, V]) belowSieveWarmup() bool {
 	return s.cap > 0 && atomic.LoadInt64(&s.size)*2 < s.cap
 }
 
-// sampleRead records a read access into the per-shard read buffer. On backlog (the
-// consumer a full window behind) the reader drains that one stripe itself if it can
-// claim the single-consumer token without blocking, else it wakes the worker. Below
-// backlog this is just the buffer append.
+// sampleRead buffers a read. When its ring fills, the reader drains it if the
+// consumer lock is free; otherwise it wakes the worker.
 func (s *shard[K, V]) sampleRead(h, id uint64) {
 	if s.wake == nil {
 		return
@@ -189,14 +160,11 @@ func (s *shard[K, V]) sampleRead(h, id uint64) {
 		s.drainMu.Unlock()
 		return
 	}
-	signal(s.wake) // may already be pending
+	signal(s.wake)
 }
 
-// drainReadSamples replays the dirty stripes buffered read fingerprints into
-// the frequency sketch. The dirty mask keeps the usual quiescent check to a
-// single load. A bit is cleared only once its stripe turns out to be quiet,
-// so a busy stripe costs no mask writes and a producer racing the clear
-// rearms the bit on its next sample.
+// drainReadSamples adds pending read hashes to the frequency sketch. A dirty bit
+// stays set while its ring remains busy.
 func (s *shard[K, V]) drainReadSamples() {
 	p := s.sieve
 	if p == nil {
@@ -215,9 +183,7 @@ func (s *shard[K, V]) drainReadSamples() {
 	}
 }
 
-// drainStripe replays one stripe's fingerprints into the sketch.
-// When producers have lapped the consumer only the most recent window survives.
-// Older samples are dropped.
+// drainStripe adds the newest ring window to the sketch and drops older samples.
 func (s *shard[K, V]) drainStripe(p *sieveTinyLFU[K, V], st *readStripe) {
 	t := st.tail.Load()
 	h := st.head.Load()
@@ -269,9 +235,7 @@ func (s *shard[K, V]) moveToLRUHead(item *cacheItem[K, V]) {
 	s.addToLRUHead(item)
 }
 
-// cleanup expires items under the shard lock through the same dropItem path as
-// normal deletion. It collects the expired items first so the scan phase stays
-// separate from unlinking and removal.
+// cleanup collects expired items, then removes them through the normal policy path.
 func (s *shard[K, V]) cleanup(now int64, evictionPolicy EvictionPolicy, statsEnabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

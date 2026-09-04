@@ -8,8 +8,7 @@ import (
 var (
 	// ErrCacheExists is returned when registering a name that already has a configuration.
 	ErrCacheExists = errors.New("cache already exists")
-	// ErrCacheNotRegistered is returned by GetCache for a name with no live instance
-	// and no registered config; use GetCacheWithConfig to get-or-create.
+	// ErrCacheNotRegistered is returned when GetCache has no registration for a name.
 	ErrCacheNotRegistered = errors.New("cache not registered")
 	// ErrTypeMismatch is returned when a cached instance's type parameters differ from those requested.
 	ErrTypeMismatch = errors.New("cache type mismatch")
@@ -23,7 +22,7 @@ var (
 	ErrItemTooLarge = errors.New("cache item cost exceeds shard budget")
 )
 
-// CacheError describes a failure from a named cache operation (register, get, close).
+// CacheError describes a failed operation on a named cache.
 type CacheError struct {
 	Op    string
 	Name  string
@@ -49,7 +48,7 @@ func newCacheError(op, name string, cause error) *CacheError {
 	}
 }
 
-// ConfigError describes an invalid configuration field; it unwraps to ErrInvalidConfig.
+// ConfigError describes an invalid configuration field. It unwraps to ErrInvalidConfig.
 type ConfigError struct {
 	Field  string
 	Value  any
