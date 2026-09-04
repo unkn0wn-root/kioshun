@@ -42,24 +42,20 @@ import (
 )
 
 func main() {
-    // Create cache with default configuration
     c := kioshun.NewDefault[string, string]()
     defer c.Close()
 
-    // Set with default TTL (30 min)
     c.Set("user:123", "David", kioshun.DefaultExpiration)
 
-    // Set commits the write before returning so the key is immediately readable.
+    // Set returns after the value is readable.
     c.Set("user:456", "John", kioshun.NoExpiration)
 
-    // SetAsync returns early. It may commit inline when the shard is idle
-    // otherwise it queues the write for that shard's worker.
+    // SetAsync may queue the write.
     c.SetAsync("user:789", "Paul", 5*time.Minute)
 
-    // Optional: call Sync() when committed visibility is required.
+    // Sync waits for all accepted writes.
     c.Sync()
 
-    // Get value
     if value, found := c.Get("user:123"); found {
         fmt.Printf("User: %s\n", value)
     }
@@ -90,7 +86,7 @@ config.DefaultTTL = time.Hour
 
 c, err := kioshun.New[string, string](config)
 if err != nil {
-    // handle error
+	panic(err)
 }
 ```
 
@@ -118,7 +114,7 @@ c.Close() error
 ```
 
 > `Set` is synchronous and gives immediate 'read-after-write' visibility for the key.
-> `SetAsync` is optional - it may have committed inline already or it may still be queued.
+> `SetAsync` is optional. It may have committed inline already or it may still be queued.
 > Use `Sync` when committed visibility is required.
 
 ## HTTP Middleware
@@ -132,7 +128,7 @@ config.MaxSize = 100000
 
 middleware, err := httpcache.New(config)
 if err != nil {
-    // handle error
+	panic(err)
 }
 defer middleware.Close()
 
@@ -158,7 +154,7 @@ plotted as a percentage of the Belady optimum.
 
 ![Hit ratio vs throughput](benchmarks/chart/spot.svg)
 
-The 100k entry cap.
+Results at the 100,000-entry limit:
 
 | trace | OPT | kioshun | theine | otter | ristretto |
 |---|---|---|---|---|---|

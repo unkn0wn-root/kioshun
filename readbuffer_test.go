@@ -39,7 +39,6 @@ func TestReadBufferSampleThenDrainFeedsSketch(t *testing.T) {
 
 func TestReadBufferDrainEmptyIsNoop(t *testing.T) {
 	s := newReadTestShard(t, 64)
-	// Draining with nothing buffered must not panic or advance the sketch.
 	s.drainReadSamples()
 	if got := s.sieve.estimate(123); got != 0 {
 		t.Fatalf("estimate=%d after empty drain, want 0", got)
@@ -50,8 +49,7 @@ func TestReadBufferLossyOverflowDrainsRecentWindow(t *testing.T) {
 	s := newReadTestShard(t, 64)
 	h := uint64(99)
 
-	// Push far more than total ring capacity; producers overwrite older slots.
-	// The drain must stay bounded and still replay the most recent window.
+	// Overrun the rings and verify the newest window still drains.
 	total := readStripeSlots * (len(s.readBuf.stripes) + 4) * 8
 	for range total {
 		s.readBuf.sample(h, stripeID())
@@ -61,14 +59,12 @@ func TestReadBufferLossyOverflowDrainsRecentWindow(t *testing.T) {
 	if got := s.sieve.estimate(h); got == 0 {
 		t.Fatal("expected the recent-sample window to reach the sketch")
 	}
-	// A second drain should be a clean no-op (slots were cleared).
 	s.drainReadSamples()
 }
 
 func TestReadBufferZeroHashMappedToSentinel(t *testing.T) {
 	s := newReadTestShard(t, 64)
-	// hash 0 collides with the empty-slot sentinel; sample() remaps it to 1 so
-	// it is not silently dropped by the drain.
+	// Hash 0 must not be mistaken for an empty sample slot.
 	for range 30 {
 		s.readBuf.sample(0, stripeID())
 	}
@@ -119,7 +115,6 @@ func TestReadBufferConcurrentSampleDrain(t *testing.T) {
 		}(g)
 	}
 
-	// Single consumer drains repeatedly, mirroring the write worker.
 	deadline := time.After(150 * time.Millisecond)
 	for {
 		select {
@@ -156,7 +151,7 @@ func TestReadHitsDrainWithoutBreakingCache(t *testing.T) {
 			t.Fatalf("read %d: got (%d,%v), want (%d,true)", i, v, ok, key)
 		}
 	}
-	// Interleave a write so the worker drains read samples alongside writes.
+	// A write wakes the worker and causes it to drain read samples too.
 	c.Set(key, key+1, time.Hour)
 	if err := c.Sync(); err != nil {
 		t.Fatal(err)

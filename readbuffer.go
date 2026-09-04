@@ -8,41 +8,31 @@ import (
 )
 
 const (
-	// readStripeSlots is how many access fingerprints a stripe buffers before
-	// producers begin overwriting the oldest unread sample.
-	// Note: must be 2^n.
+	// readStripeSlots must be a power of two.
 	readStripeSlots = 64
 	readSlotMask    = readStripeSlots - 1
 
-	// caps per-shard striping.
-	// Must stay <= 32 so one uint32 can hold a dirty bit per stripe.
+	// maxReadStripes must be at most 32 because dirty uses one bit per stripe.
 	maxReadStripes = 16
 )
 
-// readStripe is a "lossy" multi-producer/single-consumer ring of access
-// fingerprints (key hashes). Readers append wait-free; the shard's write worker
-// is the only consumer. When producers outrun the consumer the oldest samples
-// are overwritten - acceptable because samples only feed the frequency sketch,
-// where a dropped sample costs a little accuracy but never correctness.
+// readStripe is a lossy ring of key hashes with many producers and one consumer.
+// Readers never wait. If they overtake the consumer, old samples are discarded;
+// this affects frequency estimates but not cache correctness.
 type readStripe struct {
 	tail atomic.Uint64
 	head atomic.Uint64
 	buf  [readStripeSlots]atomic.Uint64
 }
 
-// readBuffer is the per-shard BP-Wrapper read buffer: a small set of striped
-// rings indexed by a per-P stripe id to reduce contention on hot shards. The
-// zero value is unused (no stripes).
+// readBuffer spreads a shard's read samples across rings to reduce contention.
 type readBuffer struct {
 	stripes []readStripe
 	mask    uint64
 
-	// dirty has one bit per stripe: producers set it on a stripe's first sample, the
-	// consumer clears it only when the stripe turns out quiet. The write path's
-	// constant "any samples pending?" check is then one word, not a walk over every
-	// stripe's cursors, and a busy stripe's bit just stays set (no steady-state
-	// read-modify-write). Lossy: a sample racing the clear is delayed to the next
-	// sample, not lost.
+	// dirty lets the consumer find rings with pending samples in one load. A
+	// producer sets its ring's bit; the consumer clears it only when the ring is
+	// empty. A sample that races the clear is picked up after the next sample.
 	dirty atomic.Uint32
 }
 
@@ -54,12 +44,9 @@ func newReadBuffer() readBuffer {
 	}
 }
 
-// sample records an access fingerprint into the stripe picked by the caller's id
-// and returns that stripe's index plus whether the consumer has fallen a full window
-// behind. Past readStripeSlots of backlog, producers overwrite unread samples, so
-// the caller drains that stripe or wakes the worker. The head load is a hint (head
-// only advances): a stale read may over-report backlog and cause an extra drain, but
-// cannot hide a full window. Lossy by design.
+// sample stores a key hash and reports when the consumer is a full ring behind.
+// Its head read may be stale, which can request an unnecessary drain but cannot
+// hide a full ring.
 func (rb *readBuffer) sample(h, id uint64) (stripe int, needDrain bool) {
 	if h == 0 {
 		h = 1

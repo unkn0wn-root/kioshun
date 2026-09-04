@@ -13,12 +13,10 @@ const (
 	writeBarrier
 )
 
-// inlineAckBuf sizes the stack allocated ack slice so small batches avoid a heap alloc.
+// inlineAckBuf keeps acknowledgements for small batches on the stack.
 const inlineAckBuf = 8
 
-// writeCommand is the shard write-queue payload.
-// Plain Set keeps its hot fields inline.
-// Callback data stays behind extra so the common path avoids it.
+// writeCommand keeps fields used by every Set inline. Callback data is optional.
 type writeCommand[K comparable, V any] struct {
 	key        K
 	value      V
@@ -30,7 +28,6 @@ type writeCommand[K comparable, V any] struct {
 	extra      *writeExtra[K, V]
 }
 
-// writeExtra holds the cold fields of a write command.
 type writeExtra[K comparable, V any] struct {
 	callback func(K, V)
 }
@@ -46,8 +43,7 @@ type callbackTask[K comparable, V any] struct {
 	callback   func(K, V)
 }
 
-// newCallbackTask returns the expiry callback task for a committed Set, with
-// ok=false when the command did not commit, never expires, or has no callback.
+// newCallbackTask returns a task only for a committed Set with an expiry callback.
 func (cmd *writeCommand[K, V]) newCallbackTask(committed bool) (callbackTask[K, V], bool) {
 	if !committed || cmd.expireTime <= 0 || cmd.extra == nil || cmd.extra.callback == nil {
 		return callbackTask[K, V]{}, false
@@ -71,18 +67,12 @@ func (c *Cache[K, V]) set(key K, value V, ttl time.Duration, callback func(K, V)
 	return c.enqueue(s, cmd)
 }
 
-// tryApplyInline applies a Set synchronously when the shard is completely
-// uncontended: the drain token is free, the write queue is fully quiescent (no slot
-// reserved or published), and the shard lock is immediately available. Inline apply
-// gives immediate read-after-write visibility and skips the async handoff that would
-// otherwise let a re-read miss the not-yet-applied write and enqueue a redundant Set.
+// tryApplyInline applies a Set immediately when the queue and shard are idle. This
+// gives read-after-write visibility without making SetAsync wait under contention.
 //
-// Holding the drain token makes this the sole consumer and quiescent rules out any
-// accepted-but-unpublished write, so applying ahead of the queue cannot reorder
-// against a queued write; mirroring the worker's drain order (buffered reads replay
-// into the sketch before admission) makes the inline Set decide admission identically.
-// Every acquisition is non-blocking, so contention just returns false and leaves the
-// write for the async queue, preserving the SetAsync contract and write batching.
+// The drain lock makes this the only consumer, and the second empty check rules out
+// a producer that reserved a slot in the meantime. Read samples are drained first
+// to preserve the worker's admission order. Every lock attempt is non-blocking.
 func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	if !s.queue.quiescent() {
 		return false
@@ -169,8 +159,7 @@ func (c *Cache[K, V]) itemCost(key K, value V) (int64, error) {
 	return cost, nil
 }
 
-// enqueue is the async producer boundary: closed caches fail immediately and a
-// full queue applies backpressure until the shard worker frees space.
+// enqueue waits for space when the shard's write queue is full.
 func (c *Cache[K, V]) enqueue(s *shard[K, V], cmd writeCommand[K, V]) error {
 	if c.isClosed() {
 		return ErrCacheClosed
@@ -178,8 +167,7 @@ func (c *Cache[K, V]) enqueue(s *shard[K, V], cmd writeCommand[K, V]) error {
 	return s.queue.enqueue(cmd)
 }
 
-// awaitResult waits for a command's ack, abandoning the wait if the cache shuts
-// down so callers never hang on a command that won't be processed.
+// awaitResult stops waiting if the cache closes.
 func (c *Cache[K, V]) awaitResult(ch chan struct{}) error {
 	select {
 	case <-ch:
@@ -201,10 +189,8 @@ func (c *Cache[K, V]) releaseWriteWaiter(waiter *writeWaiter) {
 	c.waiterPool.Put(waiter)
 }
 
-// syncMutate is the synchronous write path shared by Set and Delete. It
-// takes drainMu (the queue's single-consumer token), flushes queued writes so
-// the direct mutation observes prior writes in order, then mutates under the
-// shard lock.
+// syncMutate drains earlier writes before applying a direct mutation under the
+// shard lock. drainMu keeps queue consumption ordered.
 func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 	if c.isClosed() {
 		return ErrCacheClosed
@@ -262,14 +248,11 @@ func (c *Cache[K, V]) enqueueAllAndWait(op writeOp) error {
 	return c.enqueueAllShardsAndWait(op)
 }
 
-// flush drains every shard's accepted writes during shutdown
 func (c *Cache[K, V]) flush() {
 	_ = c.enqueueAllShardsAndWait(writeBarrier)
 }
 
-// enqueueAllShardsAndWait pushes op to every shard and waits for each ack,
-// giving an ordered fence: all writes a shard accepted before its op are
-// applied before this returns. Waits abandon on shutdown via awaitResult.
+// enqueueAllShardsAndWait places an ordered barrier on every shard.
 func (c *Cache[K, V]) enqueueAllShardsAndWait(op writeOp) error {
 	waiters := make([]*writeWaiter, 0, len(c.shards))
 	for _, s := range c.shards {
@@ -310,12 +293,8 @@ func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 	for {
 		select {
 		case <-s.wake:
-			// Drain, then re-arm under the wake-coalescing protocol. Clearing wakeState
-			// before re-checking ready() makes a missed signal impossible: a producer
-			// publishing after this drain either becomes visible to ready() (the loop
-			// re-arms and drains it) or finds wakeState 0 and sends a fresh token. A
-			// failed re-arm CAS means a producer left a token, so break and let the next
-			// select consume it.
+			// Clear wakeState before checking the ring. A concurrent producer is then
+			// either visible to ready or responsible for sending a new wake-up.
 			for {
 				c.drainShard(s)
 				s.queue.wakeState.Store(0)
@@ -327,16 +306,14 @@ func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 				}
 			}
 		case <-c.closeCh:
-			// final drain catches any writes accepted during shutdown then exit.
+			// Process writes accepted before shutdown.
 			c.drainShard(s)
 			return
 		}
 	}
 }
 
-// tryDrainShard replays sampled reads, then applies queued writes in batches,
-// without blocking behind another active drain. Reads replay
-// first (and between batches) so admission/eviction sees current frequencies.
+// tryDrainShard processes read samples and queued writes if no drain is active.
 func (c *Cache[K, V]) tryDrainShard(s *shard[K, V]) {
 	if !s.drainMu.TryLock() {
 		return
@@ -351,12 +328,8 @@ func (c *Cache[K, V]) drainShard(s *shard[K, V]) {
 	s.drainMu.Unlock()
 }
 
-// drainMissAndLookup restores read-after-write visibility for the lock-free read
-// path. A SieveTinyLFU read never waits for the write worker, so a miss may be a Set
-// still queued for this shard. When the queue is non-empty it drains (without
-// blocking - only if it can claim the single-consumer token) and re-checks, so a Get
-// racing a Set of the same key still observes it. Writes stay batched; the catch-up
-// cost is paid only on the miss path, where a stale miss would re-enqueue a Set.
+// drainMissAndLookup checks whether a lock-free miss is a queued Set. It drains
+// only when it can take the consumer lock without waiting.
 func (c *Cache[K, V]) drainMissAndLookup(s *shard[K, V], kh uint64, key K) (*cacheItem[K, V], bool) {
 	if s.queue.quiescent() || !s.drainMu.TryLock() {
 		return nil, false
@@ -366,8 +339,6 @@ func (c *Cache[K, V]) drainMissAndLookup(s *shard[K, V], kh uint64, key K) (*cac
 	return s.tab.lookup(kh, key)
 }
 
-// drainShardQueue consumes read samples and queued writes. The caller must hold
-// s.drainMu so there is only one shard consumer.
 func (c *Cache[K, V]) drainShardQueue(s *shard[K, V]) {
 	batch := s.writeBatch
 
@@ -430,9 +401,7 @@ func (c *Cache[K, V]) stampExpireTimeNow(cmd *writeCommand[K, V]) {
 	}
 }
 
-// newItem allocates a populated item for cmd. Items are not pooled: lock-free
-// reads may hold an evicted item, so the GC owns reclamation. Zero-valued fields
-// (list links, visited) start clean.
+// newItem does not use a pool because lock-free readers may retain evicted items.
 func (c *Cache[K, V]) newItem(cmd *writeCommand[K, V]) *cacheItem[K, V] {
 	return &cacheItem[K, V]{
 		value:      cmd.value,
@@ -443,14 +412,12 @@ func (c *Cache[K, V]) newItem(cmd *writeCommand[K, V]) *cacheItem[K, V] {
 	}
 }
 
-// applySet mutates shard contents and policy state. The caller must hold s.mu.
 func (c *Cache[K, V]) applySet(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	if s.sieve != nil {
 		return c.applySieve(s, cmd)
 	}
 
-	// non-Sieve policies look up first so an existing key updates in place, and
-	// evict before inserting so the new item is not selected.
+	// Evict before insert so the new item cannot be selected as the victim.
 	if ex, exists := s.tab.lookup(cmd.hash, cmd.key); exists {
 		return c.applyUpdate(s, cmd, ex)
 	}
@@ -471,19 +438,14 @@ func (c *Cache[K, V]) applySet(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	return true
 }
 
-// applySieve is the SieveTinyLFU write path. probe makes the insert/update decision
-// in one walk: an update swaps the new immutable item in place, an insert is
-// published late. A candidate runs admission while live in the policy queues but
-// absent from the table, so a rejected one is unlinked policy-only - never stored,
-// never tombstoned, never visible to a lock-free Get. Only an admitted candidate is
-// published, at the slot probe located. Caller must hold s.mu.
+// New candidates enter the policy before the table, so rejection never exposes
+// them to lock-free readers or creates a deleted slot.
 func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 	warmup := s.belowSieveWarmup()
 	prev, slot, cur := s.tab.probe(cmd.hash, cmd.key)
 
 	if prev != nil {
-		// update: swap a fresh immutable item into the slot probe located and
-		// carry policy state across.
+		// Publish an immutable replacement and preserve its policy position.
 		item := c.newItem(cmd)
 		s.tab.swapAt(slot, item)
 		if d := cmd.cost - prev.cost; d != 0 {
@@ -497,8 +459,7 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 		return true
 	}
 
-	// insert: hold the candidate out of the table until admission decides its
-	// fate.
+	// Keep the candidate out of the table until admission decides its fate.
 	ghostHit := !warmup && s.sieve.ghost.contains(cmd.hash)
 	item := c.newItem(cmd)
 	item.unpublished = true
@@ -519,17 +480,14 @@ func (c *Cache[K, V]) applySieve(s *shard[K, V], cmd *writeCommand[K, V]) bool {
 		s.sieve.stats.Admits++
 		return true
 	}
-	// rejected: enforceSieveCapacity already unlinked the candidate and decremented
-	// size (unpublished-aware drop); nothing was stored, so release the probe barrier.
+	// Rejection already unlinked the candidate, so release its reserved table slot.
 	s.tab.unpin()
 	s.sieve.stats.Rejects++
 	return false
 }
 
-// applyUpdate updates an existing resident in place for LRU/LFU/FIFO, whose reads
-// hold the shard lock. SieveTinyLFU updates go through applySieve, which must
-// publish a fresh immutable item instead (a lock-free reader may hold the old
-// one). The caller must hold s.mu.
+// applyUpdate changes an item for policies whose reads hold the shard lock.
+// SieveTinyLFU uses applySieve because its published items are immutable.
 func (c *Cache[K, V]) applyUpdate(s *shard[K, V], cmd *writeCommand[K, V], ex *cacheItem[K, V]) bool {
 	costDelta := cmd.cost - ex.cost
 	ex.value = cmd.value
@@ -549,8 +507,6 @@ func (c *Cache[K, V]) applyUpdate(s *shard[K, V], cmd *writeCommand[K, V], ex *c
 	return true
 }
 
-// enforcePostUpdateCapacity restores capacity after updating an existing item.
-// The caller must hold s.mu.
 func (c *Cache[K, V]) enforcePostUpdateCapacity(s *shard[K, V]) {
 	if !s.overCapacity() {
 		return
@@ -564,7 +520,6 @@ func (c *Cache[K, V]) enforcePostUpdateCapacity(s *shard[K, V]) {
 	}
 }
 
-// deleteKey removes key from a shard. The caller must hold s.mu.
 func (c *Cache[K, V]) deleteKey(s *shard[K, V], kh uint64, key K) bool {
 	item, exists := s.tab.lookup(kh, key)
 	if !exists {
@@ -574,7 +529,6 @@ func (c *Cache[K, V]) deleteKey(s *shard[K, V], kh uint64, key K) bool {
 	return true
 }
 
-// clearShard resets a shard's contents and policy state. The caller must hold s.mu.
 func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 	s.tab.clear()
 	if s.sieve == nil {

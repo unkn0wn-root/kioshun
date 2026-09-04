@@ -9,23 +9,17 @@ const (
 	sketchCounterBits     = 4
 	sketchCounterMask     = (1 << sketchCounterBits) - 1
 	sketchMaxCounter      = sketchCounterMask
-	// Aging shifts packed counters right by one. Keep the low bits of each
-	// counter and clear bits that shifted across counter boundaries.
+	// The mask clears bits that cross counter boundaries during aging.
 	sketchCounterAgingMask = (^uint64(0) / sketchCounterMask) * (sketchCounterMask >> 1)
 
-	// counters are grouped into cache-line blocks of 8 words (128 4-bit
-	// counters). One access touches a single block - selected by the low bits
-	// of the caller's avalanched fingerprint - with the four row offsets taken
-	// from disjoint higher bit ranges so an add or estimate costs one hash and
-	// one cache line instead of four of each.
+	// Each estimate uses four counters in one cache-line-sized block. One mixed
+	// hash selects both the block and the four offsets.
 	sketchBlockWords    = 8
 	sketchBlockCounters = sketchBlockWords * sketchCountersPerWord
 )
 
-// doorkeeper is a 2-hash Bloom filter that absorbs first-time accesses so the
-// count-min sketch only spends counters on keys seen at least twice. Both probe
-// indexes derive from disjoint bit ranges of the caller's avalanched
-// fingerprint, sharing the one hash the sketch already needs.
+// doorkeeper is a two-hash Bloom filter. It keeps first accesses out of the
+// count-min sketch, saving its counters for keys seen more than once.
 type doorkeeper struct {
 	bits []uint64
 	mask uint64
@@ -42,9 +36,7 @@ func newDoorkeeper(n uint64) doorkeeper {
 	}
 }
 
-// add sets the doorkeeper bits and reports whether the fingerprint was already
-// present. Callers use the return value to keep first-time accesses out of the
-// heavier count-min sketch.
+// add records a hash and reports whether both bits were already set.
 func (d *doorkeeper) add(av uint64) bool {
 	if len(d.bits) == 0 {
 		return true
@@ -82,10 +74,8 @@ func (d *doorkeeper) set(i uint64) {
 	d.bits[i/64] |= uint64(1) << (i % 64)
 }
 
-// countMinSketch estimates access frequency in 4-bit saturating counters packed
-// 16 per word and grouped into cache-line blocks. Counters periodically halve
-// (age) so the estimate tracks a sliding window of popularity rather than
-// all-time totals.
+// countMinSketch estimates access frequency with packed 4-bit counters. Aging
+// periodically halves them so old activity fades.
 type countMinSketch struct {
 	counters  []uint64
 	blockMask uint64
@@ -93,8 +83,6 @@ type countMinSketch struct {
 	resetAt   uint64
 }
 
-// newCountMinSketch rounds the logical counter count to a power of two so block
-// selection can use a mask instead of modulo.
 func newCountMinSketch(n uint64) countMinSketch {
 	if n < sketchMinCounters {
 		n = sketchMinCounters
@@ -109,9 +97,7 @@ func newCountMinSketch(n uint64) countMinSketch {
 	}
 }
 
-// add increments all four rows only while the estimated frequency is below the
-// saturation limit. Once the estimate reaches the 4-bit maximum, extra accesses
-// are ignored until aging makes room again.
+// add increments all four counters until the estimate reaches its 4-bit limit.
 func (s *countMinSketch) add(av uint64) {
 	if len(s.counters) == 0 {
 		return
@@ -133,12 +119,8 @@ func (s *countMinSketch) estimate(av uint64) uint8 {
 	return s.minCounter(s.indexes(av))
 }
 
-// indexes maps av to four counter cells inside one block. The block comes from the
-// low bits; the in-block offsets start at bit 21, clear of the block mask up to 2^21
-// blocks (256M counters - far beyond any per-shard sketch). Past that the first
-// offset shares bits with block selection (a mild correlation, not an error), and
-// two offsets can collide on one cell, costing a row - both small next to the single
-// cache line per access.
+// indexes maps a mixed hash to four counters in one block. Block and offset bits
+// do not overlap for any practical per-shard sketch size.
 func (s *countMinSketch) indexes(av uint64) [4]uint64 {
 	base := (av & s.blockMask) * sketchBlockCounters
 	return [4]uint64{
@@ -158,8 +140,7 @@ func (s *countMinSketch) minCounter(idx [4]uint64) uint8 {
 	)
 }
 
-// age halves every packed 4-bit counter in place. The mask removes shifted bits
-// that would otherwise leak from one counter nibble into the next.
+// age halves every counter without letting bits cross packed counter boundaries.
 func (s *countMinSketch) age() {
 	for i := range s.counters {
 		s.counters[i] = (s.counters[i] >> 1) & sketchCounterAgingMask
@@ -172,7 +153,6 @@ func (s *countMinSketch) clear() {
 	s.samples = 0
 }
 
-// locate resolves counter cell i to its word index and in-word bit shift.
 func locate(i uint64) (word, shift uint64) {
 	return i / sketchCountersPerWord, (i % sketchCountersPerWord) * sketchCounterBits
 }

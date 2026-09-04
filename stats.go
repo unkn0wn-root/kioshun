@@ -30,8 +30,7 @@ func (s *stats) stripe() *statStripe {
 	return &s.stripes[stripeID()&s.mask]
 }
 
-// recordHit reuses the caller's stripe id (the read path already holds one for the
-// read sample), avoiding a second stripeID call per hit. Rarer events fetch their own.
+// recordHit shares the stripe already chosen for the read sample.
 func (s *stats) recordHit(id uint64) { s.stripes[id&s.mask].hits.Add(1) }
 func (s *stats) recordMiss()         { s.stripe().misses.Add(1) }
 func (s *stats) recordEviction()     { s.stripe().evictions.Add(1) }

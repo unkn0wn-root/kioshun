@@ -22,16 +22,16 @@ func TestStripeIDAllocDistinctAndReuse(t *testing.T) {
 		seen[id] = true
 	}
 
-	// exhausted: overflow ids are consecutive and not tracked
+	// Overflow IDs are consecutive and are not tracked.
 	if id := a.acquire(); id != stripeIDCap {
 		t.Fatalf("first overflow id = %d, want %d", id, stripeIDCap)
 	}
 	if id := a.acquire(); id != stripeIDCap+1 {
 		t.Fatalf("second overflow id = %d, want %d", id, stripeIDCap+1)
 	}
-	a.release(stripeIDCap + 44) // overflow release is a no-op, must not corrupt the bitmap
+	a.release(stripeIDCap + 44)
 
-	// released ids come back lowest-first
+	// Released IDs are reused from the lowest available value.
 	a.release(7)
 	a.release(3)
 	if id := a.acquire(); id != 3 {
@@ -43,8 +43,7 @@ func TestStripeIDAllocDistinctAndReuse(t *testing.T) {
 }
 
 func TestStripeTokenCleanupReleasesID(t *testing.T) {
-	// Mint tokens without parking them in the pool, so the GC can collect
-	// them and the cleanup has to hand their ids back.
+	// Keep tokens out of the pool so garbage collection returns their IDs.
 	before := stripeIDs.acquire()
 	stripeIDs.release(before)
 
@@ -58,7 +57,7 @@ func TestStripeTokenCleanupReleasesID(t *testing.T) {
 		id := stripeIDs.acquire()
 		stripeIDs.release(id)
 		if id <= before {
-			return // the issued ids were handed back
+			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("lowest free id still %d after GC, want %d", id, before)
@@ -68,10 +67,8 @@ func TestStripeTokenCleanupReleasesID(t *testing.T) {
 }
 
 func TestStripeIDMaskedStable(t *testing.T) {
-	// The pool hands the parked token back, so back-to-back calls on one
-	// goroutine return one id. Preemption or a GC pool clear between two
-	// calls can legitimately swap the token, so require a stable pair within
-	// a few attempts rather than on the first.
+	// Preemption or a pool clear can replace a token, so allow several attempts
+	// to observe two calls using the same ID.
 	const mask = maxReadStripes - 1
 	for range 100 {
 		first := stripeID() & mask
@@ -84,11 +81,8 @@ func TestStripeIDMaskedStable(t *testing.T) {
 }
 
 func TestStripeTokenNotTinyBatched(t *testing.T) {
-	// Id reuse rides on runtime.AddCleanup, and the cleanup of a tiny
-	// pointer-free object may never run when the runtime batches it into a
-	// shared allocation block with something longer-lived. A pointer field
-	// keeps the token off the tiny-allocator path entirely; do not "simplify"
-	// it away or ids leak.
+	// The pointer prevents the runtime's tiny allocator from delaying cleanup
+	// and leaking IDs. Keep this check with stripeToken's matching comment.
 	typ := reflect.TypeOf(stripeToken{})
 	for i := range typ.NumField() {
 		if typ.Field(i).Type.Kind() == reflect.Pointer {

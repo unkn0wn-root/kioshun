@@ -6,21 +6,18 @@ import (
 	"sync"
 )
 
-// stripeIDCap is how many ids the allocator bitmap tracks, far above any realistic GOMAXPROCS.
 const (
 	stripeIDWords = 4
 	stripeIDCap   = stripeIDWords * 64
 )
 
-// stripeIDs hands out the lowest free index and reclaims it when the owning token
-// is GCed, so the indices held by live tokens stay distinct. Random indices would
-// not: with about as many producers as stripes, some would collide on a stripe and
-// bounce its cache line between cores.
+// stripeIDs keeps live tokens on different stripes when possible. Tokens return
+// their IDs when the garbage collector reclaims them.
 var stripeIDs stripeIDAlloc
 
 type stripeIDAlloc struct {
 	mu       sync.Mutex
-	used     [stripeIDWords]uint64 // bitmap of live ids 0..stripeIDCap-1
+	used     [stripeIDWords]uint64
 	overflow uint64
 }
 
@@ -34,8 +31,7 @@ func (a *stripeIDAlloc) acquire() uint64 {
 			return uint64(w<<6 | b)
 		}
 	}
-	// All tracked ids are taken; hand out consecutive values instead.
-	// They still spread fine over any power-of-two stripe count.
+	// Consecutive overflow IDs still spread across a power-of-two stripe count.
 	id := stripeIDCap + a.overflow
 	a.overflow++
 	return id
@@ -50,20 +46,13 @@ func (a *stripeIDAlloc) release(id uint64) {
 	a.mu.Unlock()
 }
 
-// stripeTokens holds roughly one stripeToken per P: sync.Pool's private slot returns
-// the token last released on the current P, so repeated calls on the same P reuse
-// the same id and the stripe choice follows the P. One process-wide pool suffices -
-// the id only spreads producers across stripes. New tokens issue rarely (startup, or
-// after an idle P's token was collected), keeping the allocator mutex and cleanup
-// registration off the hot path.
+// sync.Pool usually returns the token last used on the current P. Reusing its ID
+// keeps work on the same stripe and avoids frequent allocation.
 var stripeTokens = sync.Pool{New: newStripeToken}
 
-// stripeToken has a pointer field for one reason: it keeps the token off the
-// runtime's tiny allocator which packs small pointer free objects into a
-// shared memory block. As long as anything in that block is still alive, the
-// dead objects in it are not collected and their cleanups may never run - for
-// us that would mean leaked token ids. Objects containing pointers are never
-// packed like this, no matter their size.
+// The pointer keeps stripeToken out of the runtime's tiny allocator. Tiny
+// pointer-free objects can share a block whose cleanup is delayed by another
+// live object, which would keep stripe IDs allocated indefinitely.
 type stripeToken struct {
 	idx uint64
 	_   *byte
@@ -75,11 +64,8 @@ func newStripeToken() any {
 	return t
 }
 
-// stripeID returns the caller's index into the striped structures (read-sample
-// rings, stat counters). Best-effort: a goroutine preempted between Get and Put, or
-// a GOMAXPROCS change, can leave two producers on the same stripe briefly. Every
-// striped consumer tolerates that, and callers mask the value so it cannot index out
-// of range.
+// stripeID returns an index for striped read buffers and counters. The mapping is
+// best effort: preemption or a GOMAXPROCS change can briefly share an index.
 func stripeID() uint64 {
 	t := stripeTokens.Get().(*stripeToken)
 	idx := t.idx
