@@ -140,11 +140,8 @@ http.Handle("/api/users", middleware.Wrap(usersHandler))
 
 ### Hit ratio and throughput
 
-Kioshun is compared against [Ristretto](https://github.com/dgraph-io/ristretto),
-[Otter](https://github.com/maypok86/otter) and [Theine](https://github.com/Yiling-J/theine-go)
-by replaying ARC and LIRS request traces (P3, P8, S3, DS1, OLTP, LOOP)
-through every cache in the **same harness** at a 100,000 entry cap. Hit ratio is
-plotted as a percentage of the Belady optimum.
+Kioshun is compared against [Ristretto](https://github.com/dgraph-io/ristretto), [Otter](https://github.com/maypok86/otter) and [Theine](https://github.com/Yiling-J/theine-go)
+by replaying ARC and LIRS request traces (P3, P8, S3, DS1, OLTP, LOOP) through every cache in the **same harness**.
 
 ![Hit ratio vs the Belady optimum](benchmarks/chart/hitratio_opt.svg)
 
@@ -154,7 +151,7 @@ plotted as a percentage of the Belady optimum.
 
 ![Hit ratio vs throughput](benchmarks/chart/spot.svg)
 
-Results at the 100,000-entry limit:
+Results at the 100,000 entry limit:
 
 | trace | OPT | kioshun | theine | otter | ristretto |
 |---|---|---|---|---|---|
@@ -179,8 +176,7 @@ Hit ratio as a percent of that ceiling:
 
 ### Microbenchmarks
 
-A separate suite compares Kioshun with Ristretto, BigCache, FreeCache and go-cache using
-pre-generated workloads with async and strict write modes reported separately:
+A separate suite compares Kioshun with Ristretto, BigCache, FreeCache and go-cache using pre-generated workloads with async and strict write modes reported separately:
 
 ```bash
 cd benchmarks
