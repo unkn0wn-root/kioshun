@@ -145,7 +145,7 @@ func TestNewDefaultsPartialConfigPerField(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/partial", nil)
-	shouldCache, ttl := middleware.policy(req, http.StatusOK, http.Header{}, []byte("body"))
+	shouldCache, ttl := middleware.policy(req, http.StatusOK, http.Header{"Cache-Control": {"public"}}, []byte("body"))
 	if !shouldCache {
 		t.Fatal("policy rejected default-size body")
 	}
@@ -172,7 +172,7 @@ func TestNewCanDisableCacheAndBodySizeLimits(t *testing.T) {
 
 	largeBody := bytes.Repeat([]byte("x"), int(DefaultConfig().MaxBodySize)+1)
 	req := httptest.NewRequest("GET", "/unlimited", nil)
-	shouldCache, ttl := middleware.policy(req, http.StatusOK, http.Header{}, largeBody)
+	shouldCache, ttl := middleware.policy(req, http.StatusOK, http.Header{"Cache-Control": {"public"}}, largeBody)
 	if !shouldCache {
 		t.Fatal("policy rejected large body with body size limit disabled")
 	}
@@ -194,7 +194,7 @@ func TestDefaultCachePolicyAllowsNoExpirationDefaultTTL(t *testing.T) {
 	policy := DefaultCachePolicy(Config{DefaultTTL: kioshun.NoExpiration})
 	req := httptest.NewRequest("GET", "/no-expiration", nil)
 
-	shouldCache, ttl := policy(req, http.StatusOK, http.Header{}, []byte("body"))
+	shouldCache, ttl := policy(req, http.StatusOK, http.Header{"Cache-Control": {"public"}}, []byte("body"))
 	if !shouldCache {
 		t.Fatal("DefaultCachePolicy rejected cacheable response")
 	}
@@ -207,7 +207,7 @@ func TestDefaultCachePolicyDefaultsZeroConfig(t *testing.T) {
 	policy := DefaultCachePolicy(Config{})
 	req := httptest.NewRequest("GET", "/zero", nil)
 
-	shouldCache, ttl := policy(req, http.StatusOK, http.Header{}, []byte("body"))
+	shouldCache, ttl := policy(req, http.StatusOK, http.Header{"Cache-Control": {"public"}}, []byte("body"))
 	if !shouldCache {
 		t.Fatal("DefaultCachePolicy(Config{}) rejected non-empty body")
 	}
@@ -239,6 +239,7 @@ func TestHTTPCacheMiddleware_CapturesImplicitStatusHeaders(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("response"))
 	})
@@ -268,8 +269,10 @@ func TestHTTPCacheMiddleware_IgnoresConfiguredHeaders(t *testing.T) {
 	middleware := newTestMiddleware(t, DefaultConfig())
 	defer middleware.Close()
 
+	date := time.Now().UTC().Format(http.TimeFormat)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Date", time.Now().Format(time.RFC1123))
+		w.Header().Set("Cache-Control", "max-age=60")
+		w.Header().Set("Date", date)
 		w.Header().Set("X-Request-Id", "request-1")
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
@@ -292,8 +295,8 @@ func TestHTTPCacheMiddleware_IgnoresConfiguredHeaders(t *testing.T) {
 	if rec2.Header().Get("X-Request-Id") != "" {
 		t.Fatalf("X-Request-Id=%q, want empty", rec2.Header().Get("X-Request-Id"))
 	}
-	if rec2.Header().Get("Date") != "" {
-		t.Fatalf("Date=%q, want empty", rec2.Header().Get("Date"))
+	if rec2.Header().Get("Date") != date {
+		t.Fatalf("Date=%q, want origin Date %q", rec2.Header().Get("Date"), date)
 	}
 	if rec2.Header().Get("Content-Type") != "text/plain" {
 		t.Fatalf("Content-Type=%q, want text/plain", rec2.Header().Get("Content-Type"))
@@ -310,6 +313,7 @@ func TestHTTPCacheMiddleware_LargeBodyIsNotCached(t *testing.T) {
 	middleware.OnSet(func(string, time.Duration) { setCount++ })
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("12345"))
 	})
@@ -334,6 +338,7 @@ func TestHTTPCacheMiddleware_FlushDisablesCaching(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.Write([]byte("part"))
 		w.(http.Flusher).Flush()
 		w.Write([]byte("tail"))
@@ -358,6 +363,7 @@ func TestHTTPCacheMiddleware_InformationalStatusDoesNotCommitFinalStatus(t *test
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Link", "</style.css>; rel=preload")
 		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusCreated)
 		w.Write([]byte("created"))
@@ -422,6 +428,7 @@ func TestHTTPCacheMiddleware_NonCacheableMethodBypassesCachedKey(t *testing.T) {
 
 	var calls int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		call := atomic.AddInt32(&calls, 1)
 		w.Write(fmt.Appendf(nil, "%s:%d", r.Method, call))
 	})
@@ -458,6 +465,7 @@ func TestHTTPCacheMiddleware_EvictionCleansPatternIndex(t *testing.T) {
 	middleware.SetKeyGenerator(KeyWithoutQuery())
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
@@ -487,6 +495,7 @@ func TestHTTPCacheMiddleware_InvalidateCleansPatternIndex(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
@@ -514,6 +523,7 @@ func TestHTTPCacheMiddleware_InvalidateByFunc(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
@@ -550,6 +560,7 @@ func TestHTTPCacheMiddleware_TTLExpiryCleansPatternIndex(t *testing.T) {
 	middleware.SetKeyGenerator(KeyWithoutQuery())
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
@@ -574,6 +585,7 @@ func TestHTTPCacheMiddleware_BasicCaching(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		w.Write([]byte(`{"message": "test"}`))
@@ -614,6 +626,7 @@ func TestHTTPCacheMiddleware_TTLExpiration(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})
@@ -710,6 +723,7 @@ func TestHTTPCacheMiddleware_KeyGenerator(t *testing.T) {
 	middleware.SetKeyGenerator(KeyWithUserID("X-User-ID"))
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})
@@ -766,6 +780,7 @@ func TestHTTPCacheMiddleware_Callbacks(t *testing.T) {
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})
@@ -800,21 +815,25 @@ func TestHTTPCacheMiddleware_CacheControlHeaders(t *testing.T) {
 
 	tests := []struct {
 		name         string
-		cacheControl string
+		cacheControl []string
 		expectCached bool
 	}{
-		{"no-cache-control", "", true},
-		{"max-age-300", "max-age=300", true},
-		{"no-cache", "no-cache", false},
-		{"no-store", "no-store", false},
-		{"private", "private", false},
+		{"no-cache-control", nil, false},
+		{"max-age-300", []string{"max-age=300"}, true},
+		{"max-age-0", []string{"max-age=0"}, false},
+		{"public", []string{"public"}, true},
+		{"s-maxage-60", []string{"s-maxage=60"}, true},
+		{"no-cache", []string{"no-cache"}, false},
+		{"no-store", []string{"no-store"}, false},
+		{"private", []string{"private"}, false},
+		{"split-line-private", []string{"max-age=60", "private"}, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if tt.cacheControl != "" {
-					w.Header().Set("Cache-Control", tt.cacheControl)
+				for _, cc := range tt.cacheControl {
+					w.Header().Add("Cache-Control", cc)
 				}
 				w.WriteHeader(200)
 				w.Write([]byte("response"))
@@ -885,6 +904,7 @@ func TestHTTPCacheMiddleware_Stats(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})
@@ -923,6 +943,7 @@ func TestHTTPCacheMiddleware_Clear(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})
@@ -972,8 +993,8 @@ func TestKeyGenerators(t *testing.T) {
 		key1 := DefaultKeyGenerator(req1)
 		key2 := DefaultKeyGenerator(req2)
 
-		if key1 == key2 {
-			t.Error("Different Accept headers should generate different keys")
+		if key1 != key2 {
+			t.Error("Request headers should not change the key, Vary tells variants apart")
 		}
 
 		if len(key1) != 32 || len(key2) != 32 {
@@ -1086,24 +1107,65 @@ func TestCachePolicies(t *testing.T) {
 	})
 }
 
-func TestExtractMaxAge(t *testing.T) {
+func TestCacheControlSeconds(t *testing.T) {
 	tests := []struct {
 		cacheControl string
+		directive    string
 		expected     time.Duration
+		found        bool
 	}{
-		{"", 0},
-		{"max-age=300", 300 * time.Second},
-		{"public, max-age=600", 600 * time.Second},
-		{"no-cache, max-age=300", 300 * time.Second},
-		{"max-age=invalid", 0},
-		{"no-cache", 0},
+		{"", "max-age", 0, false},
+		{"max-age=300", "max-age", 300 * time.Second, true},
+		{"public, max-age=600", "max-age", 600 * time.Second, true},
+		{"no-cache, max-age=300", "max-age", 300 * time.Second, true},
+		{"MAX-AGE=5", "max-age", 5 * time.Second, true},
+		{`max-age="60"`, "max-age", 60 * time.Second, true},
+		{`max-age=60"`, "max-age", 0, true},
+		{`max-age="60`, "max-age", 0, true},
+		{"max-age=99999999999", "max-age", (1 << 31) * time.Second, true},
+		{"max-age=99999999999999999999999", "max-age", (1 << 31) * time.Second, true},
+		{"max-age=60, max-age=0", "max-age", 60 * time.Second, true},
+		{"max-age=invalid", "max-age", 0, true},
+		{"max-age=-1", "max-age", 0, true},
+		{"max-age", "max-age", 0, true},
+		{"no-cache", "max-age", 0, false},
+		{"s-maxage=60", "max-age", 0, false},
+		{"max-age=60, s-maxage=10", "s-maxage", 10 * time.Second, true},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.cacheControl, func(t *testing.T) {
-			result := extractMaxAge(tt.cacheControl)
-			if result != tt.expected {
-				t.Errorf("Expected %v, got %v", tt.expected, result)
+		t.Run(tt.directive+" in "+tt.cacheControl, func(t *testing.T) {
+			result, found := cacheControlSeconds(tt.cacheControl, tt.directive)
+			if result != tt.expected || found != tt.found {
+				t.Errorf("got (%v, %v), want (%v, %v)", result, found, tt.expected, tt.found)
+			}
+		})
+	}
+}
+
+func TestInitialAge(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	date := func(d time.Duration) string { return now.Add(d).Format(http.TimeFormat) }
+	tests := []struct {
+		name     string
+		header   http.Header
+		expected time.Duration
+	}{
+		{"no Date or Age", http.Header{}, 0},
+		{"Date 10s ago", http.Header{"Date": {date(-10 * time.Second)}}, 10 * time.Second},
+		{"Date in the future", http.Header{"Date": {date(time.Hour)}}, 0},
+		{"Age", http.Header{"Age": {"120"}}, 120 * time.Second},
+		{"Date older than Age", http.Header{"Date": {date(-10 * time.Second)}, "Age": {"5"}}, 10 * time.Second},
+		{"Age list uses first member", http.Header{"Age": {"120, 30"}}, 120 * time.Second},
+		{"Age second field line ignored", http.Header{"Age": {"5", "120"}}, 5 * time.Second},
+		{"Age invalid", http.Header{"Age": {"abc"}}, 0},
+		{"Age overflow", http.Header{"Age": {"99999999999999999999"}}, (1 << 31) * time.Second},
+		{"Date in year 1", http.Header{"Date": {"Mon, 01 Jan 0001 00:00:00 GMT"}}, (1 << 31) * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := initialAge(tt.header, now); got != tt.expected {
+				t.Errorf("initialAge = %v, want %v", got, tt.expected)
 			}
 		})
 	}
@@ -1115,6 +1177,7 @@ func TestHTTPCacheMiddleware_PatternInvalidation(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response for " + r.URL.Path))
 	})
@@ -1183,6 +1246,7 @@ func TestHTTPCacheMiddleware_InvalidationEdgeCases(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})
@@ -1247,6 +1311,7 @@ func TestHTTPCacheMiddleware_CacheHitMissVerification(t *testing.T) {
 	middleware.OnMiss(func(key string) { missCount++ })
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})
@@ -1304,6 +1369,7 @@ func TestHTTPCacheMiddleware_ConcurrentInvalidation(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})
@@ -1357,6 +1423,7 @@ func TestHTTPCacheMiddleware_BasicPatternInvalidation(t *testing.T) {
 	defer middleware.Close()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
 		w.WriteHeader(200)
 		w.Write([]byte("response"))
 	})

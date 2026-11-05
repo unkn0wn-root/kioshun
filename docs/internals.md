@@ -424,22 +424,42 @@ Named caches are typed. Asking for the same name with a different `K, V` pair re
 - response body size limit
 - optional pattern index for invalidation
 
-The HTTP cache default uses SieveTinyLFU, 16 shards, max 100000 responses, a 5 minute TTL, GET/HEAD, common cacheable status codes, ignored volatile headers,
-and a 10 MB body capture limit. Unlike the root cache default, HTTP middleware enables cache stats unless `DisableStats` is set.
+The HTTP cache default uses SieveTinyLFU, 16 shards, max 100000 responses, GET/HEAD, the statuses 200, 201, 300, 301, 302, 404 and 410,
+ignored `Server`, `X-Request-Id` and `X-Trace-Id` headers, and a 10 MB body capture limit. `DefaultTTL` (5 minutes) applies only to responses
+marked `public` that carry no other freshness information. Unlike the root cache default, HTTP middleware enables cache stats unless `DisableStats` is set.
 
 Pattern invalidation is opt-in. Supplying `Config.PathExtractor` enables the path index and attaches a removal listener to the backing cache. The index
 stores keys by URL path and reconciles removals by response identity, so a delayed removal notification will not delete a newer response cached under the same key.
 
-`Wrap` bypasses non-cacheable request methods. For a cacheable request it:
+`Wrap` first looks at the request method:
+
+- A method in `CacheableMethods` goes on to the caching steps below.
+- GET, HEAD, OPTIONS and TRACE outside `CacheableMethods` pass through untouched.
+- Any other method is unsafe. `Wrap` computes the keys the key generator returns for a GET and a HEAD copy of the request before the
+  handler runs, since the handler may change the request. The handler runs behind a writer that records the status and buffers no body.
+  On a 2xx or 3xx status, `Wrap` deletes both keys (RFC 9111 section 4.4).
+
+For a cacheable method, a request with any field line of `Range`, `If-Range`, `If-Match`, `If-None-Match`, `If-Modified-Since` or
+`If-Unmodified-Since`, even an empty one, passes through with no lookup and no store. Otherwise `Wrap`:
 
 1. Generate the cache key.
-2. Serve a cached response when present.
-3. Otherwise wrap the `ResponseWriter`.
+2. Serve the stored response when present and when every header it recorded from `Vary` has the same values in this request. A mismatch is a miss.
+3. Otherwise clone the request headers, so the rules below see the request as received, and wrap the `ResponseWriter`.
 4. Forward the request to the next handler.
-5. Capture final status, headers, and body.
-6. Ask the policy whether to cache and for what TTL.
-7. When pattern invalidation is enabled and the key maps to a path, add it to the pattern index before the store, so a removal during the store, including a SieveTinyLFU admission rejection, is reconciled by the removal listener.
-8. Store a defensive response snapshot in the backing cache, rolling back the index entry if the store fails.
+5. Capture final status, headers, and body. The writer rebuilds the header map with canonical keys and merges the values of keys that
+   differ only in case, in sorted key order as net/http writes them, so fields set under non-canonical keys are seen by every rule.
+6. Apply the shared-cache storage restrictions, whatever the policy: no `206`, no `no-store`, `no-cache` or `private` in any
+   `Cache-Control` line, no `Authorization` request unless the response has `public`, `s-maxage` or `must-revalidate`, no `Set-Cookie`,
+   and no request `Cache-Control: no-store`. A field with an empty value counts as present.
+7. Ask the policy whether to cache and for what TTL.
+8. Read `Vary` over all field lines with canonicalized names. `Vary: *` stops here. Record the cloned request values for each name.
+9. Build the snapshot: the stored headers minus ignored ones and hop-by-hop fields (`Connection`, the fields it names, `Keep-Alive`
+   and `Proxy-Connection`), a `Date` added when absent, the `Vary` values, and the corrected initial age (the larger of now minus `Date`
+   and the first member of `Age`, at most 2^31 seconds).
+10. When pattern invalidation is enabled and the key maps to a path, add it to the pattern index before the store, so a removal during the store, including a SieveTinyLFU admission rejection, is reconciled by the removal listener.
+11. Store the snapshot in the backing cache, rolling back the index entry if the store fails.
+
+A hit writes the stored headers, the hit header and `Age`, computed as the initial age plus the time since the response was stored.
 
 The response writer:
 
@@ -449,17 +469,24 @@ The response writer:
 - sets the miss header before committing a miss response
 - captures body bytes up to `MaxBodySize`
 
-`DefaultCachePolicy` rejects non-cacheable methods, non-cacheable statuses, oversized bodies, and `Cache-Control: no-cache`, `no-store`, or `private`.
-It uses a positive `max-age` first, then a positive `Expires`, then `DefaultTTL`.
+`DefaultCachePolicy` rejects non-cacheable methods, non-cacheable statuses and oversized bodies. It joins all `Cache-Control` lines and takes
+the freshness lifetime from the first of `s-maxage`, `max-age`, `Expires` minus `Date` (or minus now without `Date`), and `DefaultTTL` when
+the response is `public`. Without any of these the response is not stored. An unparsable `Expires` means already expired. Delta-seconds may be
+quoted, an invalid value reads as 0, and values are clamped to 2^31 seconds. `max-age`, `s-maxage` and `Age` share one delta-seconds parser. The TTL is the lifetime minus the corrected initial age, and a
+TTL of zero or less is not stored. `DefaultTTL` set to `kioshun.NoExpiration` stores `public` responses with no expiry.
 
 Key generators include:
 
-- `DefaultKeyGenerator`: MD5 of method, full URL, and common vary headers
-- `KeyWithVaryHeaders`: MD5 of method, full URL, and caller-specified headers
-- `KeyWithoutQuery`: plain `METHOD:/path`
-- `KeyWithoutQueryHashed`: MD5 of method, path, and common vary headers
-- `KeyWithUserID`: MD5 of method, full URL, and a user-id header
-- `PathBasedKeyGenerator`: plain `METHOD:/path`
+- `DefaultKeyGenerator`: MD5 of `METHOD scheme://host/path?query`, with the host from `r.Host` and the escaped path
+- `KeyWithVaryHeaders`: MD5 of the same, then `"\nName: value"` for each named header
+- `KeyWithoutQuery`: plain `METHOD:host/path`, escaped path, no query
+- `KeyWithoutQueryHashed`: MD5 of `METHOD host/path`, then `"\nName: value"` for Accept, Accept-Encoding and Authorization
+- `KeyWithUserID`: MD5 of `METHOD scheme://host/path?query`, then `"\nName: value"` for the user-id header
+- `PathBasedKeyGenerator`: plain `METHOD:host/path`, the same as `KeyWithoutQuery`
+
+Header values are joined over all field lines with ",". A newline cannot appear in a parsed header value or an escaped URI, so the
+separators keep distinct requests from sharing a key. `PathExtractorFromKey` returns the part of a `METHOD:host/path` key from the first
+"/" after the method, and still reads older `METHOD:/path` keys.
 
 `Invalidate(pattern)` asks the path index for matching keys and deletes them from the cache. Exact patterns match keys stored at one path. Patterns ending in `*` match the base path and its descendants. Without a configured
 `PathExtractor`, the index stays empty and `Invalidate` returns 0.

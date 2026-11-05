@@ -119,11 +119,13 @@ c.Close() error
 
 ## HTTP Middleware
 
+The middleware is a shared HTTP cache. With the default policy, it stores only responses that carry explicit freshness (`max-age`, `s-maxage` or `Expires`) or are marked `public`.
+
 ```go
 import "github.com/unkn0wn-root/kioshun/httpcache"
 
 config := httpcache.DefaultConfig()
-config.DefaultTTL = 5 * time.Minute
+config.DefaultTTL = 5 * time.Minute // for public responses without max-age or Expires
 config.MaxSize = 100000
 
 middleware, err := httpcache.New(config)
@@ -132,6 +134,10 @@ if err != nil {
 }
 defer middleware.Close()
 
+usersHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=60")
+	w.Write([]byte(`["alice","bob"]`))
+})
 http.Handle("/api/users", middleware.Wrap(usersHandler))
 ```
 > See **[http.md](docs/http.md)** for complete documentation.
