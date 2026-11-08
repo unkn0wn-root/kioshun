@@ -23,7 +23,8 @@ The root `kioshun` package contains the generic cache:
 The `httpcache` package layers HTTP response caching on top:
 
 - `httpcache/config.go`: middleware configuration and default resolution.
-- `httpcache/middleware.go`: handler wrapping, response capture, policies, keys.
+- `httpcache/middleware.go`: handler wrapping, response capture, policies, keys,
+  the epoch table for variant invalidation.
 - `httpcache/pattern.go`: path-segment trie indexing cached keys for pattern
   invalidation, kept in sync by the cache's removal listener.
 
@@ -430,21 +431,60 @@ marked `public` that carry no other freshness information. Unlike the root cache
 
 Pattern invalidation is opt-in. Supplying `Config.PathExtractor` enables the path index and attaches a removal listener to the backing cache. The index
 stores keys by URL path and reconciles removals by response identity, so a delayed removal notification will not delete a newer response cached under the same key.
+With a `PathExtractor`, a store holds one of 64 mutexes, picked by a hash of the key, across the index update and the cache write, and `Clear` holds all 64
+while it empties the cache and the index. Concurrent stores of one key therefore leave the index holding the response the cache holds, and no store lands
+between the two halves of a `Clear`. Without a `PathExtractor`, stores and `Clear` take none of these locks.
+
+The first call to `SetKeyGenerator` allocates an epoch table, and the table being present is the switch for what follows. `DefaultKeyGenerator`, the
+only generator `New` installs, reads only the method and the target URI, so without the table every path runs as before apart from one check on a hit
+and one nil check each on the miss and unsafe paths. Every stored response is 16 bytes larger, since its two tag fields move `Response` into the next
+allocation size class.
+A custom generator can give the variants of one URL different keys, for example one per user. With the table, `Wrap` also computes resource keys.
+A resource key is the key the generator returns for a bare copy of the request: no header, body or form values, a copy of the URL taken before the
+handler runs, and the same context, remote address, host and TLS state. A copy that kept the headers would find only the requester's own variant.
+
+The epoch table is a fixed array of atomic 64-bit counters. Its length is `MaxSize` rounded up to a power of two, at least 1024, or 65536 without a
+size limit, and a later `SetKeyGenerator` keeps it. A resource key maps to a slot by `maphash` with a seed made in `New`, the same seed that picks the
+pattern-index locks. A stored response whose key differs from its resource key records the slot, plus 1 so that 0 means untagged, and the slot's counter at
+the time of the store. A response whose key equals its resource key, such as one stored without the header the generator reads,
+is untagged.
+
+To invalidate a resource key, `Wrap` deletes the entry stored under it and adds 1 to its slot's counter. A hit on a tagged response whose recorded epoch
+no longer matches its slot is treated like a `Vary` mismatch. The request goes to the handler, and its response, if stored, replaces the old one under
+the same key with the new epoch.
+
+Two resource keys can share a slot. A write to one then also makes the tagged entries of the other miss once, and they are refilled on the next request.
+Stale data is never served. A write moves two slots, one for the GET and one for the HEAD resource key. With the table at least as large as `MaxSize`
+and the cache full of tagged entries, a write therefore costs about two extra misses on other resources on average. The counters are 64 bits wide,
+so they do not wrap in practice.
+
+The generator runs on the bare copy under `recover`. If it panics, as one that needs a header may, a store leaves the response untagged. An unsafe
+request computes the GET and the HEAD resource key separately, so a panic for one method leaves the other method's resource key in use. For a method
+that panicked, only the requester's own entry is removed.
+
+An entry that is no longer served stays in memory until it is replaced, evicted or expires. Until then it counts toward `Stats`, the core counts a hit for
+the lookup that finds it, and `InvalidateByFunc` sees its key. The table costs 8 bytes per slot and exists only after `SetKeyGenerator`. A GET that
+started before a successful unsafe request and finishes after it can store the old response again.
 
 `Wrap` first looks at the request method:
 
 - A method in `CacheableMethods` goes on to the caching steps below.
 - GET, HEAD, OPTIONS and TRACE outside `CacheableMethods` pass through untouched.
-- Any other method is unsafe. `Wrap` computes the keys the key generator returns for a GET and a HEAD copy of the request before the
-  handler runs, since the handler may change the request. The handler runs behind a writer that records the status and buffers no body.
-  On a 2xx or 3xx status, `Wrap` deletes both keys (RFC 9111 section 4.4).
+- Any other method is unsafe. Before the handler runs, since the handler may change the request, `Wrap` computes the GET and HEAD keys.
+  After `SetKeyGenerator` it computes the resource key of each method from one bare copy of the request, each under its own `recover`.
+  Without the table, or when the generator panics on the bare copy for either method, it also computes the generator's keys for a copy
+  that keeps the request's headers. The handler runs behind a writer that records the status and buffers no body. On a 2xx or 3xx status,
+  `Wrap` deletes those own keys if it computed them and invalidates the resource key of each method that did not panic (RFC 9111
+  section 4.4).
 
 For a cacheable method, a request with any field line of `Range`, `If-Range`, `If-Match`, `If-None-Match`, `If-Modified-Since` or
 `If-Unmodified-Since`, even an empty one, passes through with no lookup and no store. Otherwise `Wrap`:
 
 1. Generate the cache key.
-2. Serve the stored response when present and when every header it recorded from `Vary` has the same values in this request. A mismatch is a miss.
-3. Otherwise clone the request headers, so the rules below see the request as received, and wrap the `ResponseWriter`.
+2. Serve the stored response when present, when it is untagged or its recorded epoch still matches its slot, and when every header it recorded
+   from `Vary` has the same values in this request. Anything else is a miss.
+3. Otherwise clone the request headers, so the rules below see the request as received, and wrap the `ResponseWriter`. When the epoch table
+   exists, also take a copy of the request and its URL on the stack, in a frame of its own, made only then.
 4. Forward the request to the next handler.
 5. Capture final status, headers, and body. The writer rebuilds the header map with canonical keys and merges the values of keys that
    differ only in case, in sorted key order as net/http writes them, so fields set under non-canonical keys are seen by every rule.
@@ -456,8 +496,11 @@ For a cacheable method, a request with any field line of `Range`, `If-Range`, `I
 9. Build the snapshot: the stored headers minus ignored ones and hop-by-hop fields (`Connection`, the fields it names, `Keep-Alive`
    and `Proxy-Connection`), a `Date` added when absent, the `Vary` values, and the corrected initial age (the larger of now minus `Date`
    and the first member of `Age`, at most 2^31 seconds).
-10. When pattern invalidation is enabled and the key maps to a path, add it to the pattern index before the store, so a removal during the store, including a SieveTinyLFU admission rejection, is reconciled by the removal listener.
-11. Store the snapshot in the backing cache, rolling back the index entry if the store fails.
+10. When the epoch table exists, build a bare request from the copy and compute the resource key from it. If it differs from the key, tag
+    the snapshot with the resource key's slot and the slot's current epoch.
+11. When pattern invalidation is enabled and the key maps to a path, take the key's lock and add the key to the pattern index before the
+    store, so a removal during the store, including a SieveTinyLFU admission rejection, is reconciled by the removal listener.
+12. Store the snapshot in the backing cache, rolling back the index entry if the store fails.
 
 A hit writes the stored headers, the hit header and `Age`, computed as the initial age plus the time since the response was stored.
 
