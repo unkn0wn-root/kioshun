@@ -30,12 +30,30 @@ if err != nil {
 ```
 
 > Each cache runs one write-worker goroutine per shard (plus a cleanup goroutine when `CleanupInterval > 0`),
-> so `ShardCount` sets the number of background goroutines - default `min(NumCPU*4, 256)`.
+> so `ShardCount` sets the number of background goroutines. See [Sharding](#sharding) for the automatic count.
 > If you create many caches (e.g. via the cache `Manager`), set `ShardCount` explicitly to bound the total.
 
 `ProbationRatio` and `GhostRatio` set the initial SieveTinyLFU probation
 window and ghost size as a percent of capacity. The policy resizes both at
 runtime, so leave them at zero unless you are experimenting.
+
+## Sharding
+
+With `ShardCount` left at zero, the cache picks the shard count. It starts
+from `NumCPU*4`, capped at 256, and lowers it until each shard holds at least
+64 entries of `MaxSize`, down to a single shard. A cache with `MaxSize` 100
+gets one shard and a cache with `MaxSize` 10000 gets at most 128. A cache
+without `MaxSize` keeps the CPU-based count.
+
+Each shard enforces its own share of `MaxSize`, and keys never spread evenly.
+With only a few entries per shard, some shards evict while others still have
+room, so the cache holds well under `MaxSize` keys. At 64 entries per shard it
+keeps about 95% of them.
+
+An explicit `ShardCount` is used as given, rounded up to a power of two. When
+`MaxSize` or `MaxCost` is set, the count is capped at the largest power of two
+that is at most 256 and at most that limit, so every shard gets at least one
+entry of `MaxSize` and one unit of `MaxCost`.
 
 ## Weighted Capacity
 
@@ -56,6 +74,14 @@ c, err := kioshun.New[string, []byte](config, kioshun.WithWeigher(
 ))
 ```
 
+`MaxCost` is split across shards and each shard enforces its own share, so a
+single item can cost at most `MaxCost` divided by the shard count, give or
+take one. With `MaxCost` of 1 MiB over 64 shards, an item may cost at most
+16 KiB. `Set`,
+`SetAsync` and `SetWithCallback` reject a costlier item with an error that
+wraps `ErrItemTooLarge` and reports the shard budget. Check for it with
+`errors.Is`. To store larger items, raise `MaxCost` or lower `ShardCount`.
+
 `CostAdmission` selects how SieveTinyLFU compares a weighted candidate against
 the eviction victim:
 
@@ -64,6 +90,23 @@ the eviction victim:
   ground between request-hit and byte-hit objectives.
 - `CostAdmissionDensity`: compares frequency divided by cost, favoring dense
   hot entries.
+
+## TTL values
+
+The `ttl` argument of `Set`, `SetAsync` and `SetWithCallback` works like this:
+
+- `DefaultExpiration` (`0`) uses `Config.DefaultTTL`. A `DefaultTTL` of 0
+  means the entry never expires.
+- `NoExpiration` (`-1`) means the entry never expires. It stays until it is
+  evicted, deleted or cleared.
+- A positive TTL expires the entry after that long.
+- Any other negative TTL means the entry is already expired. The call stores
+  nothing and removes the key the same way `Delete` does, so a removal
+  listener sees the old entry with `RemovedDeleted`. No callback is scheduled.
+
+A TTL computed from a deadline, such as `time.Until(deadline)`, can come out
+as exactly `0` or exactly `-1ns`, and those mean "use the default" and "never
+expire". Check for `ttl <= 0` and call `Delete` instead of `Set`.
 
 ## Named caches
 

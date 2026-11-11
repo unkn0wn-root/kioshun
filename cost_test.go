@@ -2,6 +2,7 @@ package kioshun
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -170,6 +171,7 @@ func TestWeightedMaxCostNormalizesShardCount(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxSize = 100
 	cfg.MaxCost = 3
+	cfg.ShardCount = 8
 	cfg.CleanupInterval = 0
 	cfg.EvictionPolicy = LRU
 
@@ -179,13 +181,88 @@ func TestWeightedMaxCostNormalizesShardCount(t *testing.T) {
 	}
 	defer cache.Close()
 
-	if len(cache.shards) > int(cfg.MaxCost) {
-		t.Fatalf("shards=%d exceeds MaxCost=%d and would create zero-budget shards", len(cache.shards), cfg.MaxCost)
+	if len(cache.shards) != 2 {
+		t.Fatalf("shards=%d, want 2: MaxCost=%d must cap ShardCount=%d to avoid zero-budget shards", len(cache.shards), cfg.MaxCost, cfg.ShardCount)
 	}
 	for i, shard := range cache.shards {
 		if shard.costCap <= 0 {
 			t.Fatalf("shard %d costCap=%d, want positive cost budget", i, shard.costCap)
 		}
+	}
+}
+
+func newShardBudgetTestCache(t *testing.T) *Cache[string, []byte] {
+	t.Helper()
+	cfg := Config{MaxSize: 10000, MaxCost: 1 << 20, ShardCount: 64}
+	c, err := New[string, []byte](cfg, WithWeigher(func(_ string, v []byte) int64 {
+		return int64(len(v))
+	}))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return c
+}
+
+func TestItemTooLargeReportsShardBudget(t *testing.T) {
+	c := newShardBudgetTestCache(t)
+	defer c.Close()
+
+	err := c.Set("big", make([]byte, 64<<10), NoExpiration)
+	if !errors.Is(err, ErrItemTooLarge) {
+		t.Fatalf("Set error = %v, want ErrItemTooLarge", err)
+	}
+	if !strings.Contains(err.Error(), "budget 16384") {
+		t.Fatalf("Set error = %q, want it to report budget 16384", err)
+	}
+}
+
+func TestItemCostLimitIsPerShard(t *testing.T) {
+	c := newShardBudgetTestCache(t)
+	defer c.Close()
+
+	if err := c.Set("fits", make([]byte, 16384), NoExpiration); err != nil {
+		t.Fatalf("Set cost 16384 error = %v, want nil", err)
+	}
+	if err := c.Set("over", make([]byte, 16385), NoExpiration); !errors.Is(err, ErrItemTooLarge) {
+		t.Fatalf("Set cost 16385 error = %v, want ErrItemTooLarge", err)
+	}
+}
+
+func TestSetNegativeTTLSkipsCostChecks(t *testing.T) {
+	// A nil value has an invalid cost.
+	c, err := New[string, []byte](Config{MaxSize: 64, MaxCost: 100, ShardCount: 1}, WithWeigher(func(_ string, v []byte) int64 {
+		if v == nil {
+			return -1
+		}
+		return int64(len(v))
+	}))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer c.Close()
+
+	tests := []struct {
+		name  string
+		value []byte
+	}{
+		{"too large", make([]byte, 101)},
+		{"negative cost", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := c.Set("k", []byte("old"), time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Set("k", tt.value, -time.Second); err != nil {
+				t.Fatalf("Set with negative TTL error = %v, want nil", err)
+			}
+			if got := c.Size(); got != 0 {
+				t.Fatalf("Size()=%d, want 0", got)
+			}
+			if _, ok := c.Get("k"); ok {
+				t.Fatal("old entry survived Set with a negative TTL")
+			}
+		})
 	}
 }
 

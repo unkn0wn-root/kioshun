@@ -108,9 +108,13 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 	if shardCount <= 0 {
 		shardCount = runtime.NumCPU() * shardMultiplier
 		shardCount = min(shardCount, maxShardCount)
+		if config.MaxSize > 0 {
+			shardCount = int(min(int64(shardCount), mathx.PrevPowerOf2(max(config.MaxSize/minShardEntries, 1))))
+		}
 	}
 
-	// Do not create more shards than the capacity can use.
+	// Every shard needs at least one slot and one unit of cost, since a zero
+	// limit means unlimited.
 	if config.MaxSize > 0 {
 		shardCount = min(shardCount, int(mathx.PrevPowerOf2(min(config.MaxSize, int64(maxShardCount)))))
 	}
@@ -259,19 +263,24 @@ func (c *Cache[K, V]) GetWithTTL(key K) (V, time.Duration, bool) {
 
 // Set inserts or updates key and waits until the owning shard has committed
 // the write, giving immediate read-after-write visibility for that key.
+//
+// A positive ttl expires the entry after that long. DefaultExpiration (0) uses
+// Config.DefaultTTL, and NoExpiration (-1) keeps the entry until it is evicted
+// or deleted. Any other negative ttl stores nothing and deletes key.
 func (c *Cache[K, V]) Set(key K, value V, ttl time.Duration) error {
 	return c.setAndWait(key, value, ttl, nil)
 }
 
 // SetAsync accepts an insert or update. It applies the write before returning
 // when the shard is idle; otherwise it queues the write. Call Sync when later
-// reads must see all accepted writes.
+// reads must see all accepted writes. ttl works as for Set.
 func (c *Cache[K, V]) SetAsync(key K, value V, ttl time.Duration) error {
 	return c.set(key, value, ttl, nil)
 }
 
-// SetWithCallback sets key and schedules the callback after the item is committed.
-// The callback fires once the TTL elapses and re-validates the item under lock.
+// SetWithCallback sets key like Set and calls callback when ttl has elapsed,
+// if key is still present and expired. The callback does not run after Close,
+// but a pending timer keeps the entry and the cache reachable until it fires.
 func (c *Cache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
 	return c.setAndWait(key, value, ttl, callback)
 }
@@ -291,7 +300,9 @@ func (c *Cache[K, V]) Clear() {
 	_ = c.enqueueAllAndWait(writeClear)
 }
 
-// Exists checks membership without mutating recency/frequency (removes if expired).
+// Exists reports whether key is present and not expired. It does not count as a
+// hit or miss and does not change recency or frequency. An expired entry is
+// removed.
 func (c *Cache[K, V]) Exists(key K) bool {
 	if c.isClosed() {
 		return false
@@ -299,8 +310,39 @@ func (c *Cache[K, V]) Exists(key K) bool {
 
 	kh := c.hasher.Sum(key)
 	shard := c.shardByHash(kh)
-	now := c.nowNano()
 
+	// Bounded SieveTinyLFU items are immutable once published, so the lookup
+	// needs no lock. The other policies update items in place.
+	var expireTime int64
+	if shard.sieve != nil {
+		item, exists := shard.tab.lookup(kh, key)
+		if !exists {
+			// A miss may be a Set still queued for this shard.
+			if item, exists = c.drainMissAndLookup(shard, kh, key); !exists {
+				return false
+			}
+		}
+		expireTime = item.expireTime
+	} else {
+		shard.mu.RLock()
+		item, exists := shard.tab.lookup(kh, key)
+		if exists {
+			expireTime = item.expireTime
+		}
+		shard.mu.RUnlock()
+		if !exists {
+			return false
+		}
+	}
+	if expireTime == 0 {
+		return true
+	}
+	now := c.nowNano()
+	if now <= expireTime {
+		return true
+	}
+
+	// Check again under the write lock, since a Set may have refreshed the entry.
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 

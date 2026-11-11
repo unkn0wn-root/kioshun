@@ -1,6 +1,8 @@
 package kioshun
 
 import (
+	"fmt"
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -85,7 +87,9 @@ func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bo
 		return false
 	}
 	s.drainReadSamples()
-	c.stampExpireTimeNow(cmd)
+	if cmd.expireTime > 0 {
+		c.stampExpireTime(cmd, c.nowNano())
+	}
 	committed := c.applySet(s, cmd)
 	s.mu.Unlock()
 	s.drainMu.Unlock()
@@ -114,27 +118,35 @@ func (c *Cache[K, V]) setCommand(
 		ttl = c.config.DefaultTTL
 	}
 
+	// A negative expireTime marks an entry that is already expired.
 	var expireTime int64
-	if ttl > 0 {
+	switch {
+	case ttl > 0:
 		expireTime = ttl.Nanoseconds()
+	case ttl < 0 && ttl != NoExpiration:
+		expireTime = -1
 	}
 
 	kh := c.hasher.Sum(key)
-	cost, err := c.itemCost(key, value)
-	if err != nil {
-		return nil, writeCommand[K, V]{}, err
-	}
 	shard := c.shardByHash(kh)
-	if shard.costCap > 0 && cost > shard.costCap {
-		return nil, writeCommand[K, V]{}, ErrItemTooLarge
-	}
 	cmd := writeCommand[K, V]{
 		op:         writeSet,
 		key:        key,
 		value:      value,
 		hash:       kh,
 		expireTime: expireTime,
-		cost:       cost,
+	}
+	// An already expired write stores nothing, so its cost is not checked.
+	if expireTime >= 0 {
+		cost, err := c.itemCost(key, value)
+		if err != nil {
+			return nil, writeCommand[K, V]{}, err
+		}
+		if shard.costCap > 0 && cost > shard.costCap {
+			return nil, writeCommand[K, V]{}, fmt.Errorf("%w: cost %d, budget %d (MaxCost %d over %d shards)",
+				ErrItemTooLarge, cost, shard.costCap, c.config.MaxCost, len(c.shards))
+		}
+		cmd.cost = cost
 	}
 	if callback != nil {
 		cmd.extra = &writeExtra[K, V]{callback: callback}
@@ -215,7 +227,9 @@ func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error
 	var task callbackTask[K, V]
 	var hasTask bool
 	err := c.syncMutate(s, func() {
-		c.stampExpireTimeNow(&cmd)
+		if cmd.expireTime > 0 {
+			c.stampExpireTime(&cmd, c.nowNano())
+		}
 		committed := c.applySet(s, &cmd)
 		task, hasTask = cmd.newCallbackTask(committed)
 	})
@@ -391,13 +405,8 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 
 func (c *Cache[K, V]) stampExpireTime(cmd *writeCommand[K, V], now int64) {
 	if cmd.expireTime > 0 {
-		cmd.expireTime += now
-	}
-}
-
-func (c *Cache[K, V]) stampExpireTimeNow(cmd *writeCommand[K, V]) {
-	if cmd.expireTime > 0 {
-		cmd.expireTime += c.nowNano()
+		// Saturate so a very long TTL cannot wrap into the expired range.
+		cmd.expireTime = min(cmd.expireTime, math.MaxInt64-now) + now
 	}
 }
 
@@ -413,6 +422,10 @@ func (c *Cache[K, V]) newItem(cmd *writeCommand[K, V]) *cacheItem[K, V] {
 }
 
 func (c *Cache[K, V]) applySet(s *shard[K, V], cmd *writeCommand[K, V]) bool {
+	if cmd.expireTime < 0 {
+		c.deleteKey(s, cmd.hash, cmd.key)
+		return false
+	}
 	if s.sieve != nil {
 		return c.applySieve(s, cmd)
 	}
@@ -545,25 +558,18 @@ func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 }
 
 func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
-	delay := max(time.Duration(task.expireTime-c.nowNano()), 0)
-
-	go func() {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-
-		select {
-		case <-timer.C:
-			kh := c.hasher.Sum(task.key)
-			s := c.shardByHash(kh)
-			s.mu.RLock()
-			item, exists := s.tab.lookup(kh, task.key)
-			expired := exists && item.expireTime > 0 && c.nowNano() > item.expireTime
-			s.mu.RUnlock()
-			if expired {
-				task.callback(task.key, task.value)
-			}
-		case <-c.closeCh:
+	time.AfterFunc(time.Duration(task.expireTime-c.nowNano()), func() {
+		if c.isClosed() {
 			return
 		}
-	}()
+		kh := c.hasher.Sum(task.key)
+		s := c.shardByHash(kh)
+		s.mu.RLock()
+		item, exists := s.tab.lookup(kh, task.key)
+		expired := exists && item.expireTime > 0 && c.nowNano() > item.expireTime
+		s.mu.RUnlock()
+		if expired {
+			task.callback(task.key, task.value)
+		}
+	})
 }

@@ -18,6 +18,11 @@ const (
 
 	maxShardCount   = 256
 	shardMultiplier = 4
+
+	// minShardEntries is the smallest per-shard capacity auto sharding picks.
+	// Keys spread unevenly, and with 64 slots per shard a full cache keeps
+	// about 95% of MaxSize.
+	minShardEntries = 64
 )
 
 type EvictionPolicy int
@@ -47,9 +52,9 @@ const (
 type Config struct {
 	MaxSize         int64          // max resident items; 0 => unlimited
 	MaxCost         int64          // max total weighted cost; 0 => disabled
-	ShardCount      int            // shard count; 0 => auto (scaled to CPUs, 2^n)
+	ShardCount      int            // shard count; 0 => auto (scaled to CPUs, at least 64 entries per shard, 2^n)
 	CleanupInterval time.Duration  // expired-item sweep interval; 0 => no sweep
-	DefaultTTL      time.Duration  // TTL for Set with DefaultExpiration; NoExpiration => none
+	DefaultTTL      time.Duration  // TTL for Set with DefaultExpiration; 0 or NoExpiration => none
 	EvictionPolicy  EvictionPolicy // replacement policy; default SieveTinyLFU
 	StatsEnabled    bool           // collect hit, miss, and eviction counts
 	ProbationRatio  uint8          // SieveTinyLFU probation window, % of capacity; 0 => default
