@@ -107,6 +107,9 @@ type removedEntry[K comparable, V any] struct {
 	reason RemovalReason
 }
 
+// maxRetainedRemovals caps the capacity of a staging buffer kept for reuse.
+const maxRetainedRemovals = 256
+
 func (c *Cache[K, V]) listenerNotifyMask() removalNotifyMask {
 	var mask removalNotifyMask
 	if c.onRemove != nil {
@@ -119,21 +122,24 @@ func (c *Cache[K, V]) listenerNotifyMask() removalNotifyMask {
 }
 
 // removeNotifyWorker calls listeners without holding a shard lock, allowing a
-// listener to use the cache safely.
+// listener to use the cache safely. On close it delivers what is still staged.
 func (c *Cache[K, V]) removeNotifyWorker() {
 	defer c.workers.Done()
+	var spare []removedEntry[K, V]
 	for {
 		select {
 		case <-c.removeWake:
-			c.drainRemovals()
+			spare = c.drainRemovals(spare)
 		case <-c.closeCh:
-			c.drainRemovals()
+			c.drainRemovals(spare)
 			return
 		}
 	}
 }
 
-func (c *Cache[K, V]) drainRemovals() {
+// drainRemovals delivers all staged removals. Each pending shard gets the empty
+// spare buffer, and its delivered buffer becomes the next spare.
+func (c *Cache[K, V]) drainRemovals(spare []removedEntry[K, V]) []removedEntry[K, V] {
 	for _, s := range c.shards {
 		if !s.removePending.Load() {
 			continue
@@ -141,7 +147,7 @@ func (c *Cache[K, V]) drainRemovals() {
 
 		s.mu.Lock()
 		buf := s.removeBuf
-		s.removeBuf = nil
+		s.removeBuf = spare
 		s.removePending.Store(false)
 		s.mu.Unlock()
 
@@ -153,5 +159,14 @@ func (c *Cache[K, V]) drainRemovals() {
 				c.onEvict(e.key, e.value)
 			}
 		}
+
+		// Drop a buffer grown by a burst. Clear a kept one so it does not pin
+		// delivered values.
+		if cap(buf) > maxRetainedRemovals {
+			buf = nil
+		}
+		clear(buf)
+		spare = buf[:0]
 	}
+	return spare
 }

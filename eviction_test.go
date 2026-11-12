@@ -327,55 +327,79 @@ func TestOnRemove_ExpirationOnAccess(t *testing.T) {
 }
 
 func TestOnRemove_NotFiredOnOverwrite(t *testing.T) {
-	rec := newEvictRecorder()
-	c, err := New(
-		Config{MaxSize: 100, ShardCount: 2, StatsEnabled: true},
-		WithOnRemove(rec.record),
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer c.Close()
+	for _, policy := range []EvictionPolicy{LRU, LFU, FIFO, SieveTinyLFU} {
+		for _, m := range []struct {
+			name string
+			set  func(*Cache[int, string], int, string, time.Duration) error
+		}{
+			{"Set", (*Cache[int, string]).Set},
+			{"SetAsync", (*Cache[int, string]).SetAsync},
+		} {
+			t.Run(policyName(policy)+"/"+m.name, func(t *testing.T) {
+				rec := newEvictRecorder()
+				c, err := New(
+					Config{MaxSize: 100, ShardCount: 2, EvictionPolicy: policy, StatsEnabled: true},
+					WithOnRemove(rec.record),
+				)
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				defer c.Close()
 
-	for i := range 50 {
-		if err := c.Set(1, valFor(i), NoExpiration); err != nil {
-			t.Fatalf("Set: %v", err)
+				for i := range 50 {
+					if err := m.set(c, 1, valFor(i), NoExpiration); err != nil {
+						t.Fatalf("%s: %v", m.name, err)
+					}
+				}
+				if err := c.Sync(); err != nil {
+					t.Fatalf("Sync: %v", err)
+				}
+				// Close delivers every staged removal before it returns.
+				c.Close()
+				if n := rec.count(); n != 0 {
+					t.Fatalf("overwrite produced %d eviction notifications, want 0", n)
+				}
+			})
 		}
-	}
-	if err := c.Sync(); err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	// Wait long enough to catch an incorrect asynchronous notification.
-	time.Sleep(50 * time.Millisecond)
-	if n := rec.count(); n != 0 {
-		t.Fatalf("overwrite produced %d eviction notifications, want 0", n)
 	}
 }
 
 func TestOnRemove_NotFiredOnClear(t *testing.T) {
-	rec := newEvictRecorder()
-	c, err := New(
-		Config{MaxSize: 100, ShardCount: 2, StatsEnabled: true},
-		WithOnRemove(rec.record),
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer c.Close()
+	for _, policy := range []EvictionPolicy{LRU, LFU, FIFO, SieveTinyLFU} {
+		for _, m := range []struct {
+			name string
+			set  func(*Cache[int, string], int, string, time.Duration) error
+		}{
+			{"Set", (*Cache[int, string]).Set},
+			{"SetAsync", (*Cache[int, string]).SetAsync},
+		} {
+			t.Run(policyName(policy)+"/"+m.name, func(t *testing.T) {
+				rec := newEvictRecorder()
+				c, err := New(
+					Config{MaxSize: 100, ShardCount: 2, EvictionPolicy: policy, StatsEnabled: true},
+					WithOnRemove(rec.record),
+				)
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				defer c.Close()
 
-	for i := range 30 {
-		if err := c.Set(i, valFor(i), NoExpiration); err != nil {
-			t.Fatalf("Set: %v", err)
+				for i := range 30 {
+					if err := m.set(c, i, valFor(i), NoExpiration); err != nil {
+						t.Fatalf("%s: %v", m.name, err)
+					}
+				}
+				if err := c.Sync(); err != nil {
+					t.Fatalf("Sync: %v", err)
+				}
+				c.Clear()
+				// Close delivers every staged removal before it returns.
+				c.Close()
+				if n := rec.count(); n != 0 {
+					t.Fatalf("Clear produced %d eviction notifications, want 0", n)
+				}
+			})
 		}
-	}
-	if err := c.Sync(); err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	c.Clear()
-
-	time.Sleep(50 * time.Millisecond)
-	if n := rec.count(); n != 0 {
-		t.Fatalf("Clear produced %d eviction notifications, want 0", n)
 	}
 }
 

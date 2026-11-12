@@ -58,8 +58,9 @@ type shard[K comparable, V any] struct {
 	size int64 // live items
 	cost int64 // live item cost
 
-	// Removed entries are buffered under mu and delivered after releasing it.
-	// removeWake is nil when no listener is registered.
+	// Removed entries are staged in removeBuf under mu. The notify worker swaps
+	// in an empty buffer and delivers after unlocking. removeWake is nil when no
+	// listener is registered.
 	removeWake       chan struct{}
 	removeNotifyMask removalNotifyMask
 	removeBuf        []removedEntry[K, V]
