@@ -293,39 +293,78 @@ func TestOnRemove_EveryReasonEveryPath(t *testing.T) {
 }
 
 func TestOnRemove_CloseDeliversPending(t *testing.T) {
-	const total = 10_000
+	const rounds, total = 32, 2000 // about 500 staged per shard, above the reuse limit
 	cfg := Config{MaxSize: 16, ShardCount: 4, EvictionPolicy: LRU}
 
+	// select picks the wake-up or close at random, hence the rounds.
 	t.Run("worker_blocked", func(t *testing.T) {
+		for round := range rounds {
+			gate := newListenerGate()
+			var delivered atomic.Int64
+			c, err := New(cfg, WithOnRemove(func(int, string, RemovalReason) {
+				gate.wait()
+				delivered.Add(1)
+			}))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			runWithin(t, "Set", func() {
+				for k := range total {
+					if err := c.Set(k, valFor(k), NoExpiration); err != nil {
+						t.Errorf("Set(%d): %v", k, err)
+						return
+					}
+				}
+			})
+			gate.awaitEntered(t)
+			size := c.Size()
+			// Keep the worker inside the listener until Close has started.
+			go func() {
+				<-c.closeCh
+				close(gate.open)
+			}()
+			runWithin(t, "Close", func() { c.Close() })
+			if got, want := delivered.Load(), total-size; got != want {
+				t.Fatalf("round %d: delivered %d removals when Close returned, want %d", round, got, want)
+			}
+		}
+	})
+}
+
+// A goroutine that raced Close can still stage a removal.
+func TestOnRemove_RemovalAfterCloseDoesNotBlock(t *testing.T) {
+	for round := range 32 {
 		gate := newListenerGate()
-		var delivered atomic.Int64
-		c, err := New(cfg, WithOnRemove(func(int, string, RemovalReason) {
-			gate.wait()
-			delivered.Add(1)
-		}))
+		c, err := New(Config{MaxSize: 1, ShardCount: 1, EvictionPolicy: LRU},
+			WithOnRemove(func(k int, _ string, _ RemovalReason) {
+				if k == 0 {
+					gate.wait()
+				}
+			}))
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
+		mustSet(t, c, 0)
+		mustSet(t, c, 1) // evicts 0 and holds the worker
+		gate.awaitEntered(t)
 		runWithin(t, "Set", func() {
-			for k := range total {
-				if err := c.Set(k, valFor(k), NoExpiration); err != nil {
-					t.Errorf("Set(%d): %v", k, err)
-					return
-				}
+			// evicts 1 while the worker is held
+			if err := c.Set(2, valFor(2), NoExpiration); err != nil {
+				t.Errorf("Set(2): %v", err)
 			}
 		})
-		gate.awaitEntered(t)
-		size := c.Size()
-		// Keep the worker inside the listener until Close has started.
 		go func() {
 			<-c.closeCh
 			close(gate.open)
 		}()
 		runWithin(t, "Close", func() { c.Close() })
-		if got, want := delivered.Load(), total-size; got != want {
-			t.Fatalf("delivered %d removals when Close returned, want %d", got, want)
-		}
-	})
+		s := c.shards[0]
+		runWithin(t, fmt.Sprintf("round %d: a removal after Close", round), func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.dropItem(&cacheItem[int, string]{key: 3, value: valFor(3), unpublished: true}, false, RemovedDeleted, dropLRU)
+		})
+	}
 }
 
 func TestOnRemove_ListenerReentersCache(t *testing.T) {
@@ -555,7 +594,7 @@ func TestOnRemove_StagingMemoryAfterBurst(t *testing.T) {
 
 // Like TestOnRemove_ChurnAllocs, but it also runs under -race.
 func TestOnRemove_ReusesStagingBuffer(t *testing.T) {
-	delivered := make(chan struct{})
+	delivered := make(chan struct{}, 3)
 	c, err := New(Config{MaxSize: 1, ShardCount: 1, EvictionPolicy: LRU},
 		WithOnRemove(func(int, string, RemovalReason) { delivered <- struct{}{} }))
 	if err != nil {
@@ -579,6 +618,57 @@ func TestOnRemove_ReusesStagingBuffer(t *testing.T) {
 	s.mu.Unlock()
 	if got == 0 {
 		t.Fatal("the shard has no staging buffer after three passes, want a reused one")
+	}
+}
+
+func TestOnRemove_KeepsStagingBufferUpToLimit(t *testing.T) {
+	const burst = 100 // grows the buffer to between 100 and 256
+	gate := newListenerGate()
+	delivered := make(chan int, burst+2)
+	c, err := New(Config{MaxSize: 1, ShardCount: 1, EvictionPolicy: LRU},
+		WithOnRemove(func(k int, _ string, _ RemovalReason) {
+			if k == 0 {
+				gate.wait()
+			}
+			delivered <- k
+		}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+	deadline := time.After(10 * time.Second)
+	await := func(key int) {
+		t.Helper()
+		for {
+			select {
+			case k := <-delivered:
+				if k == key {
+					return
+				}
+			case <-deadline:
+				t.Fatalf("removal of key %d not delivered within 10s", key)
+			}
+		}
+	}
+
+	mustSet(t, c, 0)
+	mustSet(t, c, 1) // evicts 0 and holds the worker
+	gate.awaitEntered(t)
+	for k := 2; k <= burst+1; k++ {
+		mustSet(t, c, k) // evicts k-1
+	}
+	close(gate.open)
+	await(burst)
+	// The next pass hands the burst's buffer back to the shard.
+	mustSet(t, c, burst+2) // evicts burst+1
+	await(burst + 1)
+
+	s := c.shards[0]
+	s.mu.Lock()
+	got := cap(s.removeBuf)
+	s.mu.Unlock()
+	if got < burst || got > 256 {
+		t.Fatalf("the shard's staging buffer has capacity %d, want the burst's buffer of %d to 256 entries", got, burst)
 	}
 }
 
@@ -641,6 +731,52 @@ func TestOnRemove_ConcurrentExactlyOnce(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Every removal must be delivered with no later write or Close to flush it.
+func TestOnRemove_ConcurrentDeliveryWithoutClose(t *testing.T) {
+	const producers, perRound, rounds, shards = 6, 16, 1500, 16
+	v := &churnValue{}
+	var calls atomic.Int64
+	var c *Cache[int, *churnValue]
+	c, err := New(Config{MaxSize: shards, ShardCount: shards, EvictionPolicy: LRU},
+		WithOnRemove(func(k int, _ *churnValue, _ RemovalReason) {
+			calls.Add(1)
+			if k%61 == 0 {
+				c.Delete(k + 1)
+			}
+		}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+	var inserted int64
+	for r := range rounds {
+		var wg sync.WaitGroup
+		for p := range producers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range perRound {
+					k := (r*producers+p)*perRound + i
+					if err := c.Set(k, v, NoExpiration); err != nil {
+						t.Errorf("Set(%d): %v", k, err)
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		inserted += producers * perRound
+		deadline := time.Now().Add(2 * time.Second)
+		for calls.Load()+c.Size() != inserted {
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: %d listener calls and %d resident after 2s, want %d inserted",
+					r, calls.Load(), c.Size(), inserted)
+			}
+			runtime.Gosched()
+		}
 	}
 }
 

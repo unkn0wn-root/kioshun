@@ -162,8 +162,8 @@ buffer while holding the shard lock. A dedicated worker drains those buffers and
 cache. If no listener is configured, no buffer or worker is allocated. Delivery is asynchronous, so secondary indexes must handle a notification arriving after
 the same key has already been inserted again.
 
-The worker gives each shard an empty buffer kept from an earlier pass, so removals do not allocate new buffers while the worker keeps up. A buffer whose
-capacity a burst grew past 256 entries is dropped after delivery instead of kept.
+Staging buffers are reused: when the worker takes a shard's staged removals, it leaves an empty buffer that it has already delivered, so removals do not
+allocate new buffers while the worker keeps up. A buffer whose capacity a burst grew past 256 entries is dropped after delivery instead of kept.
 
 ## Write Path
 

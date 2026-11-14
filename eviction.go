@@ -1,5 +1,7 @@
 package kioshun
 
+import "sync/atomic"
+
 // RemovalReason explains why a key left the cache in an OnRemove notification.
 type RemovalReason uint8
 
@@ -121,20 +123,41 @@ func (c *Cache[K, V]) listenerNotifyMask() removalNotifyMask {
 	return mask
 }
 
+// removalWake wakes the notify worker. Only the producer that sets signaled
+// sends, and wait clears it after each receive, so the send never blocks.
+// Keep it a plain send. A failed non-blocking send gives no ordering.
+type removalWake struct {
+	signaled atomic.Bool
+	ch       chan struct{}
+}
+
+func (w *removalWake) signal() {
+	if !w.signaled.Load() && w.signaled.CompareAndSwap(false, true) {
+		w.ch <- struct{}{}
+	}
+}
+
+// wait reports whether a wake-up arrived before done was closed. It clears
+// signaled only after a wake-up, since one may still be queued at close.
+func (w *removalWake) wait(done <-chan struct{}) bool {
+	select {
+	case <-w.ch:
+		w.signaled.Store(false)
+		return true
+	case <-done:
+		return false
+	}
+}
+
 // removeNotifyWorker calls listeners without holding a shard lock, allowing a
 // listener to use the cache safely. On close it delivers what is still staged.
 func (c *Cache[K, V]) removeNotifyWorker() {
 	defer c.workers.Done()
 	var spare []removedEntry[K, V]
-	for {
-		select {
-		case <-c.removeWake:
-			spare = c.drainRemovals(spare)
-		case <-c.closeCh:
-			c.drainRemovals(spare)
-			return
-		}
+	for c.removeWake.wait(c.closeCh) {
+		spare = c.drainRemovals(spare)
 	}
+	c.drainRemovals(spare)
 }
 
 // drainRemovals delivers all staged removals. Each pending shard gets the empty
