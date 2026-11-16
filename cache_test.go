@@ -915,6 +915,34 @@ func TestSetAsyncAppliesInlineWhenUncontended(t *testing.T) {
 	}
 }
 
+func TestSetAsyncCommitsWithoutAnotherCall(t *testing.T) {
+	c := newTestCache[string, string](t, Config{MaxSize: 10, ShardCount: 1, EvictionPolicy: LRU})
+	defer c.Close()
+	s := c.shards[0]
+	s.mu.Lock() // makes SetAsync queue the write
+	err := c.SetAsync("key", "value", NoExpiration)
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatalf("SetAsync: %v", err)
+	}
+	kh := c.hasher.Sum("key")
+	waitFor(t, func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		_, ok := s.tab.lookup(kh, "key")
+		return ok
+	})
+}
+
+// A producer or reader that raced Close can still ask for a wake-up.
+func TestWriteWakeAfterCloseDoesNotBlock(t *testing.T) {
+	for round := range 200 {
+		c := newTestCache[int, int](t, Config{MaxSize: 10, ShardCount: 1, EvictionPolicy: LRU})
+		c.Close()
+		runWithin(t, fmt.Sprintf("round %d: a wake-up after Close", round), c.shards[0].queue.wakeConsumer)
+	}
+}
+
 type User struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`

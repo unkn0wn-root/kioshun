@@ -162,7 +162,7 @@ func (s *shard[K, V]) sampleRead(h, id uint64) {
 		s.drainMu.Unlock()
 		return
 	}
-	signal(s.wake)
+	s.queue.wakeConsumer()
 }
 
 // drainReadSamples adds pending read hashes to the frequency sketch. A dirty bit

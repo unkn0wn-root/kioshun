@@ -1,18 +1,11 @@
 package kioshun
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/unkn0wn-root/kioshun/internal/mathx"
 )
-
-// signal sends a wake-up unless one is already pending.
-func signal(ch chan struct{}) {
-	select {
-	case ch <- struct{}{}:
-	default:
-	}
-}
 
 type mpscCell[K comparable, V any] struct {
 	seq atomic.Uint64
@@ -26,7 +19,6 @@ type mpscQueue[K comparable, V any] struct {
 	mask    uint64
 	buffer  []mpscCell[K, V]
 	wake    chan struct{}
-	space   chan struct{}
 	closeCh <-chan struct{}
 
 	_         [cacheLinePadding]byte
@@ -36,6 +28,12 @@ type mpscQueue[K comparable, V any] struct {
 	_         [cacheLinePadding]byte
 	wakeState atomic.Uint32 // 1 while a wake is pending or the consumer is active
 	_         [cacheLinePadding]byte
+
+	// One producer at a time waits for space. It sets spaceWanted, and the
+	// consumer that clears it sends one wake-up on space.
+	spaceMu     sync.Mutex
+	spaceWanted atomic.Bool
+	space       chan struct{}
 }
 
 func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-chan struct{}) *mpscQueue[K, V] {
@@ -65,22 +63,58 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 			if q.head.CompareAndSwap(pos, pos+1) {
 				cell.cmd = cmd
 				cell.seq.Store(pos + 1)
-				// Wake only for the consumer's next slot and only when no wake is
-				// pending. The consumer checks the ring itself before sleeping.
-				if q.tail.Load() == pos && q.wakeState.CompareAndSwap(0, 1) {
-					signal(q.wake)
+				// Wake only for the consumer's next slot. Read tail after publishing,
+				// so a consumer that reaches this slot later finds it published.
+				if q.tail.Load() == pos {
+					q.wakeConsumer()
 				}
 				return nil
 			}
 		case dif < 0:
-			select {
-			case <-q.space:
-			case <-q.closeCh:
-				return ErrCacheClosed
+			if err := q.waitForSpace(); err != nil {
+				return err
 			}
 		default:
 			// Another producer advanced head.
 		}
+	}
+}
+
+// wakeConsumer wakes the consumer unless a wake-up is pending or the consumer
+// is running. Only the caller that sets wakeState sends, so the send never
+// blocks. Keep it a plain send. A failed non-blocking send gives no ordering.
+func (q *mpscQueue[K, V]) wakeConsumer() {
+	if q.wakeState.Load() == 0 && q.wakeState.CompareAndSwap(0, 1) {
+		q.wake <- struct{}{}
+	}
+}
+
+// waitForSpace returns when a slot may be free or the cache is closed. It sets
+// spaceWanted before checking the ring again, so a consumer that frees a slot
+// after the check sends a wake-up.
+func (q *mpscQueue[K, V]) waitForSpace() error {
+	q.spaceMu.Lock()
+	defer q.spaceMu.Unlock()
+	q.spaceWanted.Store(true)
+	pos := q.head.Load()
+	if int64(q.buffer[pos&q.mask].seq.Load())-int64(pos) >= 0 {
+		q.withdrawSpaceRequest()
+		return nil
+	}
+	select {
+	case <-q.space:
+		return nil
+	case <-q.closeCh:
+		q.withdrawSpaceRequest()
+		return ErrCacheClosed
+	}
+}
+
+// withdrawSpaceRequest clears spaceWanted, or takes the wake-up if a consumer
+// already cleared it.
+func (q *mpscQueue[K, V]) withdrawSpaceRequest() {
+	if !q.spaceWanted.CompareAndSwap(true, false) {
+		<-q.space
 	}
 }
 
@@ -113,8 +147,10 @@ func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
 		q.tail.Store(pos)
 		n++
 	}
-	if n > 0 {
-		signal(q.space)
+	// Free slots before taking the request, so a waiter that rechecks the ring
+	// after posting it sees them.
+	if n > 0 && q.spaceWanted.Load() && q.spaceWanted.CompareAndSwap(true, false) {
+		q.space <- struct{}{}
 	}
 	return n
 }
