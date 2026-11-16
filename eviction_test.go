@@ -267,6 +267,33 @@ func TestOnRemove_Delete(t *testing.T) {
 	}
 }
 
+func TestOnRemove_NegativeTTLSet(t *testing.T) {
+	rec := newEvictRecorder()
+	c, err := New(
+		Config{MaxSize: 100, ShardCount: 2, StatsEnabled: true},
+		WithOnRemove(rec.record),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.Set(5, "five", NoExpiration); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := c.Set(5, "new", -time.Second); err != nil {
+		t.Fatalf("Set with negative TTL: %v", err)
+	}
+
+	waitFor(t, func() bool {
+		v, ok := rec.value(5)
+		return ok && v == "five"
+	})
+	if rsn, _ := rec.reason(5); rsn != RemovedDeleted {
+		t.Fatalf("negative TTL Set reason = %v, want deleted", rsn)
+	}
+}
+
 func TestOnRemove_TTLExpiration(t *testing.T) {
 	rec := newEvictRecorder()
 	c, err := New(

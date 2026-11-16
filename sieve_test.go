@@ -2308,3 +2308,62 @@ func TestSieveTinyLFURecencyTieBreaking(t *testing.T) {
 		t.Errorf("Cache size should be 3, got %d", cache.Size())
 	}
 }
+
+func TestExistsDoesNotRecordSieveAccess(t *testing.T) {
+	c := newTestCache[int, int](t, Config{
+		MaxSize:        4,
+		ShardCount:     1,
+		EvictionPolicy: SieveTinyLFU,
+		StatsEnabled:   true,
+	})
+	defer c.Close()
+	for k := range 4 {
+		if err := c.Set(k, k, NoExpiration); err != nil {
+			t.Fatalf("Set(%d): %v", k, err)
+		}
+	}
+
+	s := c.shards[0]
+	if s.belowSieveWarmup() {
+		t.Fatal("shard is still in warmup, so reads would not record access")
+	}
+	item, ok := s.tab.lookup(c.hasher.Sum(0), 0)
+	if !ok {
+		t.Fatal("key 0 is not resident")
+	}
+	tailSum := func() uint64 {
+		var n uint64
+		for i := range s.readBuf.stripes {
+			n += s.readBuf.stripes[i].tail.Load()
+		}
+		return n
+	}
+
+	clearItemVisited(item)
+	before := tailSum()
+	for range 100 {
+		if !c.Exists(0) {
+			t.Fatal("Exists(0) = false, want true")
+		}
+	}
+	if itemVisited(item) {
+		t.Fatal("Exists set the visited bit")
+	}
+	if got := tailSum(); got != before {
+		t.Fatalf("Exists recorded %d read samples, want 0", got-before)
+	}
+	if st := c.Stats(); st.Hits != 0 || st.Misses != 0 {
+		t.Fatalf("Exists counted hits=%d misses=%d, want 0/0", st.Hits, st.Misses)
+	}
+
+	// Control: Get records both.
+	if _, ok := c.Get(0); !ok {
+		t.Fatal("Get(0) missed")
+	}
+	if !itemVisited(item) {
+		t.Fatal("control: Get did not set the visited bit")
+	}
+	if tailSum() == before {
+		t.Fatal("control: Get did not record a read sample")
+	}
+}

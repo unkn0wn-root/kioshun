@@ -18,7 +18,8 @@ var (
 	ErrCacheClosed = errors.New("cache is closed")
 	// ErrInvalidCost is returned when a configured weigher reports a negative cost.
 	ErrInvalidCost = errors.New("cache item cost is invalid")
-	// ErrItemTooLarge is returned when a weighted item cannot fit in its shard cost budget.
+	// ErrItemTooLarge is returned, wrapped, when a weighted item costs more than
+	// its shard's budget (about MaxCost divided by the shard count). Use errors.Is.
 	ErrItemTooLarge = errors.New("cache item cost exceeds shard budget")
 )
 

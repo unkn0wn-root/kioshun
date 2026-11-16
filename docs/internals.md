@@ -7,17 +7,20 @@ This document explains how the current v1 cache core is put together with a focu
 The root `kioshun` package contains the generic cache:
 
 - `cache.go`: public API, construction, sharding, reads, stats, cleanup.
-- `writes.go`: queued writes, synchronous mutation ordering, barriers, workers.
-- `shard.go`: per-shard state, item removal, read-sample draining, TTL cleanup.
+- `config.go`: `Config`, defaults, and validation.
+- `errors.go`: sentinel errors, `CacheError`, and `ConfigError`.
+- `writes.go`: queued writes, synchronous mutation ordering, barriers, workers, expiry callbacks.
+- `shard.go`: cache entry metadata, per-shard state, item removal, read-sample draining, TTL cleanup.
 - `htable.go`: per-shard open-addressing table with lock-free lookups.
-- `item.go`: cache entry metadata and immutable reader-visible fields.
-- `evict.go`: removal reasons and removal/eviction listener options.
-- `evictor.go`: LRU, LFU, and FIFO eviction adapters.
+- `eviction.go`: removal reasons, removal/eviction listener options, and the LRU, LFU, and FIFO eviction adapters.
 - `lfu.go`: exact LFU frequency bucket list.
-- `sieve.go`, `sketch.go`, `ghost.go`, `read_buffer.go`: SieveTinyLFU policy.
-- `queue.go`: bounded per-shard MPSC write queue.
-- `stripe_id.go`: per-P stripe id used by striped read buffers and stats.
+- `sieve.go`, `sketch.go`, `ghost.go`, `readbuffer.go`: SieveTinyLFU policy.
+- `mpsc.go`: bounded per-shard MPSC write queue.
+- `stripeid.go`: stripe id used by striped read buffers and stats.
+- `stats.go`: striped hit, miss, eviction, and expiration counters.
+- `cacheline.go`: cache-line padding size.
 - `internal/keyhash`: type-specialized hashing.
+- `internal/mathx`: power-of-two rounding.
 - `manager.go`: named cache registry and global manager helpers.
 
 The `httpcache` package layers HTTP response caching on top:
@@ -71,21 +74,30 @@ That design drives the item lifetime rules:
 - `EvictionPolicy = SieveTinyLFU`
 - `StatsEnabled = false`
 - `ProbationRatio = 1`
-- `GhostRatio = 100`
+- `GhostRatio = 75`
 - `CostAdmission = CostAdmissionFrequency`
 - `WriteBufferSize = 256`
 - `WriteBatchSize = 64`
 
 `New` validates the config, resolves `DefaultEvictionPolicy` to `SieveTinyLFU` and fills in default write queue settings when they are left as zero.
 
-A zero `ShardCount` lets the cache choose a count from the machine: it starts at `runtime.NumCPU() * 4` and caps that at 256. The final count is rounded to a
-power of two so shard lookup is just `hash & shardMask`. For bounded caches, `New` also caps the count so tiny `MaxSize` or `MaxCost` values do not create
-empty shards. `MaxSize` is split exactly across shards: every shard gets `MaxSize / shards`, and the first `MaxSize % shards` shards get one extra slot.
+A zero `ShardCount` lets the cache choose a count from the machine: it starts at `runtime.NumCPU() * 4` and caps that at 256. When `MaxSize` is set, the
+count is also capped at `MaxSize / 64` rounded down to a power of two (at least 1), so each shard holds at least `minShardEntries` (64) entries unless
+there is only one. Each shard enforces its own limit and keys spread unevenly, so with `c` slots per shard a cache filled with `MaxSize` distinct keys
+keeps about `1 - 1/sqrt(2πc)` of them, about 95% at 64 slots. At one slot per shard the expected share under uniform hashing is `1 - (1 - 1/n)^n` for `n` shards, about 63%.
+An explicit `ShardCount` skips this rule.
+
+The final count is rounded up to a power of two so shard lookup is just `hash & shardMask`. Automatic or explicit, when `MaxSize` or `MaxCost` is set,
+the count is capped at the largest power of two that is at most 256 and at most that limit, so every shard gets at least one entry of `MaxSize` and one unit of `MaxCost`. A shard whose share rounded
+down to zero would have no limit at all. `MaxSize` is split exactly across shards: every shard gets `MaxSize / shards`, and the first `MaxSize % shards`
+shards get one extra slot.
 
 `MaxSize == 0` means entries are unlimited. In that mode SieveTinyLFU has no eviction or admission work to do, so the per-shard Sieve state is not allocated.
 A SieveTinyLFU cache with `MaxCost > 0` must also have `MaxSize > 0`; the policy needs a bounded resident entry set to size its queues and sketch.
 
-`MaxCost` adds a weighted resident budget. The budget is distributed per shard and `WithWeigher` supplies item cost. With weighted SieveTinyLFU:
+`MaxCost` adds a weighted resident budget and `WithWeigher` supplies item cost. The budget is split across shards the same way as `MaxSize`, and each
+shard enforces only its own share, so one item can cost at most `MaxCost / shards`, give or take one. A costlier item is rejected before it reaches the
+write path, with an error that wraps `ErrItemTooLarge` and names the cost, the shard budget, `MaxCost`, and the shard count. With weighted SieveTinyLFU:
 
 - `CostAdmissionFrequency` compares TinyLFU frequency only.
 - `CostAdmissionBalanced` compares frequency divided by `sqrt(cost)`.
@@ -135,23 +147,26 @@ it as the empty trigger, so a pending insert's probe path stays intact.
 
 ## TTL And Expiration
 
-`Set` and `SetAsync` normalize TTLs before they reach the mutation path:
+`Set`, `SetAsync`, and `SetWithCallback` normalize TTLs before they reach the mutation path:
 
-- `DefaultExpiration` (`0`) uses `Config.DefaultTTL`
-- positive TTLs become an absolute `expireTime`
+- `DefaultExpiration` (`0`) uses `Config.DefaultTTL`, and a resolved TTL of 0 results in `expireTime == 0`
+- positive TTLs become an absolute `expireTime`, capped at `math.MaxInt64` so a huge TTL cannot wrap
 - `NoExpiration` (`-1`) results in `expireTime == 0`
+- any other negative TTL results in `expireTime == -1`, meaning already expired
 
-Any other non-positive effective TTL is treated as no expiration.
+An `expireTime` of -1 goes through the normal write path, inline or queued, so it stays ordered behind earlier writes to the same shard. When it is
+applied, the key is deleted the same way `Delete` deletes it, so listeners see `RemovedDeleted`. Nothing is stored, so the item's cost is not checked, and
+no callback is scheduled.
 
 Expired items leave the cache through three paths:
 
 - `Get`, when it encounters an expired item
-- `Exists`, which takes the write lock when removal is needed
+- `Exists`, which takes the write lock only when it finds an expired item
 - `Cleanup`, either called manually or by the cleanup worker
 
-`Keys` returns a point-in-time snapshot of non-expired keys. It does not clean up expired entries while scanning. `SetWithCallback` schedules its timer after
-the write commits, then re-checks the item when the timer wakes. The callback fires only if that same key still exists and is expired; cleanup still owns
-actual removal.
+`Keys` returns a point-in-time snapshot of non-expired keys. It does not clean up expired entries while scanning. `SetWithCallback` starts a
+`time.AfterFunc` timer after the write commits, so a pending callback costs a runtime timer and no goroutine. When the timer fires, the callback runs only
+if the cache is still open and the key still exists and is expired. Cleanup still owns actual removal.
 
 ## Removal Listener
 
@@ -199,7 +214,8 @@ Shard workers sleep on a coalesced `wake` channel. Each wake runs this sequence:
 
 `Sync`, `Clear`, and shutdown use barrier commands. A barrier sent to every shard is acknowledged only after earlier commands on that shard have been
 applied. `Close` marks the cache closed, flushes accepted writes, closes `closeCh`, waits for workers, and clears all shards. Producers blocked on a full
-queue wake through `closeCh` and return `ErrCacheClosed`.
+queue wake through `closeCh` and return `ErrCacheClosed`. `Close` does not stop callback timers. A timer that fires after `Close` sees the closed flag and
+returns without running the callback. A pending callback keeps its key, value and the cache reachable until its ttl has elapsed, even after `Close`.
 
 ## Read Path
 
@@ -223,6 +239,11 @@ shard write lock, removes it, and returns a miss. Before warmup, Sieve skips rea
 frequency sketch is not used yet.
 
 The SieveTinyLFU warmup threshold is `size*2 < cap`. Before that threshold, new writes skip frequency/admission work and are allowed to fill probation.
+
+`Exists` checks membership without touching policy state. It does not set `visited`, does not sample the read, and does not count a hit or miss. On a
+bounded SieveTinyLFU shard it probes the table without a lock and, on a miss, drains pending writes the same way `Get` does. LRU, LFU, FIFO, and unbounded
+SieveTinyLFU update items in place, so there `Exists` takes the shard read lock, and concurrent `Exists` calls do not wait for each other. If the item has
+expired, `Exists` takes the write lock, checks the item again, and removes it.
 
 ## Eviction Policies
 

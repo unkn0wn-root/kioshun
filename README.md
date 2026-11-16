@@ -116,6 +116,7 @@ c.Close() error
 > `Set` is synchronous and gives immediate 'read-after-write' visibility for the key.
 > `SetAsync` is optional. It may have committed inline already or it may still be queued.
 > Use `Sync` when committed visibility is required.
+> A negative TTL other than `NoExpiration` (-1) means already expired: the call stores nothing and removes the key.
 
 ## HTTP Middleware
 
