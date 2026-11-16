@@ -1,7 +1,9 @@
 package kioshun
 
 import (
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -113,6 +115,9 @@ func TestMPSCQueueCloseWakesBlockedProducer(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("close did not wake the blocked producer")
 	}
+	if q.spaceWanted.Load() || len(q.space) != 0 {
+		t.Fatalf("left behind after close: space wanted %v, %d wake-ups queued", q.spaceWanted.Load(), len(q.space))
+	}
 }
 
 func TestMPSCQueueConcurrentProducersNoLoss(t *testing.T) {
@@ -182,5 +187,134 @@ func TestWriteQueueWakeSignaled(t *testing.T) {
 	case <-wake:
 	default:
 		t.Fatal("enqueue did not signal the wake channel")
+	}
+}
+
+// One dequeue that frees two slots must release two blocked producers.
+func TestMPSCQueueFreedSlotsWakeEveryWaiter(t *testing.T) {
+	closeCh := make(chan struct{})
+	defer close(closeCh) // releases the producer that stays blocked
+	q := newMPSCQueue[int, int](2, make(chan struct{}, 1), closeCh)
+	for i := range 2 {
+		if err := q.enqueue(writeCommand[int, int]{hash: uint64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 3)
+	for i := range 3 {
+		go func() { done <- q.enqueue(writeCommand[int, int]{hash: uint64(10 + i)}) }()
+	}
+	select {
+	case <-done:
+		t.Fatal("enqueue returned while the ring was full")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if n := q.tryDequeue(make([]writeCommand[int, int], 2)); n != 2 {
+		t.Fatalf("dequeued %d, want 2", n)
+	}
+	for i := range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of 2 blocked producers got a freed slot", i)
+		}
+	}
+	select {
+	case <-done:
+		t.Fatal("a third producer returned while the ring was full again")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestMPSCQueueWakeConsumerQueuesOneWakeUp(t *testing.T) {
+	wake := make(chan struct{}, 1)
+	q := newMPSCQueue[int, int](8, wake, make(chan struct{}))
+	done := make(chan struct{})
+	go func() {
+		q.wakeConsumer()
+		q.wakeConsumer()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("a second wake-up blocked while one was queued")
+	}
+	if n := len(wake); n != 1 {
+		t.Fatalf("%d wake-ups queued, want 1", n)
+	}
+}
+
+// Concurrent callers with no consumer must queue one wake-up and never block.
+func TestMPSCQueueWakeConsumerConcurrentCallers(t *testing.T) {
+	for round := range 500 {
+		wake := make(chan struct{}, 1)
+		q := newMPSCQueue[int, int](8, wake, make(chan struct{}))
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				q.wakeConsumer()
+			}()
+		}
+		close(start)
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("round %d: a wake-up blocked while one was queued", round)
+		}
+		if n := len(wake); n != 1 {
+			t.Fatalf("round %d: %d wake-ups queued, want 1", round, n)
+		}
+	}
+}
+
+// Slots freed while the producer is about to wait must leave no request or
+// wake-up behind.
+func TestMPSCQueueSpaceLeavesNothingBehind(t *testing.T) {
+	for round := range 40 {
+		q := newMPSCQueue[int, int](2, make(chan struct{}, 1), make(chan struct{}))
+		var quit atomic.Bool
+		consumed := make(chan struct{})
+		go func() {
+			defer close(consumed)
+			buf := make([]writeCommand[int, int], 2)
+			for !quit.Load() {
+				if q.tryDequeue(buf) == 0 {
+					runtime.Gosched() // lets the producer run when GOMAXPROCS is 1
+				}
+			}
+		}()
+		produced := make(chan struct{})
+		go func() {
+			defer close(produced)
+			for i := range 20000 {
+				_ = q.enqueue(writeCommand[int, int]{hash: uint64(i)})
+			}
+		}()
+		select {
+		case <-produced:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: the producer is stuck: head %d, tail %d, space wanted %v, %d wake-ups queued",
+				round, q.head.Load(), q.tail.Load(), q.spaceWanted.Load(), len(q.space))
+		}
+		quit.Store(true)
+		select {
+		case <-consumed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: the consumer is blocked on a space wake-up that nobody takes", round)
+		}
+		if q.spaceWanted.Load() || len(q.space) != 0 {
+			t.Fatalf("round %d: left behind: space wanted %v, %d wake-ups queued", round, q.spaceWanted.Load(), len(q.space))
+		}
 	}
 }

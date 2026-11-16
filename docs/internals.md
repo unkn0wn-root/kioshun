@@ -178,10 +178,14 @@ buffer while holding the shard lock. A dedicated worker drains those buffers and
 cache. If no listener is configured, no buffer or worker is allocated. Delivery is asynchronous, so secondary indexes must handle a notification arriving after
 the same key has already been inserted again.
 
+Staging buffers are reused: when the worker takes a shard's staged removals, it leaves an empty buffer that it has already delivered, so removals do not
+allocate new buffers while the worker keeps up. A buffer whose capacity a burst grew past 256 entries is dropped after delivery instead of kept.
+
 ## Write Path
 
 Every shard has a bounded multi-producer, single-consumer ring queue. Producers claim slots with CAS on `head`; the shard worker owns `tail`. Sequence numbers
-on each cell distinguish free, published, and stale slots across ring laps. The ring size is rounded to a power of two and is never smaller than 2.
+on each cell distinguish free, published, and stale slots across ring laps. The ring size is rounded to a power of two and is never smaller than 2. A
+producer that finds the ring full waits for a free slot, and a drain that frees several slots lets that many waiting producers through.
 
 `SetAsync` is the fast write API. It tries the cheapest path first: apply the write inline when the shard is completely idle.
 

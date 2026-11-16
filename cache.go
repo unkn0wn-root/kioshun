@@ -66,7 +66,7 @@ type Cache[K comparable, V any] struct {
 	evictor      evictor[K, V] // nil for SieveTinyLFU
 	onRemove     func(K, V, RemovalReason)
 	onEvict      func(K, V)
-	removeWake   chan struct{}
+	removeWake   *removalWake
 
 	stats *stats // nil unless StatsEnabled
 }
@@ -204,7 +204,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 
 	nm := cache.listenerNotifyMask()
 	if nm != 0 {
-		cache.removeWake = make(chan struct{}, 1)
+		cache.removeWake = &removalWake{ch: make(chan struct{}, 1)}
 		for _, s := range cache.shards {
 			s.removeWake = cache.removeWake
 			s.removeNotifyMask = nm

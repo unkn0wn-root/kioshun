@@ -58,9 +58,10 @@ type shard[K comparable, V any] struct {
 	size int64 // live items
 	cost int64 // live item cost
 
-	// Removed entries are buffered under mu and delivered after releasing it.
-	// removeWake is nil when no listener is registered.
-	removeWake       chan struct{}
+	// Removed entries are staged in removeBuf under mu. The notify worker swaps
+	// in an empty buffer and delivers after unlocking. removePending is written
+	// only under mu. removeWake is nil when no listener is registered.
+	removeWake       *removalWake
 	removeNotifyMask removalNotifyMask
 	removeBuf        []removedEntry[K, V]
 	removePending    atomic.Bool
@@ -119,8 +120,9 @@ func (s *shard[K, V]) dropItem(
 	}
 
 	if s.stageRemoval(item.key, item.value, reason) {
+		// Set the flag before signalling. The worker reads it without the lock.
 		s.removePending.Store(true)
-		signal(s.removeWake)
+		s.removeWake.signal()
 	}
 	if item.cost != 0 {
 		atomic.AddInt64(&s.cost, -item.cost)
@@ -160,7 +162,7 @@ func (s *shard[K, V]) sampleRead(h, id uint64) {
 		s.drainMu.Unlock()
 		return
 	}
-	signal(s.wake)
+	s.queue.wakeConsumer()
 }
 
 // drainReadSamples adds pending read hashes to the frequency sketch. A dirty bit
