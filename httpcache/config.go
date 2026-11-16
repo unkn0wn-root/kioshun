@@ -15,7 +15,7 @@ type Config struct {
 	MaxSize               int64
 	ShardCount            int
 	CleanupInterval       time.Duration
-	DefaultTTL            time.Duration
+	DefaultTTL            time.Duration // lifetime for public responses without max-age, s-maxage or Expires, and for a Policy TTL of 0.
 	EvictionPolicy        kioshun.EvictionPolicy
 	ProbationRatio        uint8
 	GhostRatio            uint8
@@ -48,8 +48,8 @@ func DefaultConfig() Config {
 		DefaultTTL:       5 * time.Minute,
 		EvictionPolicy:   kioshun.SieveTinyLFU,
 		CacheableMethods: []string{"GET", "HEAD"},
-		CacheableStatus:  []int{200, 201, 300, 301, 302, 304, 404, 410},
-		IgnoreHeaders:    []string{"Date", "Server", "X-Request-Id", "X-Trace-Id"},
+		CacheableStatus:  []int{200, 201, 300, 301, 302, 404, 410},
+		IgnoreHeaders:    []string{"Server", "X-Request-Id", "X-Trace-Id"},
 		MaxBodySize:      10 * 1024 * 1024, // 10MB
 		HitHeader:        "X-Cache",
 		MissHeader:       "X-Cache",

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"net"
 	"net/http"
 	"slices"
@@ -22,12 +23,17 @@ type Response struct {
 	Headers    http.Header
 	Body       []byte
 	CachedAt   time.Time
+
+	vary http.Header   // request values of the fields named in the response's Vary
+	age  time.Duration // corrected initial age at CachedAt
 }
 
 // KeyGenerator builds a cache key from a request.
 type KeyGenerator func(*http.Request) string
 
 // Policy decides whether a response should be cached and for how long.
+// Wrap never stores a response that a shared cache must not store, whatever
+// the Policy returns.
 type Policy func(*http.Request, int, http.Header, []byte) (shouldCache bool, ttl time.Duration)
 
 // PathExtractor recovers a URL path from a cache key for pattern invalidation.
@@ -110,21 +116,54 @@ func New(config Config) (*Middleware, error) {
 // Wrap wraps an HTTP handler with response caching.
 func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !m.cacheableRequest(r) {
+		if _, ok := m.methods[r.Method]; !ok {
+			switch r.Method {
+			case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+				next.ServeHTTP(w, r)
+				return
+			}
+			// A successful unsafe method invalidates the target URI (RFC 9111
+			// section 4.4). Take the keys before the handler can change the
+			// request. A body limit of 0 buffers nothing.
+			req := *r
+			req.Method = http.MethodGet
+			getKey := m.keyGen(&req)
+			req.Method = http.MethodHead
+			headKey := m.keyGen(&req)
+			rw := newResponseWriter(w, "", 0, true)
+			next.ServeHTTP(rw, r)
+			if rw.statusCode >= 200 && rw.statusCode < 400 {
+				m.cache.Delete(getKey)
+				m.cache.Delete(headKey)
+			}
+			return
+		}
+		if !cacheableRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		key := m.keyGen(r)
 		if cached, found := m.cache.Get(key); found {
-			m.serveCached(w, cached, key)
-			return
+			match := true
+			for name, values := range cached.vary {
+				if !slices.Equal(r.Header.Values(name), values) {
+					match = false
+					break
+				}
+			}
+			if match {
+				m.serveCached(w, cached, key)
+				return
+			}
 		}
 
 		if m.onMiss != nil {
 			m.onMiss(key)
 		}
 
+		// Judge the request as received, not as the handler left it.
+		reqHeader := r.Header.Clone()
 		rw := newResponseWriter(w, m.missHeader, m.maxBodySize, m.limitBody)
 		next.ServeHTTP(rw, r)
 		rw.finish()
@@ -132,16 +171,51 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		if !rw.cacheable() {
 			return
 		}
+
+		// Storage restrictions for a shared cache (RFC 9111 section 3) apply
+		// whatever the policy decides. A 206 is incomplete (section 3.3).
+		cc := strings.Join(rw.headers.Values("Cache-Control"), ",")
+		switch {
+		case rw.statusCode == http.StatusPartialContent,
+			hasCacheControlDirective(cc, "no-store", "no-cache", "private"),
+			len(reqHeader.Values("Authorization")) > 0 && !hasCacheControlDirective(cc, "public", "s-maxage", "must-revalidate"),
+			len(rw.headers.Values("Set-Cookie")) > 0,
+			hasCacheControlDirective(strings.Join(reqHeader.Values("Cache-Control"), ","), "no-store"):
+			return
+		}
+
 		body := rw.buf.Bytes()
 		shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body)
 		if !shouldCache {
 			return
 		}
+		var vary http.Header
+		for name := range strings.SplitSeq(strings.Join(rw.headers.Values("Vary"), ","), ",") {
+			name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+			switch name {
+			case "":
+				continue
+			case "*":
+				return
+			}
+			if vary == nil {
+				vary = make(http.Header)
+			}
+			// Clone so the entry does not keep the whole request header alive.
+			vary[name] = slices.Clone(reqHeader.Values(name))
+		}
+		now := time.Now()
+		headers := m.cachedHeaders(rw.headers)
+		if headers.Get("Date") == "" {
+			headers.Set("Date", now.UTC().Format(http.TimeFormat))
+		}
 		cached := &Response{
 			StatusCode: rw.statusCode,
-			Headers:    m.cachedHeaders(rw.headers),
+			Headers:    headers,
 			Body:       bytes.Clone(body),
-			CachedAt:   time.Now(),
+			CachedAt:   now,
+			vary:       vary,
+			age:        initialAge(rw.headers, now),
 		}
 		if err := m.store(key, cached, ttl); err == nil && m.onSet != nil {
 			m.onSet(key, ttl)
@@ -256,16 +330,16 @@ func (m *Middleware) serveCached(w http.ResponseWriter, cached *Response, key st
 		w.Header()[k] = slices.Clone(v)
 	}
 
+	age := (cached.age + time.Since(cached.CachedAt)) / time.Second
 	w.Header().Set(m.hitHeader, "HIT")
-	w.Header().Set("X-Cache-Date", cached.CachedAt.Format(time.RFC3339))
-	w.Header().Set("X-Cache-Age", time.Since(cached.CachedAt).String())
+	w.Header().Set("Age", strconv.FormatInt(int64(age), 10))
 
 	w.WriteHeader(cached.StatusCode)
 	_, _ = w.Write(cached.Body)
 }
 
 func ignoredHeaders(config Config) map[string]struct{} {
-	headers := make(map[string]struct{}, len(config.IgnoreHeaders)+5)
+	headers := make(map[string]struct{}, len(config.IgnoreHeaders)+3)
 	for _, name := range config.IgnoreHeaders {
 		if name != "" {
 			headers[http.CanonicalHeaderKey(name)] = struct{}{}
@@ -273,8 +347,6 @@ func ignoredHeaders(config Config) map[string]struct{} {
 	}
 	for _, name := range []string{
 		"X-Cache",
-		"X-Cache-Date",
-		"X-Cache-Age",
 		config.HitHeader,
 		config.MissHeader,
 	} {
@@ -285,10 +357,18 @@ func ignoredHeaders(config Config) map[string]struct{} {
 	return headers
 }
 
+// cachedHeaders copies the headers to store. It leaves out ignored headers and
+// the hop-by-hop fields, which describe one connection (RFC 9110 section 7.6.1).
 func (m *Middleware) cachedHeaders(headers http.Header) http.Header {
+	hop := []string{"Connection", "Keep-Alive", "Proxy-Connection"}
+	for name := range strings.SplitSeq(strings.Join(headers.Values("Connection"), ","), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			hop = append(hop, http.CanonicalHeaderKey(name))
+		}
+	}
 	cached := make(http.Header, len(headers))
 	for name, values := range headers {
-		if _, ignored := m.ignore[http.CanonicalHeaderKey(name)]; ignored {
+		if _, ignored := m.ignore[name]; ignored || slices.Contains(hop, name) {
 			continue
 		}
 		cached[name] = slices.Clone(values)
@@ -296,28 +376,38 @@ func (m *Middleware) cachedHeaders(headers http.Header) http.Header {
 	return cached
 }
 
-func (m *Middleware) cacheableRequest(r *http.Request) bool {
-	_, ok := m.methods[r.Method]
-	return ok
-}
-
-// DefaultKeyGenerator hashes the method, full URL, and common vary headers.
-func DefaultKeyGenerator(r *http.Request) string {
-	h := md5.New()
-	h.Write([]byte(r.Method))
-	h.Write([]byte(r.URL.String()))
-
-	vary := []string{"Accept", "Accept-Encoding", "Authorization", "Accept-Language"}
-	for _, header := range vary {
-		if value := r.Header.Get(header); value != "" {
-			h.Write([]byte(header + ":" + value))
+// cacheableRequest reports whether r may be served from or stored in the
+// cache. Conditional and Range requests go to the origin.
+func cacheableRequest(r *http.Request) bool {
+	for _, name := range []string{"Range", "If-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
+		if len(r.Header.Values(name)) > 0 {
+			return false
 		}
 	}
-
-	return hex.EncodeToString(h.Sum(nil))
+	return true
 }
 
-// DefaultCachePolicy builds a policy that respects HTTP cache headers.
+// DefaultKeyGenerator hashes the method and target URI. Responses that vary
+// on request headers are told apart by their Vary field instead.
+func DefaultKeyGenerator(r *http.Request) string {
+	sum := md5.Sum([]byte(r.Method + " " + targetURI(r)))
+	return hex.EncodeToString(sum[:])
+}
+
+// targetURI returns the absolute target URI of a server request, whose
+// authority is in r.Host while r.URL holds only the path and query.
+func targetURI(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host + r.URL.RequestURI()
+}
+
+// DefaultCachePolicy builds a policy that stores responses with explicit
+// freshness. The lifetime is s-maxage, then max-age, then Expires minus Date.
+// A response marked public without any of these gets DefaultTTL. The result
+// is the lifetime minus the response's current age.
 func DefaultCachePolicy(config Config) Policy {
 	config = configWithDefaults(config)
 	cacheableMethods := cacheableMethodSet(config.CacheableMethods)
@@ -338,25 +428,35 @@ func DefaultCachePolicy(config Config) Policy {
 			return false, 0
 		}
 
-		cacheControl := headers.Get("Cache-Control")
-		if hasCacheControlDirective(cacheControl, "no-cache", "no-store", "private") {
+		now := time.Now()
+		cc := strings.Join(headers.Values("Cache-Control"), ",")
+		var lifetime time.Duration
+		if sMaxAge, ok := cacheControlSeconds(cc, "s-maxage"); ok {
+			lifetime = sMaxAge
+		} else if maxAge, ok := cacheControlSeconds(cc, "max-age"); ok {
+			lifetime = maxAge
+		} else if expires := headers.Values("Expires"); len(expires) > 0 {
+			// An invalid Expires means already expired (RFC 9111 section 5.3).
+			t, err := http.ParseTime(expires[0])
+			if err != nil {
+				return false, 0
+			}
+			date, err := http.ParseTime(headers.Get("Date"))
+			if err != nil {
+				date = now
+			}
+			lifetime = t.Sub(date)
+		} else if hasCacheControlDirective(cc, "public") {
+			if config.DefaultTTL == kioshun.NoExpiration {
+				return true, kioshun.NoExpiration
+			}
+			lifetime = config.DefaultTTL
+		} else {
 			return false, 0
 		}
 
-		if maxAge := extractMaxAge(cacheControl); maxAge > 0 {
-			return true, maxAge
-		}
-
-		if expires := headers.Get("Expires"); expires != "" {
-			if expireTime, err := time.Parse(time.RFC1123, expires); err == nil {
-				ttl := time.Until(expireTime)
-				if ttl > 0 {
-					return true, ttl
-				}
-			}
-		}
-
-		return true, config.DefaultTTL
+		ttl := lifetime - initialAge(headers, now)
+		return ttl > 0, ttl
 	}
 }
 
@@ -370,9 +470,11 @@ func cacheableMethodSet(methods []string) map[string]struct{} {
 	return set
 }
 
-// PathBasedKeyGenerator keys responses by request method and path.
+// PathBasedKeyGenerator keys responses as "METHOD:host/path", using the
+// escaped path. It ignores the query string, so it suits only resources whose
+// response does not depend on the query.
 func PathBasedKeyGenerator(r *http.Request) string {
-	return r.Method + ":" + r.URL.Path
+	return r.Method + ":" + r.Host + r.URL.EscapedPath()
 }
 
 // responseWriter captures status, headers, and body while forwarding writes.
@@ -410,7 +512,19 @@ func (rw *responseWriter) WriteHeader(code int) {
 	}
 
 	rw.statusCode = code
-	rw.headers = rw.ResponseWriter.Header().Clone()
+	// Canonicalize, merging keys in sorted order as net/http writes them, so the
+	// rules see fields the handler set under non-canonical keys.
+	h := rw.Header()
+	names := make([]string, 0, len(h))
+	for name := range h {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	rw.headers = make(http.Header, len(h))
+	for _, name := range names {
+		canonical := http.CanonicalHeaderKey(name)
+		rw.headers[canonical] = append(rw.headers[canonical], h[name]...)
+	}
 	if code == http.StatusSwitchingProtocols {
 		rw.streamed = true
 	}
@@ -498,72 +612,66 @@ func (rw *responseWriter) Push(target string, opts *http.PushOptions) error {
 	return pusher.Push(target, opts)
 }
 
-// KeyWithVaryHeaders hashes the method, full URL, and selected vary headers.
+// KeyWithVaryHeaders hashes the method, target URI, and the named request headers.
 func KeyWithVaryHeaders(varyHeaders []string) KeyGenerator {
 	return func(r *http.Request) string {
 		h := md5.New()
-		h.Write([]byte(r.Method))
-		h.Write([]byte(r.URL.String()))
-
-		for _, header := range varyHeaders {
-			if value := r.Header.Get(header); value != "" {
-				h.Write([]byte(header + ":" + value))
-			}
+		h.Write([]byte(r.Method + " " + targetURI(r)))
+		for _, name := range varyHeaders {
+			h.Write([]byte("\n" + name + ": " + strings.Join(r.Header.Values(name), ",")))
 		}
-
 		return hex.EncodeToString(h.Sum(nil))
 	}
 }
 
-// KeyWithoutQuery keys responses by method and path, ignoring query parameters.
+// KeyWithoutQuery keys responses as "METHOD:host/path". It ignores the query
+// string, so requests that differ only in the query share one entry. Use it
+// only for resources whose response does not depend on the query.
 // It is PathBasedKeyGenerator in the form New-style call sites expect.
 func KeyWithoutQuery() KeyGenerator {
 	return PathBasedKeyGenerator
 }
 
-// KeyWithoutQueryHashed hashes method, path, and common vary headers.
+// KeyWithoutQueryHashed hashes the method, host, escaped path, and the Accept,
+// Accept-Encoding and Authorization request headers. It ignores the query string.
 func KeyWithoutQueryHashed() KeyGenerator {
 	return func(r *http.Request) string {
 		h := md5.New()
-		h.Write([]byte(r.Method))
-		h.Write([]byte(r.URL.Path))
-
-		vary := []string{"Accept", "Accept-Encoding", "Authorization"}
-		for _, header := range vary {
-			if value := r.Header.Get(header); value != "" {
-				h.Write([]byte(header + ":" + value))
-			}
+		h.Write([]byte(r.Method + " " + r.Host + r.URL.EscapedPath()))
+		for _, name := range []string{"Accept", "Accept-Encoding", "Authorization"} {
+			h.Write([]byte("\n" + name + ": " + strings.Join(r.Header.Values(name), ",")))
 		}
-
 		return hex.EncodeToString(h.Sum(nil))
 	}
 }
 
-// PathExtractorFromKey extracts path from "METHOD:PATH" keys.
+// PathExtractorFromKey extracts the path from "METHOD:host/path" keys. It also
+// accepts "METHOD:/path" keys.
 func PathExtractorFromKey(key string) string {
-	parts := strings.SplitN(key, ":", 2)
-	if len(parts) == 2 {
-		return parts[1]
+	_, rest, ok := strings.Cut(key, ":")
+	if !ok {
+		return key
 	}
-	return key
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[i:]
+	}
+	return rest
 }
 
-// KeyWithUserID hashes the request with a user identifier header.
+// KeyWithUserID hashes the method, target URI, and a user identifier header.
+// The header must be set by trusted code in front of the cache, since a
+// client can send any value.
 func KeyWithUserID(userIDHeader string) KeyGenerator {
 	return func(r *http.Request) string {
 		h := md5.New()
-		h.Write([]byte(r.Method))
-		h.Write([]byte(r.URL.String()))
-
-		if userID := r.Header.Get(userIDHeader); userID != "" {
-			h.Write([]byte("user:" + userID))
-		}
-
+		h.Write([]byte(r.Method + " " + targetURI(r)))
+		h.Write([]byte("\n" + userIDHeader + ": " + strings.Join(r.Header.Values(userIDHeader), ",")))
 		return hex.EncodeToString(h.Sum(nil))
 	}
 }
 
-// AlwaysCache caches successful 2xx responses for the supplied TTL.
+// AlwaysCache caches successful 2xx responses for the supplied TTL. Wrap still
+// refuses responses that a shared cache must not store.
 func AlwaysCache(ttl time.Duration) Policy {
 	return func(_ *http.Request, statusCode int, _ http.Header, _ []byte) (bool, time.Duration) {
 		return statusCode >= 200 && statusCode < 300, ttl
@@ -577,7 +685,8 @@ func NeverCache() Policy {
 	}
 }
 
-// ByContentType assigns TTLs by Content-Type prefix.
+// ByContentType assigns TTLs by Content-Type prefix. Wrap still refuses
+// responses that a shared cache must not store.
 func ByContentType(rules map[string]time.Duration, defaultTTL time.Duration) Policy {
 	return func(_ *http.Request, statusCode int, headers http.Header, _ []byte) (bool, time.Duration) {
 		if statusCode < 200 || statusCode >= 300 {
@@ -596,6 +705,7 @@ func ByContentType(rules map[string]time.Duration, defaultTTL time.Duration) Pol
 }
 
 // BySize caches successful 2xx responses within the specified size range.
+// Wrap still refuses responses that a shared cache must not store.
 func BySize(minSize, maxSize int64, ttl time.Duration) Policy {
 	return func(_ *http.Request, statusCode int, _ http.Header, body []byte) (bool, time.Duration) {
 		if statusCode < 200 || statusCode >= 300 {
@@ -607,22 +717,48 @@ func BySize(minSize, maxSize int64, ttl time.Duration) Policy {
 	}
 }
 
-// extractMaxAge parses a positive max-age directive from Cache-Control.
-func extractMaxAge(cacheControl string) time.Duration {
-	if cacheControl == "" {
-		return 0
-	}
-
-	for part := range strings.SplitSeq(cacheControl, ",") {
-		part = strings.TrimSpace(part)
-		name, value, ok := strings.Cut(part, "=")
-		if ok && strings.EqualFold(strings.TrimSpace(name), "max-age") {
-			if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds > 0 {
-				return time.Duration(seconds) * time.Second
-			}
+// cacheControlSeconds reports the delta-seconds value of the first directive
+// named in cc. An invalid value reads as 0, which makes the response stale.
+func cacheControlSeconds(cc, directive string) (time.Duration, bool) {
+	for part := range strings.SplitSeq(cc, ",") {
+		name, value, _ := strings.Cut(strings.TrimSpace(part), "=")
+		if !strings.EqualFold(strings.TrimSpace(name), directive) {
+			continue
 		}
+		seconds, _ := deltaSeconds(value)
+		return seconds, true
 	}
-	return 0
+	return 0, false
+}
+
+// initialAge returns the corrected initial age of a response received at now:
+// the larger of its apparent age from Date and its Age field, at most 2^31
+// seconds (RFC 9111 section 4.2.3).
+func initialAge(h http.Header, now time.Time) time.Duration {
+	var age time.Duration
+	if date, err := http.ParseTime(h.Get("Date")); err == nil {
+		age = now.Sub(date)
+	}
+	if seconds, ok := deltaSeconds(h.Get("Age")); ok {
+		age = max(age, seconds)
+	}
+	return min(max(age, 0), (1<<31)*time.Second)
+}
+
+// deltaSeconds parses a delta-seconds value (RFC 9111 section 1.2.2). It reads
+// the first member of a list, ignores surrounding spaces and one surrounding
+// pair of quotes, and clamps values above 2^31.
+func deltaSeconds(s string) (time.Duration, bool) {
+	s, _, _ = strings.Cut(s, ",")
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+	}
+	seconds, err := strconv.ParseUint(s, 10, 64)
+	if err != nil && !errors.Is(err, strconv.ErrRange) {
+		return 0, false
+	}
+	return time.Duration(min(seconds, 1<<31)) * time.Second, true
 }
 
 func hasCacheControlDirective(cacheControl string, directives ...string) bool {
