@@ -7,14 +7,19 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"errors"
+	"hash/maphash"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/unkn0wn-root/kioshun"
+	"github.com/unkn0wn-root/kioshun/internal/mathx"
 )
 
 // Response is a cached HTTP response.
@@ -24,11 +29,16 @@ type Response struct {
 	Body       []byte
 	CachedAt   time.Time
 
-	vary http.Header   // request values of the fields named in the response's Vary
-	age  time.Duration // corrected initial age at CachedAt
+	vary  http.Header   // request values of the fields named in the response's Vary
+	age   time.Duration // corrected initial age at CachedAt
+	epoch uint64        // the slot's epoch when stored
+	slot  uint64        // epoch slot of the resource key plus 1, or 0 if untagged
 }
 
-// KeyGenerator builds a cache key from a request.
+// KeyGenerator builds a cache key from a request. After SetKeyGenerator it is
+// also called with a copy of the request that has no headers, to find every
+// stored variant of the same URL. If it panics on that copy for GET or HEAD,
+// a successful unsafe request removes only its own entry for that method.
 type KeyGenerator func(*http.Request) string
 
 // Policy decides whether a response should be cached and for how long.
@@ -54,12 +64,22 @@ type Middleware struct {
 	maxBodySize int64
 	limitBody   bool
 
+	// epochs is allocated by SetKeyGenerator. Each stored variant records its
+	// slot's epoch, and an unsafe request moves it on.
+	epochs  []atomic.Uint64
+	maxSize int64        // resolved MaxSize, which sizes epochs
+	seed    maphash.Seed // picks epoch slots and stripes
+
 	// tracks cached keys by URL path for Invalidate. It is populated
 	// and queried only when patternEnabled is set (a PathExtractor was configured),
 	// and kept in sync by the backing cache's removal listener (onCacheRemove).
 	patternEnabled bool
 	patternIdx     *patternIndex
 	pathExtract    PathExtractor
+
+	// stripes order the stores of one key, and Clear, against the pattern
+	// index. They are used only when patternEnabled is set.
+	stripes [64]sync.Mutex
 }
 
 // New creates a caching Middleware from config, applying DefaultConfig for unset fields.
@@ -91,6 +111,8 @@ func New(config Config) (*Middleware, error) {
 		methods:     cacheableMethodSet(config.CacheableMethods),
 		maxBodySize: config.MaxBodySize,
 		limitBody:   !config.DisableBodySizeLimit,
+		maxSize:     config.MaxSize,
+		seed:        maphash.MakeSeed(),
 		patternIdx:  newPatternIndex(),
 	}
 
@@ -124,17 +146,37 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			}
 			// A successful unsafe method invalidates the target URI (RFC 9111
 			// section 4.4). Take the keys before the handler can change the
-			// request. A body limit of 0 buffers nothing.
-			req := *r
-			req.Method = http.MethodGet
-			getKey := m.keyGen(&req)
-			req.Method = http.MethodHead
-			headKey := m.keyGen(&req)
+			// request. If the generator panics on the bare request, only the
+			// request's own entries are removed. A body limit of 0 buffers nothing.
+			var getKey, headKey, getRK, headRK string
+			var getOK, headOK bool
+			if m.epochs != nil {
+				req := bareRequest(r, r.URL)
+				req.Method = http.MethodGet
+				getRK, getOK = m.resourceKey(req)
+				req.Method = http.MethodHead
+				headRK, headOK = m.resourceKey(req)
+			}
+			if !getOK || !headOK {
+				req := *r
+				req.Method = http.MethodGet
+				getKey = m.keyGen(&req)
+				req.Method = http.MethodHead
+				headKey = m.keyGen(&req)
+			}
 			rw := newResponseWriter(w, "", 0, true)
 			next.ServeHTTP(rw, r)
 			if rw.statusCode >= 200 && rw.statusCode < 400 {
-				m.cache.Delete(getKey)
-				m.cache.Delete(headKey)
+				if !getOK || !headOK {
+					m.cache.Delete(getKey)
+					m.cache.Delete(headKey)
+				}
+				if getOK {
+					m.invalidate(getRK)
+				}
+				if headOK {
+					m.invalidate(headRK)
+				}
 			}
 			return
 		}
@@ -143,8 +185,10 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
+		// A response stored before its resource key's epoch moved on is
+		// treated like a Vary mismatch.
 		key := m.keyGen(r)
-		if cached, found := m.cache.Get(key); found {
+		if cached, found := m.cache.Get(key); found && (cached.slot == 0 || m.epochs[cached.slot-1].Load() == cached.epoch) {
 			match := true
 			for name, values := range cached.vary {
 				if !slices.Equal(r.Header.Values(name), values) {
@@ -165,62 +209,88 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 		// Judge the request as received, not as the handler left it.
 		reqHeader := r.Header.Clone()
 		rw := newResponseWriter(w, m.missHeader, m.maxBodySize, m.limitBody)
+		if m.epochs != nil {
+			m.serveTagged(next, rw, r, reqHeader, key)
+			return
+		}
 		next.ServeHTTP(rw, r)
-		rw.finish()
-
-		if !rw.cacheable() {
-			return
-		}
-
-		// Storage restrictions for a shared cache (RFC 9111 section 3) apply
-		// whatever the policy decides. A 206 is incomplete (section 3.3).
-		cc := strings.Join(rw.headers.Values("Cache-Control"), ",")
-		switch {
-		case rw.statusCode == http.StatusPartialContent,
-			hasCacheControlDirective(cc, "no-store", "no-cache", "private"),
-			len(reqHeader.Values("Authorization")) > 0 && !hasCacheControlDirective(cc, "public", "s-maxage", "must-revalidate"),
-			len(rw.headers.Values("Set-Cookie")) > 0,
-			hasCacheControlDirective(strings.Join(reqHeader.Values("Cache-Control"), ","), "no-store"):
-			return
-		}
-
-		body := rw.buf.Bytes()
-		shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body)
-		if !shouldCache {
-			return
-		}
-		var vary http.Header
-		for name := range strings.SplitSeq(strings.Join(rw.headers.Values("Vary"), ","), ",") {
-			name = http.CanonicalHeaderKey(strings.TrimSpace(name))
-			switch name {
-			case "":
-				continue
-			case "*":
-				return
-			}
-			if vary == nil {
-				vary = make(http.Header)
-			}
-			// Clone so the entry does not keep the whole request header alive.
-			vary[name] = slices.Clone(reqHeader.Values(name))
-		}
-		now := time.Now()
-		headers := m.cachedHeaders(rw.headers)
-		if headers.Get("Date") == "" {
-			headers.Set("Date", now.UTC().Format(http.TimeFormat))
-		}
-		cached := &Response{
-			StatusCode: rw.statusCode,
-			Headers:    headers,
-			Body:       bytes.Clone(body),
-			CachedAt:   now,
-			vary:       vary,
-			age:        initialAge(rw.headers, now),
-		}
-		if err := m.store(key, cached, ttl); err == nil && m.onSet != nil {
-			m.onSet(key, ttl)
-		}
+		m.storeResponse(rw, r, reqHeader, key, nil, nil)
 	})
+}
+
+// serveTagged runs next and stores the response tagged with the epoch of the
+// request as received. It keeps its request copy off Wrap's frame.
+func (m *Middleware) serveTagged(next http.Handler, rw *responseWriter, r *http.Request, reqHeader http.Header, key string) {
+	received, u := *r, *r.URL
+	next.ServeHTTP(rw, r)
+	m.storeResponse(rw, r, reqHeader, key, &received, &u)
+}
+
+// storeResponse stores rw's response under key if a shared cache may store it.
+// received and u are the request and URL before the handler ran, or nil without
+// the epoch table. It keeps the store path's locals off Wrap's frame.
+func (m *Middleware) storeResponse(rw *responseWriter, r *http.Request, reqHeader http.Header, key string, received *http.Request, u *url.URL) {
+	rw.finish()
+
+	if !rw.cacheable() {
+		return
+	}
+
+	// Storage restrictions for a shared cache (RFC 9111 section 3) apply
+	// whatever the policy decides. A 206 is incomplete (section 3.3).
+	cc := strings.Join(rw.headers.Values("Cache-Control"), ",")
+	switch {
+	case rw.statusCode == http.StatusPartialContent,
+		hasCacheControlDirective(cc, "no-store", "no-cache", "private"),
+		len(reqHeader.Values("Authorization")) > 0 && !hasCacheControlDirective(cc, "public", "s-maxage", "must-revalidate"),
+		len(rw.headers.Values("Set-Cookie")) > 0,
+		hasCacheControlDirective(strings.Join(reqHeader.Values("Cache-Control"), ","), "no-store"):
+		return
+	}
+
+	body := rw.buf.Bytes()
+	shouldCache, ttl := m.policy(r, rw.statusCode, rw.headers, body)
+	if !shouldCache {
+		return
+	}
+	var vary http.Header
+	for name := range strings.SplitSeq(strings.Join(rw.headers.Values("Vary"), ","), ",") {
+		name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+		switch name {
+		case "":
+			continue
+		case "*":
+			return
+		}
+		if vary == nil {
+			vary = make(http.Header)
+		}
+		// Clone so the entry does not keep the whole request header alive.
+		vary[name] = slices.Clone(reqHeader.Values(name))
+	}
+	now := time.Now()
+	headers := m.cachedHeaders(rw.headers)
+	if headers.Get("Date") == "" {
+		headers.Set("Date", now.UTC().Format(http.TimeFormat))
+	}
+	cached := &Response{
+		StatusCode: rw.statusCode,
+		Headers:    headers,
+		Body:       bytes.Clone(body),
+		CachedAt:   now,
+		vary:       vary,
+		age:        initialAge(rw.headers, now),
+	}
+	if received != nil {
+		if rk, ok := m.resourceKey(bareRequest(received, u)); ok && rk != key {
+			s := m.slotFor(rk)
+			cached.slot = s + 1
+			cached.epoch = m.epochs[s].Load()
+		}
+	}
+	if err := m.store(key, cached, ttl); err == nil && m.onSet != nil {
+		m.onSet(key, ttl)
+	}
 }
 
 // Stats returns cache statistics.
@@ -228,6 +298,16 @@ func (m *Middleware) Stats() kioshun.Stats { return m.cache.Stats() }
 
 // Clear removes all cached entries.
 func (m *Middleware) Clear() {
+	if m.patternEnabled {
+		for i := range m.stripes {
+			m.stripes[i].Lock()
+		}
+		defer func() {
+			for i := range m.stripes {
+				m.stripes[i].Unlock()
+			}
+		}()
+	}
 	m.cache.Clear()
 	m.patternIdx.clear()
 }
@@ -265,9 +345,9 @@ func (m *Middleware) InvalidateByFunc(fn func(string) bool) int {
 }
 
 // store writes resp to the cache. When pattern invalidation is enabled it
-// indexes the key before the write, so a removal during Set - including a
-// SIEVE admission rejection that drops the entry immediately - is reported to
-// onCacheRemove and cleaned up.
+// indexes the key before the write, so a removal during Set is still cleaned
+// up. Holding the key's stripe across both keeps the index and the cache in
+// agreement when stores of one key race.
 func (m *Middleware) store(key string, resp *Response, ttl time.Duration) error {
 	if !m.patternEnabled {
 		return m.cache.Set(key, resp, ttl)
@@ -278,6 +358,9 @@ func (m *Middleware) store(key string, resp *Response, ttl time.Duration) error 
 		return m.cache.Set(key, resp, ttl)
 	}
 
+	mu := &m.stripes[maphash.String(m.seed, key)%uint64(len(m.stripes))]
+	mu.Lock()
+	defer mu.Unlock()
 	m.patternIdx.addKey(path, key, resp)
 	if err := m.cache.Set(key, resp, ttl); err != nil {
 		m.patternIdx.removeKeyByIdentity(path, key, resp)
@@ -305,8 +388,24 @@ func (m *Middleware) Close() error {
 	return m.cache.Close()
 }
 
-// SetKeyGenerator overrides the cache key generator.
-func (m *Middleware) SetKeyGenerator(keyGen KeyGenerator) { m.keyGen = keyGen }
+// SetKeyGenerator overrides the cache key generator. Wrap then also calls it on
+// a copy of the request without headers, so an unsafe request can invalidate
+// every stored variant of a URL. The first call allocates a table of 8 bytes
+// per slot: one slot per entry of MaxSize, rounded up to a power of two and at
+// least 1024, or 65536 slots without a size limit.
+//
+// Call it before the handler returned by Wrap serves its first request. It is
+// not safe to call while requests are being served.
+func (m *Middleware) SetKeyGenerator(keyGen KeyGenerator) {
+	m.keyGen = keyGen
+	if m.epochs == nil {
+		n := 1 << 16
+		if m.maxSize > 0 {
+			n = max(mathx.NextPowerOf2(int(m.maxSize)), 1024)
+		}
+		m.epochs = make([]atomic.Uint64, n)
+	}
+}
 
 // SetCachePolicy overrides the policy deciding what to cache and for how long.
 func (m *Middleware) SetCachePolicy(policy Policy) { m.policy = policy }
@@ -402,6 +501,42 @@ func targetURI(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host + r.URL.RequestURI()
+}
+
+// bareRequest returns a copy of r with no header, body or form values, using a
+// copy of u as its URL. Both copies share one allocation.
+func bareRequest(r *http.Request, u *url.URL) *http.Request {
+	b := &struct {
+		req http.Request
+		url url.URL
+	}{req: *r, url: *u}
+	b.req.URL = &b.url
+	b.req.Header = nil
+	b.req.Body = http.NoBody
+	b.req.GetBody = nil
+	b.req.ContentLength = 0
+	b.req.Trailer = nil
+	b.req.Form, b.req.PostForm, b.req.MultipartForm = nil, nil, nil
+	return &b.req
+}
+
+// resourceKey returns the key that keyGen gives the bare request req. It
+// reports false if keyGen panics, as a generator that needs a header may.
+func (m *Middleware) resourceKey(req *http.Request) (key string, ok bool) {
+	defer func() { _ = recover() }()
+	return m.keyGen(req), true
+}
+
+// slotFor returns the index in epochs of resource key rk.
+func (m *Middleware) slotFor(rk string) uint64 {
+	return maphash.String(m.seed, rk) & uint64(len(m.epochs)-1)
+}
+
+// invalidate removes the entry stored under resource key rk and moves the
+// epoch of its slot on, so the variants stored before stop being served.
+func (m *Middleware) invalidate(rk string) {
+	m.cache.Delete(rk)
+	m.epochs[m.slotFor(rk)].Add(1)
 }
 
 // DefaultCachePolicy builds a policy that stores responses with explicit

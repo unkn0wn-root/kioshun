@@ -160,7 +160,11 @@ middleware.SetKeyGenerator(httpcache.KeyWithVaryHeaders([]string{"Accept", "Auth
 middleware.SetKeyGenerator(httpcache.KeyWithoutQuery())
 ```
 
+`New` already installs `DefaultKeyGenerator`, so the first call above is needed only to switch back to it. Any `SetKeyGenerator` call, with any generator, allocates the table described under [Automatic Invalidation](#automatic-invalidation) and makes each stored response cost one more key computation.
+
 The default key does not include request headers. A response that depends on a request header should name it in `Vary`, and the cache then checks that header on every hit. See [Vary](#vary).
+
+Call `SetKeyGenerator` before the handler returned by `Wrap` serves its first request. It is not safe to call while requests are being served.
 
 ## Eviction Policies
 
@@ -230,6 +234,8 @@ stats := middleware.Stats()
 fmt.Printf("Hit ratio: %.2f%%\n", stats.HitRatio*100)
 ```
 
+An entry that is no longer served still counts toward `Stats` until it is replaced, evicted or expires, and a lookup that finds it counts as a hit.
+
 ## Cache Management
 
 ### Basic Operations
@@ -252,7 +258,13 @@ middleware.Close()
 
 ### Automatic Invalidation
 
-A request with any method other than GET, HEAD, OPTIONS or TRACE passes through to the handler. If its response status is 2xx or 3xx, the stored GET and HEAD responses for the same URL are removed. A successful `POST /api/users` therefore removes the cached `GET /api/users`. The entries are found with the configured key generator, so with a key that includes request headers only the entry for the same header values is removed. Methods listed in `CacheableMethods` are cached instead and do not invalidate.
+A request with any method other than GET, HEAD, OPTIONS or TRACE passes through to the handler. If its response status is 2xx or 3xx, the stored GET and HEAD responses for the same URL are no longer served, with every built-in key generator. With `KeyWithUserID("X-User-ID")`, a successful `POST /api/users` from one user stops the cached `GET /api/users` of every user from being served. With `KeyWithVaryHeaders` or `KeyWithoutQueryHashed`, it covers the entries for every header value. The next request for each entry goes to the handler, and its response replaces the old entry when it is stored.
+
+To do this, the first `SetKeyGenerator` call allocates a table of 8 bytes per slot, with one slot per entry of `MaxSize` rounded up to a power of two (at least 1024, or 65536 without a size limit). Two URLs can share a slot. A write to one then also makes those entries of the other whose keys include request headers miss once. Stale data is never served. Without `SetKeyGenerator` there is no table.
+
+The URL includes the query string, so `POST /api/users` keeps `GET /api/users?page=2`. Generators that ignore the query (`KeyWithoutQuery`, `PathBasedKeyGenerator`, `KeyWithoutQueryHashed`) cover every entry for the path.
+
+A custom key generator gets the same treatment for anything it reads from request headers. If it puts a request context value, the client address or TLS state (for example a client certificate) in the key, only the entries matching the unsafe request's own value are covered. A custom generator may panic on a request without headers, for GET, for HEAD or for both. For a method it panics on, the unsafe request removes only its own entry. The other method is still covered for every header value. Methods listed in `CacheableMethods` are cached instead and do not invalidate.
 
 ## Cache Invalidation Setup
 
@@ -283,9 +295,8 @@ removed := middleware.Invalidate("/api/users/*") // Returns 0
 
 Use a path-based key generator **and** give the config a `PathExtractor` so the
 pattern index can recover the path from each key. Supplying a `PathExtractor` is
-what enables pattern invalidation: it turns on the index and wires the cache's
-removal listener that keeps the index in sync as entries are evicted, rejected,
-expired or deleted.
+what enables pattern invalidation. The index stays in step with the cache as
+entries are evicted, rejected, expired, deleted or cleared.
 
 ```go
 // CORRECT SETUP - Invalidation works
@@ -489,7 +500,7 @@ A response to a request with `Authorization` is stored only when its `Cache-Cont
 | Outcome | When | X-Cache | Origin called | Effect |
 |---------|------|---------|---------------|--------|
 | Bypass | OPTIONS or TRACE, or GET or HEAD removed from `CacheableMethods` | none | yes | none |
-| Invalidation | Any other method not in `CacheableMethods` | none | yes | On 2xx or 3xx, removes the stored GET and HEAD responses for the URL |
+| Invalidation | Any other method not in `CacheableMethods` | none | yes | On 2xx or 3xx, stops every stored GET and HEAD response for the URL from being served |
 | Bypass | Conditional or Range request | none | yes | Nothing is looked up or stored |
 | Hit | Stored, fresh, and the `Vary` headers match | HIT, plus `Age` | no | `OnHit` |
 | Miss, stored | Storable, the policy agrees, and some lifetime is left | MISS | yes | Stored. `OnMiss`, `OnSet` |
@@ -508,5 +519,5 @@ A response to a request with `Authorization` is stored only when its `Cache-Cont
 - Replaying trailers on a hit.
 - The `response_delay` term of the age calculation (RFC 9111 section 4.2.3). The time the handler took to answer is not added to the response's `Age`.
 - Quoted `Cache-Control` values that contain commas. The value is split at each comma, so `ext="a, max-age=600, b"` is read as containing `max-age=600`.
-- Full invalidation with the header-keyed generators. With `KeyWithUserID`, `KeyWithVaryHeaders` or `KeyWithoutQueryHashed`, an unsafe method removes only the entry whose key matches the unsafe request's headers. Entries stored for other header values stay until they expire, which falls short of RFC 9111 section 4.4.
+- Ordering against requests in flight. A GET that started before a successful unsafe request and finishes after it can store the old response again. It stays until it expires, is evicted or is replaced.
 - Telling http from https in the path generators. `KeyWithoutQuery`, `PathBasedKeyGenerator` and `KeyWithoutQueryHashed` leave out the scheme, so `http://` and `https://` requests for the same host and path share an entry.

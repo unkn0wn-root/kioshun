@@ -17,13 +17,15 @@ const (
 // ("/api/*") matches the base path and every descendant.
 //
 // The index is kept in sync with the backing cache by the cache's eviction
-// listener. addKey records a key when its response is cached; removeKeyByIdentity
-// drops it when the cache evicts, expires, or deletes it. Those notifications are
-// delivered asynchronously, so a key may be recached (producing a new *Response)
-// before the notification for its previous incarnation is processed. Each key is
-// therefore stored alongside the *Response it was indexed with as an identity
-// token, and removeKeyByIdentity removes only on a token match - a stale
-// notification can never drop a live entry.
+// listener. addKey records a key when its response is cached, and
+// removeKeyByIdentity drops it when the cache evicts, expires, or deletes it.
+// Those notifications are delivered asynchronously, so a key may be recached
+// (producing a new *Response) before the notification for its previous
+// incarnation is processed. Each key is therefore stored alongside the
+// *Response it was indexed with as an identity token, and removeKeyByIdentity
+// removes only on a token match. A stale notification never drops a live entry.
+// Middleware.store and Middleware.Clear hold per-key locks, so the token is
+// always the response the cache holds.
 type patternIndex struct {
 	mu   sync.RWMutex
 	root *patternNode

@@ -1,6 +1,7 @@
 package httpcache
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -731,6 +732,608 @@ func TestRFC9111_Unsafe_RejectStaleHead(t *testing.T) {
 	e.do("POST", "/item")
 	e.do("HEAD", "/item")
 	wantOrigin(t, e, 3, "a successful POST must invalidate the stored HEAD response")
+}
+
+// With key generators that tell users apart, every stored variant of the URL
+// stops being served, not only the unsafe request's own.
+
+// variantHeader names the request header that gives two users different
+// entries under the generator. Header-free generators tell them apart by Vary.
+func variantHeader(gen string) string {
+	switch gen {
+	case "KeyWithUserID":
+		return "X-User-ID"
+	case "KeyWithVaryHeaders", "KeyWithoutQueryHashed":
+		return "Accept"
+	}
+	return "X-Tenant"
+}
+
+// variantHandler is itemHandler with Vary: X-Tenant.
+func variantHandler(writeStatus int) http.HandlerFunc {
+	item := itemHandler(writeStatus)
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Vary", "X-Tenant")
+		item(w, r)
+	}
+}
+
+func withKeyGenerator(gen KeyGenerator) func(*Middleware) {
+	return func(m *Middleware) { m.SetKeyGenerator(gen) }
+}
+
+// slotSharer reports whether target's GET or HEAD resource key shares an epoch
+// slot with written's. A shared slot costs one extra miss, so tests avoid them.
+func slotSharer(m *Middleware, writtenHost, written string) func(host, target string) bool {
+	slots := func(host, target string) []uint64 {
+		r := httptest.NewRequest("GET", target, nil)
+		r.Host = host
+		var s []uint64
+		for _, method := range []string{"GET", "HEAD"} {
+			r.Method = method
+			rk, _ := m.resourceKey(bareRequest(r, r.URL))
+			s = append(s, m.slotFor(rk))
+		}
+		return s
+	}
+	ws := slots(writtenHost, written)
+	return func(host, target string) bool {
+		return slices.ContainsFunc(slots(host, target), func(s uint64) bool { return slices.Contains(ws, s) })
+	}
+}
+
+func TestRFC9111_Unsafe_AcceptOtherResourcesKept(t *testing.T) {
+	type resource struct{ path, host string }
+	for _, g := range generators {
+		t.Run(g.name, func(t *testing.T) {
+			h := variantHeader(g.name)
+			e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(g.gen))
+			host := e.srv.Listener.Addr().String()
+			shares := slotSharer(e.mw, host, "/p")
+			path := "/q"
+			for i := 1; shares(host, path); i++ {
+				path = "/q" + strconv.Itoa(i)
+			}
+			otherHost := "other.example"
+			for i := 1; shares(otherHost, "/p"); i++ {
+				otherHost = "other" + strconv.Itoa(i) + ".example"
+			}
+			others := []resource{{path, ""}, {"/p", otherHost}}
+			if g.gen(keyRequest("/p?x=1", "h")) != g.gen(keyRequest("/p", "h")) {
+				query := "/p?x=1"
+				for i := 2; shares(host, query); i++ {
+					query = "/p?x=" + strconv.Itoa(i)
+				}
+				others = append(others, resource{query, ""})
+			}
+			for _, method := range []string{"GET", "HEAD"} {
+				for _, o := range others {
+					e.do(method, o.path, "Host", o.host, h, "alice")
+				}
+			}
+			e.do("POST", "/p", h, "bob")
+			for _, method := range []string{"GET", "HEAD"} {
+				for _, o := range others {
+					if r := e.do(method, o.path, "Host", o.host, h, "alice"); r.hdr.Get("X-Cache") != "HIT" {
+						t.Errorf("%s %s (Host %q) after POST /p got X-Cache=%s, want HIT", method, o.path, o.host, r.hdr.Get("X-Cache"))
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_RejectStaleVariant(t *testing.T) {
+	for _, g := range generators {
+		t.Run(g.name, func(t *testing.T) {
+			h := variantHeader(g.name)
+			e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(g.gen))
+			e.do("GET", "/p", h, "alice")
+			e.do("GET", "/p", h, "bob")
+			e.do("POST", "/p", h, "bob")
+			if r := e.do("GET", "/p", h, "alice"); r.body != "v2" {
+				t.Errorf("alice got %q (X-Cache=%s) after bob's POST, want v2", r.body, r.hdr.Get("X-Cache"))
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_RejectStaleHeadVariant(t *testing.T) {
+	for _, g := range generators {
+		t.Run(g.name, func(t *testing.T) {
+			h := variantHeader(g.name)
+			e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(g.gen))
+			e.do("HEAD", "/p", h, "alice")
+			e.do("HEAD", "/p", h, "bob")
+			e.do("POST", "/p", h, "bob")
+			if r := e.do("HEAD", "/p", h, "alice"); r.hdr.Get("X-Cache") != "MISS" {
+				t.Errorf("alice's HEAD after bob's POST got X-Cache=%s, want MISS", r.hdr.Get("X-Cache"))
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_AcceptErrorKeepsVariants(t *testing.T) {
+	for _, status := range []int{400, 404, 409, 500, 503} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			e := newEnv(t, DefaultConfig(), variantHandler(status), withKeyGenerator(KeyWithUserID("X-User-ID")))
+			e.do("GET", "/p", "X-User-ID", "alice")
+			e.do("GET", "/p", "X-User-ID", "bob")
+			e.do("POST", "/p", "X-User-ID", "bob")
+			for _, user := range []string{"alice", "bob"} {
+				if r := e.do("GET", "/p", "X-User-ID", user); r.hdr.Get("X-Cache") != "HIT" {
+					t.Errorf("%s after a POST answered %d got X-Cache=%s, want HIT", user, status, r.hdr.Get("X-Cache"))
+				}
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_RejectStaleVariantAfterNonError(t *testing.T) {
+	for _, status := range []int{200, 201, 204, 301, 303, 307} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			e := newEnv(t, DefaultConfig(), variantHandler(status), withKeyGenerator(KeyWithUserID("X-User-ID")))
+			e.do("GET", "/p", "X-User-ID", "alice")
+			e.do("GET", "/p", "X-User-ID", "bob")
+			e.do("POST", "/p", "X-User-ID", "bob")
+			if r := e.do("GET", "/p", "X-User-ID", "alice"); r.body != "v2" {
+				t.Errorf("alice got %q (X-Cache=%s) after bob's POST answered %d, want v2", r.body, r.hdr.Get("X-Cache"), status)
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_AcceptOtherQueryKept(t *testing.T) {
+	e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(KeyWithUserID("X-User-ID")))
+	host := e.srv.Listener.Addr().String()
+	shares := slotSharer(e.mw, host, "/p")
+	query := "/p?page=2"
+	for i := 3; shares(host, query); i++ {
+		query = "/p?page=" + strconv.Itoa(i)
+	}
+	e.do("GET", query, "X-User-ID", "alice")
+	e.do("POST", "/p", "X-User-ID", "bob")
+	if r := e.do("GET", query, "X-User-ID", "alice"); r.hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("GET %s after POST /p got X-Cache=%s, want HIT", query, r.hdr.Get("X-Cache"))
+	}
+}
+
+func TestRFC9111_Unsafe_RejectStaleVariantQueryIgnored(t *testing.T) {
+	e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(KeyWithoutQueryHashed()))
+	e.do("GET", "/p?a", "Accept", "alice")
+	e.do("POST", "/p?b", "Accept", "bob")
+	if r := e.do("GET", "/p?a", "Accept", "alice"); r.body != "v2" {
+		t.Errorf("GET /p?a after POST /p?b got %q (X-Cache=%s), want v2: the key ignores the query", r.body, r.hdr.Get("X-Cache"))
+	}
+}
+
+func TestRFC9111_Unsafe_AcceptRewrittenTargetKept(t *testing.T) {
+	item := variantHandler(200)
+	other := "/other"
+	e := newEnv(t, DefaultConfig(), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			r.URL.Path = other // a router that rewrites the path in place
+		}
+		item(w, r)
+	}, withKeyGenerator(KeyWithUserID("X-User-ID")))
+	host := e.srv.Listener.Addr().String()
+	shares := slotSharer(e.mw, host, "/item")
+	for i := 1; shares(host, other); i++ {
+		other = "/other" + strconv.Itoa(i)
+	}
+	e.do("GET", other, "X-User-ID", "alice")
+	e.do("POST", "/item", "X-User-ID", "bob")
+	if r := e.do("GET", other, "X-User-ID", "alice"); r.hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("GET %s after POST /item got X-Cache=%s, want HIT", other, r.hdr.Get("X-Cache"))
+	}
+}
+
+func TestRFC9111_Unsafe_RejectHandlerRewritesTargetVariants(t *testing.T) {
+	item := variantHandler(200)
+	e := newEnv(t, DefaultConfig(), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			r.URL.Path = "/rewritten"
+			r.Header.Del("X-User-ID")
+		}
+		item(w, r)
+	}, withKeyGenerator(KeyWithUserID("X-User-ID")))
+	e.do("GET", "/item", "X-User-ID", "alice")
+	e.do("GET", "/item", "X-User-ID", "bob")
+	e.do("POST", "/item", "X-User-ID", "bob")
+	for _, user := range []string{"alice", "bob"} {
+		if r := e.do("GET", "/item", "X-User-ID", user); r.body != "v2" {
+			t.Errorf("%s got %q (X-Cache=%s) after bob's POST, want v2", user, r.body, r.hdr.Get("X-Cache"))
+		}
+	}
+}
+
+func TestRFC9111_Unsafe_RejectGetHandlerRewritesTarget(t *testing.T) {
+	item := variantHandler(200)
+	e := newEnv(t, DefaultConfig(), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			r.URL.Path = "/rewritten" // before the response is stored
+		}
+		item(w, r)
+	}, withKeyGenerator(KeyWithUserID("X-User-ID")))
+	e.do("GET", "/item", "X-User-ID", "alice")
+	e.do("POST", "/item", "X-User-ID", "bob")
+	if r := e.do("GET", "/item", "X-User-ID", "alice"); r.body != "v2" {
+		t.Errorf("alice got %q (X-Cache=%s) after bob's POST, want v2", r.body, r.hdr.Get("X-Cache"))
+	}
+}
+
+// A GET handler rewrites Host, as proxy-header middleware does. The resource
+// key must still come from the request as received.
+func TestRFC9111_Unsafe_RejectGetHandlerRewritesHost(t *testing.T) {
+	item := variantHandler(200)
+	e := newEnv(t, DefaultConfig(), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			r.Host = "internal.example"
+		}
+		item(w, r)
+	}, withKeyGenerator(KeyWithUserID("X-User-ID")))
+	e.do("GET", "/item", "X-User-ID", "alice")
+	e.do("POST", "/item", "X-User-ID", "bob")
+	if r := e.do("GET", "/item", "X-User-ID", "alice"); r.body != "v2" {
+		t.Errorf("alice got %q (X-Cache=%s) after bob's POST, want v2", r.body, r.hdr.Get("X-Cache"))
+	}
+}
+
+func TestRFC9111_Unsafe_AcceptSafeMethodKeepsVariants(t *testing.T) {
+	for _, method := range []string{"OPTIONS", "TRACE"} {
+		t.Run(method, func(t *testing.T) {
+			e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(KeyWithUserID("X-User-ID")))
+			e.do("GET", "/p", "X-User-ID", "alice")
+			e.do("GET", "/p", "X-User-ID", "bob")
+			e.do(method, "/p", "X-User-ID", "bob")
+			for _, user := range []string{"alice", "bob"} {
+				if r := e.do("GET", "/p", "X-User-ID", user); r.hdr.Get("X-Cache") != "HIT" {
+					t.Errorf("%s after bob's %s got X-Cache=%s, want HIT", user, method, r.hdr.Get("X-Cache"))
+				}
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_RejectStaleVariantAnyUnsafeMethod(t *testing.T) {
+	for _, method := range []string{"PUT", "PATCH", "DELETE", "PURGE"} {
+		t.Run(method, func(t *testing.T) {
+			e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(KeyWithUserID("X-User-ID")))
+			e.do("GET", "/p", "X-User-ID", "alice")
+			e.do("GET", "/p", "X-User-ID", "bob")
+			e.do(method, "/p", "X-User-ID", "bob")
+			if r := e.do("GET", "/p", "X-User-ID", "alice"); r.body != "v2" {
+				t.Errorf("alice got %q (X-Cache=%s) after bob's %s, want v2", r.body, r.hdr.Get("X-Cache"), method)
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_RejectUntaggedResourceKeyStale(t *testing.T) {
+	e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(KeyWithUserID("X-User-ID")))
+	e.do("GET", "/p")
+	e.do("POST", "/p", "X-User-ID", "bob")
+	if r := e.do("GET", "/p"); r.body != "v2" {
+		t.Errorf("GET without X-User-ID got %q (X-Cache=%s) after bob's POST, want v2", r.body, r.hdr.Get("X-Cache"))
+	}
+}
+
+type tenantKey struct{}
+
+// A context value is not part of the request headers, so only the unsafe
+// request's own tenant is covered. This is a documented limit.
+func TestHTTPCache_Unsafe_AcceptContextKeyedKeepsOtherContexts(t *testing.T) {
+	m := newTestMiddleware(t, DefaultConfig())
+	defer m.Close()
+	m.SetKeyGenerator(func(r *http.Request) string {
+		tenant, _ := r.Context().Value(tenantKey{}).(string)
+		return r.Method + " " + r.Host + r.URL.RequestURI() + " " + tenant
+	})
+	h := m.Wrap(variantHandler(200))
+	serve := func(method, tenant string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "/p", nil)
+		r = r.WithContext(context.WithValue(r.Context(), tenantKey{}, tenant))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+	serve("GET", "a")
+	serve("GET", "b")
+	serve("POST", "b")
+	if rec := serve("GET", "a"); rec.Header().Get("X-Cache") != "HIT" {
+		t.Errorf("tenant a after tenant b's POST got X-Cache=%s, want HIT", rec.Header().Get("X-Cache"))
+	}
+	if rec := serve("GET", "b"); rec.Body.String() != "v2" {
+		t.Errorf("tenant b after its own POST got %q, want v2", rec.Body.String())
+	}
+}
+
+func TestHTTPCache_Unsafe_RejectStaleVariantCookieKeyed(t *testing.T) {
+	e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(func(r *http.Request) string {
+		key := r.Method + " " + r.Host + r.URL.RequestURI()
+		if c, err := r.Cookie("session"); err == nil {
+			key += " " + c.Value
+		}
+		return key
+	}))
+	e.do("GET", "/p", "Cookie", "session=alice")
+	e.do("GET", "/p", "Cookie", "session=bob")
+	e.do("POST", "/p", "Cookie", "session=bob")
+	if r := e.do("GET", "/p", "Cookie", "session=alice"); r.body != "v2" {
+		t.Errorf("alice got %q (X-Cache=%s) after bob's POST, want v2", r.body, r.hdr.Get("X-Cache"))
+	}
+}
+
+// A layer in front parsed the form, and a body field shadows a query parameter
+// the generator reads. The resource key must not see it.
+func TestHTTPCache_Unsafe_RejectStaleVariantFormParsedUpstream(t *testing.T) {
+	m := newTestMiddleware(t, DefaultConfig())
+	defer m.Close()
+	m.SetKeyGenerator(func(r *http.Request) string {
+		return r.Method + " " + r.URL.Path + " lang=" + r.FormValue("lang") + " " + r.Header.Get("X-User-ID")
+	})
+	cached := m.Wrap(variantHandler(200))
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		cached.ServeHTTP(w, r)
+	})
+	serve := func(method, user, body string) *httptest.ResponseRecorder {
+		var rd io.Reader
+		if body != "" {
+			rd = strings.NewReader(body)
+		}
+		r := httptest.NewRequest(method, "/p?lang=en", rd)
+		r.Header.Set("X-User-ID", user)
+		if body != "" {
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+	serve("GET", "alice", "")
+	serve("POST", "bob", "lang=fr")
+	if rec := serve("GET", "alice", ""); rec.Body.String() != "v2" {
+		t.Errorf("alice got %q (X-Cache=%s) after bob's POST, want v2", rec.Body.String(), rec.Header().Get("X-Cache"))
+	}
+}
+
+// A generator that reads the body must not consume the unsafe request's body,
+// which belongs to the handler, and the resource key must not see it.
+func TestHTTPCache_Unsafe_RejectGeneratorReadsBody(t *testing.T) {
+	m := newTestMiddleware(t, DefaultConfig())
+	defer m.Close()
+	m.SetKeyGenerator(func(r *http.Request) string {
+		body, _ := io.ReadAll(r.Body)
+		return r.Method + " " + r.URL.Path + " " + string(body) + " " + r.Header.Get("X-User-ID")
+	})
+	item := variantHandler(200)
+	var received string
+	h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, _ := io.ReadAll(r.Body)
+			received = string(body)
+		}
+		item(w, r)
+	}))
+	serveUser(h, "GET", "/p", "alice")
+	post := httptest.NewRequest("POST", "/p", strings.NewReader("payload"))
+	post.Header.Set("X-User-ID", "bob")
+	h.ServeHTTP(httptest.NewRecorder(), post)
+	if received != "payload" {
+		t.Errorf("handler read body %q, want payload", received)
+	}
+	if rec := serveUser(h, "GET", "/p", "alice"); rec.Body.String() != "v2" {
+		t.Errorf("alice got %q (X-Cache=%s) after bob's POST, want v2", rec.Body.String(), rec.Header().Get("X-Cache"))
+	}
+}
+
+func TestHTTPCache_Unsafe_AcceptEndingRuleUnchanged(t *testing.T) {
+	for name, post := range map[string]http.HandlerFunc{
+		"handler panic": func(http.ResponseWriter, *http.Request) { panic("write failed") },
+		"101":           func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusSwitchingProtocols) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := newTestMiddleware(t, DefaultConfig())
+			defer m.Close()
+			m.SetKeyGenerator(KeyWithUserID("X-User-ID"))
+			get := variantHandler(200)
+			h := m.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					post(w, r)
+					return
+				}
+				get(w, r)
+			}))
+			serve := func(method, user string) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(method, "/p", nil)
+				r.Header.Set("X-User-ID", user)
+				rec := httptest.NewRecorder()
+				defer func() { _ = recover() }()
+				h.ServeHTTP(rec, r)
+				return rec
+			}
+			serve("GET", "alice")
+			serve("GET", "bob")
+			serve("POST", "bob")
+			for _, user := range []string{"alice", "bob"} {
+				if rec := serve("GET", user); rec.Header().Get("X-Cache") != "HIT" {
+					t.Errorf("%s after bob's POST (%s) got X-Cache=%s, want HIT", user, name, rec.Header().Get("X-Cache"))
+				}
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_RejectStaleVariantNoStatus(t *testing.T) {
+	for name, post := range map[string]func(*testing.T, http.ResponseWriter){
+		"no status": func(*testing.T, http.ResponseWriter) {},
+		"hijack without status": func(t *testing.T, w http.ResponseWriter) {
+			conn, brw, err := http.NewResponseController(w).Hijack()
+			if err != nil {
+				t.Errorf("Hijack: %v", err)
+				return
+			}
+			defer conn.Close()
+			brw.WriteString("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+			brw.Flush()
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var version atomic.Int64
+			version.Store(1)
+			e := newEnv(t, DefaultConfig(), func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					w.Header().Set("Cache-Control", "max-age=60")
+					fmt.Fprintf(w, "v%d", version.Load())
+					return
+				}
+				version.Add(1)
+				post(t, w)
+			}, withKeyGenerator(KeyWithUserID("X-User-ID")))
+			e.do("GET", "/p", "X-User-ID", "alice")
+			e.do("GET", "/p", "X-User-ID", "bob")
+			e.do("POST", "/p", "X-User-ID", "bob")
+			if r := e.do("GET", "/p", "X-User-ID", "alice"); r.body != "v2" {
+				t.Errorf("alice got %q (X-Cache=%s) after bob's POST, want v2", r.body, r.hdr.Get("X-Cache"))
+			}
+		})
+	}
+}
+
+func TestRFC9111_Unsafe_AcceptRefillAfterInvalidation(t *testing.T) {
+	for _, g := range generators {
+		t.Run(g.name, func(t *testing.T) {
+			h := variantHeader(g.name)
+			e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(g.gen))
+			e.do("GET", "/p", h, "alice")
+			e.do("GET", "/p", h, "bob")
+			e.do("POST", "/p", h, "bob")
+			for _, user := range []string{"alice", "bob"} {
+				if r := e.do("GET", "/p", h, user); r.body != "v2" || r.hdr.Get("X-Cache") != "MISS" {
+					t.Errorf("%s's first GET after the POST got %q (X-Cache=%s), want v2 from the origin", user, r.body, r.hdr.Get("X-Cache"))
+				}
+				if r := e.do("GET", "/p", h, user); r.body != "v2" || r.hdr.Get("X-Cache") != "HIT" {
+					t.Errorf("%s's second GET after the POST got %q (X-Cache=%s), want a v2 hit", user, r.body, r.hdr.Get("X-Cache"))
+				}
+			}
+		})
+	}
+}
+
+// cookieValueKey panics on a request without a session cookie.
+func cookieValueKey(r *http.Request) string {
+	c, _ := r.Cookie("session")
+	return c.Value + r.URL.Path
+}
+
+func TestHTTPCache_Unsafe_AcceptGeneratorPanicsWithoutHeader(t *testing.T) {
+	e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(cookieValueKey))
+	if r := e.do("POST", "/p", "Cookie", "session=alice"); r.status != http.StatusOK {
+		t.Errorf("POST status = %d, want 200 from the handler", r.status)
+	}
+	e.do("GET", "/p", "Cookie", "session=alice")
+	if r := e.do("GET", "/p", "Cookie", "session=alice"); r.hdr.Get("X-Cache") != "HIT" {
+		t.Errorf("second GET got %q (X-Cache=%s), want a hit", r.body, r.hdr.Get("X-Cache"))
+	}
+}
+
+func TestHTTPCache_Unsafe_RejectStaleOwnVariantAfterGeneratorPanic(t *testing.T) {
+	e := newEnv(t, DefaultConfig(), variantHandler(200), withKeyGenerator(cookieValueKey))
+	e.do("GET", "/p", "Cookie", "session=alice")
+	e.do("POST", "/p", "Cookie", "session=alice")
+	if r := e.do("GET", "/p", "Cookie", "session=alice"); r.body != "v2" {
+		t.Errorf("alice got %q (X-Cache=%s) after her own POST, want v2", r.body, r.hdr.Get("X-Cache"))
+	}
+}
+
+// The generator panics on the header-less HEAD copy. Other users' GET variants
+// must still go, and the writer's own HEAD entry must still be removed.
+func TestHTTPCache_Unsafe_RejectStaleGetVariantGeneratorPanicsOnHead(t *testing.T) {
+	m := newTestMiddleware(t, DefaultConfig())
+	defer m.Close()
+	m.SetKeyGenerator(func(r *http.Request) string {
+		if r.Method == http.MethodHead {
+			return "HEAD " + r.URL.Path + " " + r.Header["X-User-Id"][0]
+		}
+		return r.Method + " " + r.URL.Path + " " + r.Header.Get("X-User-ID")
+	})
+	h := m.Wrap(variantHandler(200))
+	serveUser(h, "GET", "/p", "alice")
+	serveUser(h, "GET", "/p", "bob")
+	serveUser(h, "HEAD", "/p", "bob")
+	serveUser(h, "POST", "/p", "bob")
+	for _, user := range []string{"bob", "alice"} {
+		if rec := serveUser(h, "GET", "/p", user); rec.Body.String() != "v2" {
+			t.Errorf("%s got %q (X-Cache=%s) after bob's POST, want v2", user, rec.Body.String(), rec.Header().Get("X-Cache"))
+		}
+	}
+	if rec := serveUser(h, "HEAD", "/p", "bob"); rec.Header().Get("X-Cache") != "MISS" {
+		t.Errorf("bob's HEAD after his own POST got X-Cache=%s, want MISS", rec.Header().Get("X-Cache"))
+	}
+}
+
+// The mirror case, with the panic on the GET copy.
+func TestHTTPCache_Unsafe_RejectStaleHeadVariantGeneratorPanicsOnGet(t *testing.T) {
+	m := newTestMiddleware(t, DefaultConfig())
+	defer m.Close()
+	m.SetKeyGenerator(func(r *http.Request) string {
+		if r.Method == http.MethodGet {
+			return "GET " + r.URL.Path + " " + r.Header["X-User-Id"][0]
+		}
+		return r.Method + " " + r.URL.Path + " " + r.Header.Get("X-User-ID")
+	})
+	h := m.Wrap(variantHandler(200))
+	serveUser(h, "HEAD", "/p", "alice")
+	serveUser(h, "HEAD", "/p", "bob")
+	serveUser(h, "GET", "/p", "bob")
+	serveUser(h, "POST", "/p", "bob")
+	for _, user := range []string{"bob", "alice"} {
+		if rec := serveUser(h, "HEAD", "/p", user); rec.Header().Get("X-Cache") != "MISS" {
+			t.Errorf("%s's HEAD after bob's POST got X-Cache=%s, want MISS", user, rec.Header().Get("X-Cache"))
+		}
+	}
+	if rec := serveUser(h, "GET", "/p", "bob"); rec.Body.String() != "v2" {
+		t.Errorf("bob got %q (X-Cache=%s) after his own POST, want v2", rec.Body.String(), rec.Header().Get("X-Cache"))
+	}
+}
+
+// A generator that panics on the header-less copy for one method must not
+// cost other URLs their entries for the other method.
+func TestHTTPCache_Unsafe_AcceptOtherResourcesKeptGeneratorPanicsOnOneMethod(t *testing.T) {
+	for _, panics := range []string{http.MethodHead, http.MethodGet} {
+		t.Run(panics, func(t *testing.T) {
+			m := newTestMiddleware(t, DefaultConfig())
+			defer m.Close()
+			m.SetKeyGenerator(func(r *http.Request) string {
+				if r.Method == panics {
+					return r.Method + " " + r.URL.Path + " " + r.Header["X-User-Id"][0]
+				}
+				return r.Method + " " + r.URL.Path + " " + r.Header.Get("X-User-ID")
+			})
+			h := m.Wrap(variantHandler(200))
+			kept := http.MethodGet
+			if panics == http.MethodGet {
+				kept = http.MethodHead
+			}
+			// Pick a URL with its own slot for the kept method. slotSharer
+			// can't be used because the generator panics for one method.
+			slot := func(path string) uint64 {
+				r := httptest.NewRequest(kept, path, nil)
+				rk, _ := m.resourceKey(bareRequest(r, r.URL))
+				return m.slotFor(rk)
+			}
+			other := "/q"
+			for i := 1; slot(other) == slot("/p"); i++ {
+				other = "/q" + strconv.Itoa(i)
+			}
+			serveUser(h, kept, other, "alice")
+			serveUser(h, "POST", "/p", "bob")
+			if rec := serveUser(h, kept, other, "alice"); rec.Header().Get("X-Cache") != "HIT" {
+				t.Errorf("%s %s after POST /p got X-Cache=%s, want HIT", kept, other, rec.Header().Get("X-Cache"))
+			}
+		})
+	}
 }
 
 // Unsafe methods are not stored and a HEAD never answers a GET (RFC 9111 3, 4).
