@@ -3,6 +3,8 @@ package kioshun
 import (
 	"fmt"
 	"math"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -95,7 +97,7 @@ func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bo
 	s.drainMu.Unlock()
 
 	if task, ok := cmd.newCallbackTask(committed); ok {
-		c.scheduleCallback(task)
+		c.scheduleCallback(s, task)
 	}
 	return true
 }
@@ -237,7 +239,7 @@ func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error
 		return err
 	}
 	if hasTask {
-		c.scheduleCallback(task)
+		c.scheduleCallback(s, task)
 	}
 	return nil
 }
@@ -396,7 +398,7 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 	s.mu.Unlock()
 
 	for _, task := range callbacks {
-		c.scheduleCallback(task)
+		c.scheduleCallback(s, task)
 	}
 	for _, ch := range acks {
 		ch <- struct{}{}
@@ -557,19 +559,235 @@ func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 	atomic.StoreInt64(&s.cost, 0)
 }
 
-func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
-	time.AfterFunc(time.Duration(task.expireTime-c.nowNano()), func() {
-		if c.isClosed() {
-			return
+// callbackTimers holds a shard's pending expiry callbacks in a min-heap ordered
+// by deadline, served by a single timer.
+type callbackTimers[K comparable, V any] struct {
+	mu    sync.Mutex
+	c     *Cache[K, V]
+	timer *time.Timer
+	when  int64 // cache-clock time the timer is set for, or math.MaxInt64 if unknown
+	heap  []callbackEntry[K, V]
+}
+
+// callbackEntry is a heap slot. Tasks live outside the heap, so sifting and
+// growing copy a deadline and a pointer per slot, whatever the value size.
+type callbackEntry[K comparable, V any] struct {
+	expireTime int64
+	task       *callbackTask[K, V]
+}
+
+// close stops the timer and drops the pending tasks. Callbacks already started
+// keep running.
+func (ct *callbackTimers[K, V]) close() {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.timer != nil {
+		ct.timer.Stop()
+	}
+	ct.heap, ct.c = nil, nil
+}
+
+// dueBatch is how many due callbacks fireBatch takes from the heap per lock hold.
+const dueBatch = 32
+
+func (c *Cache[K, V]) scheduleCallback(s *shard[K, V], task callbackTask[K, V]) {
+	ct := s.callbacks
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	// Close sets the flag before it stops the timer under mu.
+	if c.isClosed() {
+		return
+	}
+	if len(ct.heap) == cap(ct.heap) {
+		// Grow to at least twice the length. append grows large slices by only about 1.25x.
+		ct.heap = slices.Grow(ct.heap, len(ct.heap))
+	}
+	ct.heap = append(ct.heap, callbackEntry[K, V]{task.expireTime, &task})
+	if ct.up(len(ct.heap)-1) == 0 && task.expireTime < ct.when {
+		ct.arm(task.expireTime, c.nowNano())
+	}
+}
+
+// arm sets the timer for the first instant a task with this deadline is due,
+// 1 ns after it. A task due a millisecond or more from now is armed a
+// sixteenth early, so that later tasks due a little sooner find the timer
+// already set and need no Reset. ct.mu must be held.
+func (ct *callbackTimers[K, V]) arm(deadline, now int64) {
+	d := deadline + 1 - now
+	if d > int64(time.Millisecond) {
+		d -= d / 16
+	}
+	ct.when = now + d
+	if ct.timer == nil {
+		ct.timer = time.AfterFunc(time.Duration(d), ct.fire)
+		return
+	}
+	ct.timer.Reset(time.Duration(d))
+}
+
+// fire runs when the shard timer fires. It runs a lone due callback itself and
+// leaves two or more to fireBatch.
+func (ct *callbackTimers[K, V]) fire() {
+	ct.mu.Lock()
+	ct.when = math.MaxInt64
+	if len(ct.heap) == 0 {
+		ct.mu.Unlock()
+		return
+	}
+	c := ct.c
+	now := c.nowNano()
+	if !ct.due(0, now) {
+		ct.arm(ct.heap[0].expireTime, now)
+		ct.mu.Unlock()
+		return
+	}
+	// In a 4-ary heap the second earliest task is one of the root's children.
+	if ct.due(1, now) || ct.due(2, now) || ct.due(3, now) || ct.due(4, now) {
+		ct.mu.Unlock()
+		ct.fireBatch()
+		return
+	}
+	task := ct.pop()
+	if len(ct.heap) > 0 {
+		ct.arm(ct.heap[0].expireTime, now)
+	}
+	ct.mu.Unlock()
+	kh := c.hasher.Sum(task.key)
+	s := c.shardByHash(kh)
+	s.mu.RLock()
+	item, ok := s.tab.lookup(kh, task.key)
+	expired := ok && item.expireTime > 0 && now > item.expireTime
+	s.mu.RUnlock()
+	if expired && !c.isClosed() {
+		task.callback(task.key, task.value)
+	}
+}
+
+// fireBatch takes up to dueBatch due tasks and runs the callbacks of those whose
+// entries are still present and expired: the first in this goroutine and the
+// others each in a goroutine of its own. If more tasks are due, it first starts
+// another fireBatch for them, so that a slow callback delays no other one.
+func (ct *callbackTimers[K, V]) fireBatch() {
+	var due [dueBatch]*callbackTask[K, V]
+	var hashes [dueBatch]uint64
+	ct.mu.Lock()
+	if len(ct.heap) == 0 {
+		ct.mu.Unlock()
+		return
+	}
+	c := ct.c
+	now := c.nowNano()
+	n, more := ct.take(due[:], now)
+	if !more && len(ct.heap) > 0 {
+		ct.arm(ct.heap[0].expireTime, now)
+	}
+	ct.mu.Unlock()
+	if more {
+		go ct.fireBatch()
+	}
+	if n == 0 {
+		return
+	}
+	// Keep the tasks whose entries are still present and expired. With take's
+	// now, a task take found due stays due unless its entry changed. The tasks
+	// all belong to this shard, so one read lock covers them.
+	for i := range n {
+		hashes[i] = c.hasher.Sum(due[i].key)
+	}
+	s := c.shardByHash(hashes[0])
+	kept := 0
+	s.mu.RLock()
+	for i := range n {
+		item, ok := s.tab.lookup(hashes[i], due[i].key)
+		if ok && item.expireTime > 0 && now > item.expireTime {
+			due[kept] = due[i]
+			kept++
 		}
-		kh := c.hasher.Sum(task.key)
-		s := c.shardByHash(kh)
-		s.mu.RLock()
-		item, exists := s.tab.lookup(kh, task.key)
-		expired := exists && item.expireTime > 0 && c.nowNano() > item.expireTime
-		s.mu.RUnlock()
-		if expired {
-			task.callback(task.key, task.value)
+	}
+	s.mu.RUnlock()
+	if kept == 0 {
+		return
+	}
+	for _, task := range due[1:kept] {
+		go c.runCallback(task)
+	}
+	c.runCallback(due[0])
+}
+
+// due reports whether heap[i] exists and is due at now. A task is due once now
+// is past its deadline, the rule cache entries expire by. ct.mu must be held.
+func (ct *callbackTimers[K, V]) due(i int, now int64) bool {
+	return i < len(ct.heap) && ct.heap[i].expireTime < now
+}
+
+// take moves up to len(due) tasks that are due at now from the heap into due.
+// It returns how many it took and whether more are due. ct.mu must be held.
+func (ct *callbackTimers[K, V]) take(due []*callbackTask[K, V], now int64) (n int, more bool) {
+	for n < len(due) && ct.due(0, now) {
+		due[n] = ct.pop()
+		n++
+	}
+	return n, ct.due(0, now)
+}
+
+func (c *Cache[K, V]) runCallback(task *callbackTask[K, V]) {
+	if !c.isClosed() {
+		task.callback(task.key, task.value)
+	}
+}
+
+// up moves heap[i] toward the root and returns its final index. The heap is
+// 4-ary and moves a hole instead of swapping. ct.mu must be held.
+func (ct *callbackTimers[K, V]) up(i int) int {
+	h := ct.heap
+	e := h[i]
+	for i > 0 {
+		p := (i - 1) / 4
+		if h[p].expireTime <= e.expireTime {
+			break
 		}
-	})
+		h[i] = h[p]
+		i = p
+	}
+	h[i] = e
+	return i
+}
+
+// pop removes the earliest task. The heap shrinks as it drains, so a burst does
+// not keep its peak size. ct.mu must be held.
+func (ct *callbackTimers[K, V]) pop() *callbackTask[K, V] {
+	h := ct.heap
+	top := h[0].task
+	n := len(h) - 1
+	if n == 0 {
+		ct.heap = nil
+		return top
+	}
+	last := h[n]
+	h[n] = callbackEntry[K, V]{}
+	h = h[:n]
+	i := 0
+	for {
+		child := 4*i + 1
+		if child >= n {
+			break
+		}
+		m := child
+		for j := child + 1; j < min(child+4, n); j++ {
+			if h[j].expireTime < h[m].expireTime {
+				m = j
+			}
+		}
+		if last.expireTime <= h[m].expireTime {
+			break
+		}
+		h[i] = h[m]
+		i = m
+	}
+	h[i] = last
+	if cap(h) > 64 && n < cap(h)/4 {
+		h = append(make([]callbackEntry[K, V], 0, cap(h)/2), h...)
+	}
+	ct.heap = h
+	return top
 }
