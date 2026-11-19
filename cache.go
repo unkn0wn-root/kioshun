@@ -2,7 +2,6 @@ package kioshun
 
 import (
 	"fmt"
-	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -174,7 +173,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 			stats:      cache.stats,
 			wake:       make(chan struct{}, 1),
 			writeBatch: make([]writeCommand[K, V], config.WriteBatchSize),
-			callbacks:  &callbackTimers[K, V]{c: cache, when: math.MaxInt64},
+			callbacks:  newCallbackTimer(cache),
 		}
 		s.queue = newMPSCQueue[K, V](config.WriteBufferSize, s.wake, cache.closeCh)
 
@@ -282,7 +281,8 @@ func (c *Cache[K, V]) SetAsync(key K, value V, ttl time.Duration) error {
 
 // SetWithCallback sets key like Set and calls callback when ttl has elapsed,
 // if key is still present and expired. Close cancels pending callbacks and
-// drops their keys and values. A callback already due when Close runs may still run.
+// drops their keys and values. A callback already due when Close runs may
+// still run.
 func (c *Cache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
 	return c.setAndWait(key, value, ttl, callback)
 }

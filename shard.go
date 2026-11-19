@@ -66,7 +66,8 @@ type shard[K comparable, V any] struct {
 	removeBuf        []removedEntry[K, V]
 	removePending    atomic.Bool
 
-	callbacks *callbackTimers[K, V]
+	// callbacks runs the expiry callbacks of SetWithCallback.
+	callbacks *callbackTimer[K, V]
 }
 
 // itemDropMode selects the policy state that must be unlinked with an item.

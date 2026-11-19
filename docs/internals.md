@@ -9,7 +9,8 @@ The root `kioshun` package contains the generic cache:
 - `cache.go`: public API, construction, sharding, reads, stats, cleanup.
 - `config.go`: `Config`, defaults, and validation.
 - `errors.go`: sentinel errors, `CacheError`, and `ConfigError`.
-- `writes.go`: queued writes, synchronous mutation ordering, barriers, workers, expiry callbacks.
+- `writes.go`: queued writes, synchronous mutation ordering, barriers, workers.
+- `callback.go`: per-shard timer and deadline heap for `SetWithCallback`.
 - `shard.go`: cache entry metadata, per-shard state, item removal, read-sample draining, TTL cleanup.
 - `htable.go`: per-shard open-addressing table with lock-free lookups.
 - `eviction.go`: removal reasons, removal/eviction listener options, and the LRU, LFU, and FIFO eviction adapters.
