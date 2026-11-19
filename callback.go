@@ -8,41 +8,25 @@ import (
 )
 
 const (
-	// callbackHeapArity is the number of children of a heap node. fire lists the
-	// root's children by index.
-	callbackHeapArity = 4
-
-	// callbackHeapMinCap is the capacity at which pop stops shrinking the heap.
+	callbackHeapArity  = 4
 	callbackHeapMinCap = 64
-
-	// dueBatch is how many due callbacks fireBatch takes from the heap per lock hold.
-	dueBatch = 32
-
-	// arm cuts a wait longer than earlyArmMin short by 1/earlyArmDiv of it.
-	earlyArmMin = time.Millisecond
-	earlyArmDiv = 16
+	dueBatch           = 32
+	earlyArmMin        = time.Millisecond
+	earlyArmDiv        = 16
 )
 
-// callbackTimer runs a shard's expiry callbacks from a single timer. Pending
-// callbacks wait in a min-heap ordered by deadline.
+// callbackTimer uses one timer per shard for all expiry callbacks.
 type callbackTimer[K comparable, V any] struct {
-	// mu guards the fields below. Nothing else is locked while it is held, and
-	// callbacks run without it.
+	// mu protects the fields below. Hold it when calling arm, due, take, up, or pop.
+	// Keep mu and shard.mu separate. Run callbacks outside both locks.
 	mu    sync.Mutex
 	c     *Cache[K, V] // nil after close
-	timer *time.Timer  // created by the first arm
-
-	// when is the cache-clock time the timer is set for. It is math.MaxInt64
-	// from a fire, or from the start, until the next arm.
-	when int64
-
-	// heap is 4-ary and hand-written, like the runtime's timer heap.
-	// container/heap would allocate for each entry pushed or popped.
-	heap []callbackEntry[K, V]
+	timer *time.Timer
+	when  int64                 // next wakeup in cache time, or math.MaxInt64 until armed
+	heap  []callbackEntry[K, V] // 4-ary min-heap by deadline
 }
 
-// callbackEntry is a heap slot. Tasks live outside the heap, so sifting and
-// growing copy a deadline and a pointer per slot, whatever the value size.
+// callbackEntry keeps heap slots small even when keys or values are large.
 type callbackEntry[K comparable, V any] struct {
 	expireTime int64
 	task       *callbackTask[K, V]
@@ -52,18 +36,16 @@ func newCallbackTimer[K comparable, V any](c *Cache[K, V]) *callbackTimer[K, V] 
 	return &callbackTimer[K, V]{c: c, when: math.MaxInt64}
 }
 
-// scheduleCallback adds task to its shard's heap. It arms the timer if task is
-// now the earliest and is due before the timer is set to fire.
 func (c *Cache[K, V]) scheduleCallback(s *shard[K, V], task callbackTask[K, V]) {
 	ct := s.callbacks
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	// Close sets the flag before it takes mu, so it drops a task pushed here.
+	// Close sets the flag before clearing the heap under mu.
 	if c.isClosed() {
 		return
 	}
 	if len(ct.heap) == cap(ct.heap) {
-		// Grow to at least twice the length. append grows large slices by only about 1.25x.
+		// Grow by at least 2x to reduce copies for large heaps.
 		ct.heap = slices.Grow(ct.heap, len(ct.heap))
 	}
 	ct.heap = append(ct.heap, callbackEntry[K, V]{expireTime: task.expireTime, task: &task})
@@ -72,14 +54,11 @@ func (c *Cache[K, V]) scheduleCallback(s *shard[K, V], task callbackTask[K, V]) 
 	}
 }
 
-// arm sets the timer for the first instant a task with this deadline is due,
-// 1 ns after it. A wait longer than earlyArmMin is cut short, so that later
-// tasks due a little sooner find the timer already set and need no Reset.
-// ct.mu must be held.
 func (ct *callbackTimer[K, V]) arm(deadline, now int64) {
-	// Subtract first, because deadline can be math.MaxInt64.
+	// Expiry starts 1 ns after the deadline. Subtract first to avoid overflow.
 	d := time.Duration(deadline - now + 1)
 	if d > earlyArmMin {
+		// Wake early to avoid resets for slightly earlier deadlines.
 		d -= d / earlyArmDiv
 	}
 	ct.when = now + int64(d)
@@ -90,12 +69,10 @@ func (ct *callbackTimer[K, V]) arm(deadline, now int64) {
 	ct.timer.Reset(d)
 }
 
-// fire runs when the shard timer fires. It runs a lone due callback itself and
-// leaves two or more to fireBatch.
 func (ct *callbackTimer[K, V]) fire() {
 	ct.mu.Lock()
 	ct.when = math.MaxInt64
-	// The heap stays empty after close, so c is not nil past this check.
+	// A closed timer has an empty heap and a nil cache.
 	if len(ct.heap) == 0 {
 		ct.mu.Unlock()
 		return
@@ -107,7 +84,8 @@ func (ct *callbackTimer[K, V]) fire() {
 		ct.mu.Unlock()
 		return
 	}
-	// The second earliest task is one of the root's four children.
+	// The second-earliest task is a root child.
+	// Keep these indexes in sync with callbackHeapArity.
 	if ct.due(1, now) || ct.due(2, now) || ct.due(3, now) || ct.due(4, now) {
 		ct.mu.Unlock()
 		ct.fireBatch()
@@ -129,10 +107,6 @@ func (ct *callbackTimer[K, V]) fire() {
 	}
 }
 
-// fireBatch takes up to dueBatch due tasks and runs the callbacks of those whose
-// entries are still present and expired: the first in this goroutine and the
-// others each in a goroutine of its own. If more tasks are due, it first starts
-// another fireBatch for them, so that a slow callback delays no other one.
 func (ct *callbackTimer[K, V]) fireBatch() {
 	var tasks [dueBatch]*callbackTask[K, V]
 	var hashes [dueBatch]uint64
@@ -149,16 +123,16 @@ func (ct *callbackTimer[K, V]) fireBatch() {
 	}
 	ct.mu.Unlock()
 	if more {
+		// Start the next batch before a callback can block this goroutine.
 		go ct.fireBatch()
 	}
 	if n == 0 {
 		return
 	}
-	// Keep the tasks whose entries are still present and expired at take's now.
-	// The tasks all belong to this shard, so one read lock covers them.
 	for i := range n {
 		hashes[i] = c.hasher.Sum(tasks[i].key)
 	}
+	// All tasks came from this shard, so one read lock covers the batch.
 	s := c.shardByHash(hashes[0])
 	kept := 0
 	s.mu.RLock()
@@ -179,15 +153,12 @@ func (ct *callbackTimer[K, V]) fireBatch() {
 	c.runCallback(tasks[0])
 }
 
-// runCallback runs task's callback unless the cache has closed.
 func (c *Cache[K, V]) runCallback(task *callbackTask[K, V]) {
 	if !c.isClosed() {
 		task.callback(task.key, task.value)
 	}
 }
 
-// close stops the timer and drops the pending tasks. Callbacks already started
-// keep running.
 func (ct *callbackTimer[K, V]) close() {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
@@ -195,18 +166,14 @@ func (ct *callbackTimer[K, V]) close() {
 		ct.timer.Stop()
 	}
 	ct.heap = nil
-	// The runtime can hold a stopped timer for a while, and the timer holds ct.
+	// Let the cache be collected while the runtime still references the timer.
 	ct.c = nil
 }
 
-// due reports whether heap[i] exists and is due at now. A task is due once now
-// is past its deadline, the rule cache entries expire by. ct.mu must be held.
 func (ct *callbackTimer[K, V]) due(i int, now int64) bool {
 	return i < len(ct.heap) && ct.heap[i].expireTime < now
 }
 
-// take moves up to len(dst) tasks that are due at now from the heap into dst.
-// It returns how many it took and whether more are due. ct.mu must be held.
 func (ct *callbackTimer[K, V]) take(dst []*callbackTask[K, V], now int64) (n int, more bool) {
 	for n < len(dst) && ct.due(0, now) {
 		dst[n] = ct.pop()
@@ -215,8 +182,6 @@ func (ct *callbackTimer[K, V]) take(dst []*callbackTask[K, V], now int64) (n int
 	return n, ct.due(0, now)
 }
 
-// up moves heap[i] toward the root and returns its final index. It moves a
-// hole instead of swapping. ct.mu must be held.
 func (ct *callbackTimer[K, V]) up(i int) int {
 	h := ct.heap
 	e := h[i]
@@ -232,8 +197,6 @@ func (ct *callbackTimer[K, V]) up(i int) int {
 	return i
 }
 
-// pop removes and returns the earliest task. The heap shrinks as it drains, so
-// a burst does not keep its peak size. ct.mu must be held.
 func (ct *callbackTimer[K, V]) pop() *callbackTask[K, V] {
 	h := ct.heap
 	top := h[0].task
@@ -242,7 +205,6 @@ func (ct *callbackTimer[K, V]) pop() *callbackTask[K, V] {
 		ct.heap = nil
 		return top
 	}
-	// Move the last entry down from the root.
 	last := h[n]
 	h[n] = callbackEntry[K, V]{}
 	h = h[:n]
@@ -265,7 +227,7 @@ func (ct *callbackTimer[K, V]) pop() *callbackTask[K, V] {
 		i = m
 	}
 	h[i] = last
-	// Halve at a quarter full, which leaves room to grow again without a copy.
+	// Shrink after a burst and leave room for new tasks.
 	if cap(h) > callbackHeapMinCap && n < cap(h)/4 {
 		h = append(make([]callbackEntry[K, V], 0, cap(h)/2), h...)
 	}
