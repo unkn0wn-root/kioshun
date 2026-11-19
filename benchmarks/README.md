@@ -48,20 +48,23 @@ go test -bench='BenchmarkCacheComparison' -benchmem -run=^$ -benchtime=1s .
 go test -bench=. -benchmem -run=^$ -benchtime=1s -timeout=30m .
 ```
 
-## Example Full Suite Run
+## Example Run
 
 Environment:
 
-- Date: `2026-06-11`
+- Date: `2026-11-19`
 - OS/arch: `darwin/arm64`
-- OS version: `macOS 26.5.1 (Darwin 25.5.0)`
+- OS version: `macOS 26.6.2 (Darwin 25.6.0)`
 - CPU: `Apple M4 Max`
 - Logical CPUs: `14`
 - Memory: `36 GiB`
-- Go: `go1.26.0 darwin/arm64`
+- Go: `go1.27.3 darwin/arm64`
+- Library versions: Ristretto `v2.4.2`, BigCache `v3.2.0`, FreeCache `v1.2.7`, go-cache `v2.1.0+incompatible`
 - Setup sanity check: `go test -run=TestBenchmarkComparisonGetSetup -count=1 .`
-- Full suite command: `go test -bench=. -benchmem -run=^$ -benchtime=1s -timeout=30m .`
-- Full suite duration: `265.001s`
+- Command: `go test -bench='BenchmarkCacheComparison' -benchmem -run=^$ -benchtime=1s -count=5 -timeout=60m .`
+- Duration: `745.940s`
+
+Each value is the median of 5 runs.
 
 ### Core Operations
 
@@ -69,41 +72,41 @@ Environment:
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 45.37 | - | 96 | 1 |
-| FreeCache | 55.43 | - | 0 | 0 |
-| BigCache | 59.89 | - | 41 | 0 |
-| go-cache | 277.1 | - | 24 | 1 |
-| Ristretto | 542.0 | 0.1363 | 100 | 1 |
+| Kioshun | 45.19 | - | 96 | 1 |
+| FreeCache | 53.73 | - | 0 | 0 |
+| BigCache | 61.27 | - | 21 | 0 |
+| go-cache | 326.5 | - | 24 | 1 |
+| Ristretto | 497.8 | 0.1391 | 100 | 1 |
 
 #### Set Strict
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| FreeCache | 56.41 | - | 0 | 0 |
-| Kioshun | 57.99 | - | 96 | 1 |
-| BigCache | 61.98 | - | 43 | 0 |
-| go-cache | 320.5 | - | 24 | 1 |
-| Ristretto | 1276 | - | 333 | 3 |
+| BigCache | 52.34 | - | 23 | 0 |
+| FreeCache | 53.09 | - | 0 | 0 |
+| Kioshun | 60.64 | - | 96 | 1 |
+| go-cache | 321.9 | - | 24 | 1 |
+| Ristretto | 1153 | - | 333 | 3 |
 
 #### Get TTL
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 6.194 | - | 0 | 0 |
-| Ristretto | 21.49 | - | 0 | 0 |
-| FreeCache | 75.59 | - | 1024 | 1 |
-| BigCache | 91.09 | - | 1040 | 2 |
-| go-cache | 135.8 | - | 0 | 0 |
+| Kioshun | 7.538 | - | 0 | 0 |
+| Ristretto | 20.67 | - | 0 | 0 |
+| FreeCache | 73.31 | - | 1024 | 1 |
+| BigCache | 88.14 | - | 1040 | 2 |
+| go-cache | 131.3 | - | 0 | 0 |
 
 #### Get No TTL
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 5.285 | - | 0 | 0 |
-| Ristretto | 16.51 | - | 0 | 0 |
-| FreeCache | 72.97 | - | 1024 | 1 |
-| BigCache | 110.8 | - | 1040 | 2 |
-| go-cache | 130.5 | - | 0 | 0 |
+| Kioshun | 6.657 | - | 0 | 0 |
+| Ristretto | 15.34 | - | 0 | 0 |
+| FreeCache | 71.11 | - | 1024 | 1 |
+| BigCache | 85.57 | - | 1040 | 2 |
+| go-cache | 124.6 | - | 0 | 0 |
 
 ### Mixed Workloads
 
@@ -111,41 +114,41 @@ Environment:
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 18.14 | - | 28 | 0 |
-| BigCache | 40.54 | - | 271 | 0 |
-| FreeCache | 71.40 | - | 718 | 0 |
-| go-cache | 149.3 | - | 7 | 0 |
-| Ristretto | 208.0 | - | 34 | 0 |
+| Kioshun | 18.99 | - | 28 | 0 |
+| BigCache | 34.16 | - | 262 | 0 |
+| FreeCache | 66.35 | - | 718 | 0 |
+| go-cache | 117.2 | - | 7 | 0 |
+| Ristretto | 195.3 | - | 34 | 0 |
 
 #### 70% Read / 30% Write Strict
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 35.75 | - | 28 | 0 |
-| BigCache | 39.38 | - | 272 | 0 |
-| FreeCache | 69.70 | - | 718 | 0 |
-| go-cache | 116.9 | - | 7 | 0 |
-| Ristretto | 422.2 | - | 96 | 0 |
+| BigCache | 34.45 | - | 262 | 0 |
+| Kioshun | 37.78 | - | 28 | 0 |
+| FreeCache | 66.76 | - | 718 | 0 |
+| go-cache | 119.1 | - | 7 | 0 |
+| Ristretto | 401.8 | - | 96 | 0 |
 
 #### 90% Read / 10% Write Async
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 11.99 | - | 9 | 0 |
-| BigCache | 26.51 | - | 194 | 0 |
-| Ristretto | 77.52 | - | 15 | 0 |
-| FreeCache | 77.72 | - | 919 | 0 |
-| go-cache | 130.2 | - | 2 | 0 |
+| Kioshun | 13.05 | - | 9 | 0 |
+| BigCache | 24.85 | - | 181 | 0 |
+| FreeCache | 76.73 | - | 919 | 0 |
+| Ristretto | 78.58 | - | 15 | 0 |
+| go-cache | 132.7 | - | 2 | 0 |
 
 #### 10% Read / 90% Write Async
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 34.84 | - | 86 | 0 |
-| FreeCache | 58.02 | - | 100 | 0 |
-| BigCache | 77.48 | - | 117 | 1 |
-| go-cache | 334.8 | - | 21 | 0 |
-| Ristretto | 533.1 | - | 88 | 0 |
+| Kioshun | 35.56 | - | 86 | 0 |
+| BigCache | 56.90 | - | 94 | 0 |
+| FreeCache | 61.90 | - | 100 | 0 |
+| go-cache | 315.6 | - | 21 | 0 |
+| Ristretto | 523.5 | - | 87 | 0 |
 
 ### Contention And Real-World Workloads
 
@@ -153,31 +156,31 @@ Environment:
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 20.57 | - | 38 | 0 |
-| BigCache | 73.18 | - | 583 | 1 |
-| FreeCache | 73.20 | - | 617 | 0 |
-| go-cache | 124.0 | - | 9 | 0 |
-| Ristretto | 248.3 | - | 42 | 0 |
+| Kioshun | 24.98 | - | 38 | 0 |
+| FreeCache | 71.03 | - | 617 | 0 |
+| BigCache | 76.80 | - | 573 | 1 |
+| go-cache | 104.7 | - | 9 | 0 |
+| Ristretto | 244.1 | - | 42 | 0 |
 
 #### 60% Read / 35% Write / 5% Delete Async
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 27.64 | - | 33 | 0 |
-| BigCache | 46.66 | - | 371 | 0 |
-| FreeCache | 66.80 | - | 655 | 0 |
-| go-cache | 118.8 | - | 8 | 0 |
-| Ristretto | 217.4 | 0.01253 | 43 | 0 |
+| Kioshun | 27.83 | - | 33 | 0 |
+| BigCache | 43.33 | - | 365 | 0 |
+| FreeCache | 68.59 | - | 676 | 0 |
+| go-cache | 110.4 | - | 8 | 0 |
+| Ristretto | 209.4 | 0.01234 | 43 | 0 |
 
 #### 60% Read / 35% Write / 5% Delete Strict
 
 | Cache | ns/op | write_fail/op | B/op | allocs/op |
 | --- | ---: | ---: | ---: | ---: |
-| Kioshun | 31.03 | - | 33 | 0 |
-| BigCache | 46.92 | - | 373 | 0 |
-| FreeCache | 68.54 | - | 652 | 0 |
-| go-cache | 118.7 | - | 8 | 0 |
-| Ristretto | 521.3 | - | 116 | 1 |
+| Kioshun | 28.88 | - | 33 | 0 |
+| BigCache | 51.18 | - | 365 | 0 |
+| FreeCache | 70.18 | - | 692 | 0 |
+| go-cache | 119.7 | - | 8 | 0 |
+| Ristretto | 463.4 | - | 116 | 1 |
 
 ### Large Values
 
@@ -185,25 +188,25 @@ Environment:
 
 | Size | Kioshun | Ristretto | BigCache | FreeCache | go-cache |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1KB | 31.40 | 365.4 | 71.66 | 55.04 | 160.2 |
-| 4KB | 33.10 | 353.8 | 94.21 | 89.82 | 170.7 |
-| 16KB | 32.12 | 222.2 | 172.7 | 179.6 | 161.8 |
-| 64KB | 32.64 | 103.4 | 452.3 | 216.9 | 303.5 |
+| 1KB | 32.03 | 345.1 | 47.95 | 52.50 | 130.9 |
+| 4KB | 35.96 | 348.5 | 83.84 | 84.20 | 149.2 |
+| 16KB | 31.78 | 217.5 | 157.3 | 182.3 | 128.7 |
+| 64KB | 31.86 | 96.46 | 430.9 | 200.8 | 286.4 |
 
 #### Strict ns/op
 
 | Size | Kioshun | Ristretto | BigCache | FreeCache | go-cache |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1KB | 45.56 | 1096 | 59.33 | 54.69 | 301.9 |
-| 4KB | 45.27 | 1108 | 94.38 | 93.36 | 276.0 |
-| 16KB | 45.39 | 1264 | 161.1 | 177.3 | 300.3 |
-| 64KB | 44.41 | 1168 | 430.9 | 208.6 | 301.3 |
+| 1KB | 41.52 | 1060 | 55.16 | 51.80 | 276.4 |
+| 4KB | 38.25 | 1033 | 84.14 | 81.03 | 274.7 |
+| 16KB | 38.70 | 1036 | 172.4 | 162.5 | 282.8 |
+| 64KB | 38.76 | 1021 | 432.7 | 207.8 | 288.7 |
 
 Ristretto async large-value rows also reported write failures in this run:
 
 | Size | Ristretto write_fail/op |
 | ---: | ---: |
-| 1KB | 0.04517 |
-| 4KB | 0.04072 |
-| 16KB | 0.2503 |
-| 64KB | 0.5061 |
+| 1KB | 0.04195 |
+| 4KB | 0.04436 |
+| 16KB | 0.2533 |
+| 64KB | 0.5074 |

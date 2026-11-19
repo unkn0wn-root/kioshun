@@ -12,7 +12,7 @@ import (
 
 	"github.com/allegro/bigcache/v3"
 	"github.com/coocood/freecache"
-	"github.com/dgraph-io/ristretto"
+	"github.com/dgraph-io/ristretto/v2"
 	gocache "github.com/patrickmn/go-cache"
 	kioshun "github.com/unkn0wn-root/kioshun"
 )
@@ -189,7 +189,7 @@ func (c *GoCacheWrapper) Close() error {
 }
 
 type RistrettoWrapper struct {
-	cache *ristretto.Cache
+	cache *ristretto.Cache[string, []byte]
 	ttl   time.Duration
 }
 
@@ -209,11 +209,7 @@ func (c *RistrettoWrapper) SetStrict(key string, value []byte) error {
 }
 
 func (c *RistrettoWrapper) Get(key string) ([]byte, bool) {
-	value, found := c.cache.Get(key)
-	if !found {
-		return nil, false
-	}
-	return value.([]byte), true
+	return c.cache.Get(key)
 }
 
 func (c *RistrettoWrapper) Delete(key string) bool {
@@ -258,7 +254,7 @@ func newBenchCache(tb testing.TB, name string, opts cacheOptions) cacheBench {
 			ttl:   kioshunTTL,
 		}
 	case "ristretto":
-		ristrettoCache, err := ristretto.NewCache(&ristretto.Config{
+		ristrettoCache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
 			NumCounters: int64(benchTargetEntries * 10),
 			MaxCost:     int64(benchMemoryBudget),
 			BufferItems: 64,
@@ -358,7 +354,7 @@ func runParallelCycle(b *testing.B, n int, fn func(int)) {
 func prepopulate(tb testing.TB, c cacheBench, keys []string, value []byte) {
 	tb.Helper()
 	for _, key := range keys {
-		if err := c.Set(key, value); err != nil {
+		if err := c.SetStrict(key, value); err != nil {
 			tb.Fatalf("prepopulate set %q: %v", key, err)
 		}
 	}

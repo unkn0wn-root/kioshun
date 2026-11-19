@@ -3,9 +3,11 @@ module benchmark
 go 1.24.0
 
 require (
-	github.com/allegro/bigcache/v3 v3.1.0
-	github.com/coocood/freecache v1.2.4
-	github.com/dgraph-io/ristretto/v2 v2.4.0
+	github.com/Yiling-J/theine-go v0.6.3
+	github.com/allegro/bigcache/v3 v3.2.0
+	github.com/coocood/freecache v1.2.7
+	github.com/dgraph-io/ristretto/v2 v2.4.2
+	github.com/maypok86/otter/v2 v2.4.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/unkn0wn-root/kioshun v0.0.3
 )
@@ -13,10 +15,8 @@ require (
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/fxamacker/cbor/v2 v2.6.0 // indirect
-	github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b // indirect
-	github.com/pkg/errors v0.9.1 // indirect
-	github.com/x448/float16 v0.8.4 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
+	github.com/zeebo/xxh3 v1.0.2 // indirect
 	golang.org/x/sys v0.36.0 // indirect
 )
 
