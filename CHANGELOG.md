@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+## [1.6.0](https://github.com/unkn0wn-root/kioshun/compare/v1.5.2...v1.6.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cache:** size small-cache shards, lock-free Exists, timer callbacks, expired negative TTL
+* **httpcache:** follow RFC 9111 shared-cache rules
+
+### Bug Fixes
+
+* **cache:** size small-cache shards, lock-free Exists, timer callbacks, expired negative TTL ([9dda814](https://github.com/unkn0wn-root/kioshun/commit/9dda814dab5ccb175bf549e342a902480d49b41a))
+* **cache:** stop losing removal listener wake-ups ([ffb8ef5](https://github.com/unkn0wn-root/kioshun/commit/ffb8ef54466d9d0ce561a39ade6dbe533b08d270))
+* **cache:** stop losing write queue wake-ups ([25b8c02](https://github.com/unkn0wn-root/kioshun/commit/25b8c02853cea998b138c292a067fe6d6c43a6bc))
+* **httpcache:** follow RFC 9111 shared-cache rules ([020ea38](https://github.com/unkn0wn-root/kioshun/commit/020ea385c590a3e45813d39587edb62c12ac0b00))
+* **httpcache:** invalidate every stored variant on unsafe requests ([097a605](https://github.com/unkn0wn-root/kioshun/commit/097a6050e0f48323eebf1e507a9460a7fc6d61e0))
+* release pending SetWithCallback timers on Close ([5774e7d](https://github.com/unkn0wn-root/kioshun/commit/5774e7d3ad917b45c6877dbf6e3697b0778b7c29))
+
 ### [1.5.2](https://github.com/unkn0wn-root/kioshun/compare/v1.5.1...v1.5.2) (2026-06-15)
 
 ### [1.5.1](https://github.com/unkn0wn-root/kioshun/compare/v1.4.2...v1.5.1) (2026-06-12)
