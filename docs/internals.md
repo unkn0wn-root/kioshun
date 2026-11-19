@@ -9,7 +9,8 @@ The root `kioshun` package contains the generic cache:
 - `cache.go`: public API, construction, sharding, reads, stats, cleanup.
 - `config.go`: `Config`, defaults, and validation.
 - `errors.go`: sentinel errors, `CacheError`, and `ConfigError`.
-- `writes.go`: queued writes, synchronous mutation ordering, barriers, workers, expiry callbacks.
+- `writes.go`: queued writes, synchronous mutation ordering, barriers, workers.
+- `callback.go`: per-shard timer and deadline heap for `SetWithCallback`.
 - `shard.go`: cache entry metadata, per-shard state, item removal, read-sample draining, TTL cleanup.
 - `htable.go`: per-shard open-addressing table with lock-free lookups.
 - `eviction.go`: removal reasons, removal/eviction listener options, and the LRU, LFU, and FIFO eviction adapters.
@@ -164,9 +165,11 @@ Expired items leave the cache through three paths:
 - `Exists`, which takes the write lock only when it finds an expired item
 - `Cleanup`, either called manually or by the cleanup worker
 
-`Keys` returns a point-in-time snapshot of non-expired keys. It does not clean up expired entries while scanning. `SetWithCallback` starts a
-`time.AfterFunc` timer after the write commits, so a pending callback costs a runtime timer and no goroutine. When the timer fires, the callback runs only
-if the cache is still open and the key still exists and is expired. Cleanup still owns actual removal.
+`Keys` returns a point-in-time snapshot of non-expired keys. It does not clean up expired entries while scanning. `SetWithCallback` puts the
+callback in its shard's deadline heap after the write commits. Each shard has one runtime timer, set for the earliest deadline, so a pending callback
+costs a heap entry and a copy of its key and value, and no timer or goroutine. A deadline a millisecond or more away wakes the timer a sixteenth of the
+remaining time early, and the timer is set again from there. A due callback runs only if the cache is still open and the key still exists and is
+expired, and a callback that blocks does not hold back the ones due after it. Cleanup still owns actual removal.
 
 ## Removal Listener
 
@@ -217,9 +220,9 @@ Shard workers sleep on a coalesced `wake` channel. Each wake runs this sequence:
 5. Drain read samples again between batches.
 
 `Sync`, `Clear`, and shutdown use barrier commands. A barrier sent to every shard is acknowledged only after earlier commands on that shard have been
-applied. `Close` marks the cache closed, flushes accepted writes, closes `closeCh`, waits for workers, and clears all shards. Producers blocked on a full
-queue wake through `closeCh` and return `ErrCacheClosed`. `Close` does not stop callback timers. A timer that fires after `Close` sees the closed flag and
-returns without running the callback. A pending callback keeps its key, value and the cache reachable until its ttl has elapsed, even after `Close`.
+applied. `Close` marks the cache closed, stops each shard's callback timer and drops its heap, flushes accepted writes, closes `closeCh`, waits
+for workers, and clears all shards. Producers blocked on a full queue wake through `closeCh` and return `ErrCacheClosed`. Pending callbacks are
+reachable only through the shard heaps, so nothing pending stays reachable after `Close`. A callback already due may still run.
 
 ## Read Path
 

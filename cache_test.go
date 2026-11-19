@@ -1327,28 +1327,6 @@ func TestSetWithCallbackStartsNoGoroutinePerKey(t *testing.T) {
 	}
 }
 
-func TestCallbackSkippedWhenClosed(t *testing.T) {
-	c := newTestCache[string, int](t, Config{MaxSize: 64, ShardCount: 1, EvictionPolicy: LRU})
-	defer c.Close()
-	if err := c.Set("k", 1, time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(5 * time.Millisecond)
-	c.closed.Store(true)
-
-	var called atomic.Bool
-	c.scheduleCallback(callbackTask[string, int]{
-		key:        "k",
-		value:      1,
-		expireTime: 1,
-		callback:   func(string, int) { called.Store(true) },
-	})
-	time.Sleep(50 * time.Millisecond)
-	if called.Load() {
-		t.Fatal("callback ran on a closed cache")
-	}
-}
-
 func TestSetWithCallbackNotFiredAfterClose(t *testing.T) {
 	c := newTestCache[string, int](t, Config{MaxSize: 64, EvictionPolicy: LRU})
 	var called atomic.Bool

@@ -95,7 +95,7 @@ func (c *Cache[K, V]) tryApplyInline(s *shard[K, V], cmd *writeCommand[K, V]) bo
 	s.drainMu.Unlock()
 
 	if task, ok := cmd.newCallbackTask(committed); ok {
-		c.scheduleCallback(task)
+		c.scheduleCallback(s, task)
 	}
 	return true
 }
@@ -237,7 +237,7 @@ func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error
 		return err
 	}
 	if hasTask {
-		c.scheduleCallback(task)
+		c.scheduleCallback(s, task)
 	}
 	return nil
 }
@@ -396,7 +396,7 @@ func (c *Cache[K, V]) applyWriteBatch(s *shard[K, V], batch []writeCommand[K, V]
 	s.mu.Unlock()
 
 	for _, task := range callbacks {
-		c.scheduleCallback(task)
+		c.scheduleCallback(s, task)
 	}
 	for _, ch := range acks {
 		ch <- struct{}{}
@@ -555,21 +555,4 @@ func (c *Cache[K, V]) clearShard(s *shard[K, V]) {
 	}
 	atomic.StoreInt64(&s.size, 0)
 	atomic.StoreInt64(&s.cost, 0)
-}
-
-func (c *Cache[K, V]) scheduleCallback(task callbackTask[K, V]) {
-	time.AfterFunc(time.Duration(task.expireTime-c.nowNano()), func() {
-		if c.isClosed() {
-			return
-		}
-		kh := c.hasher.Sum(task.key)
-		s := c.shardByHash(kh)
-		s.mu.RLock()
-		item, exists := s.tab.lookup(kh, task.key)
-		expired := exists && item.expireTime > 0 && c.nowNano() > item.expireTime
-		s.mu.RUnlock()
-		if expired {
-			task.callback(task.key, task.value)
-		}
-	})
 }

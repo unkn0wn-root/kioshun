@@ -173,6 +173,7 @@ func New[K comparable, V any](config Config, opts ...Option[K, V]) (*Cache[K, V]
 			stats:      cache.stats,
 			wake:       make(chan struct{}, 1),
 			writeBatch: make([]writeCommand[K, V], config.WriteBatchSize),
+			callbacks:  newCallbackTimer(cache),
 		}
 		s.queue = newMPSCQueue[K, V](config.WriteBufferSize, s.wake, cache.closeCh)
 
@@ -279,8 +280,9 @@ func (c *Cache[K, V]) SetAsync(key K, value V, ttl time.Duration) error {
 }
 
 // SetWithCallback sets key like Set and calls callback when ttl has elapsed,
-// if key is still present and expired. The callback does not run after Close,
-// but a pending timer keeps the entry and the cache reachable until it fires.
+// if key is still present and expired. Close cancels pending callbacks and
+// drops their keys and values. A callback already due when Close runs may
+// still run.
 func (c *Cache[K, V]) SetWithCallback(key K, value V, ttl time.Duration, callback func(K, V)) error {
 	return c.setAndWait(key, value, ttl, callback)
 }
@@ -449,6 +451,9 @@ func (c *Cache[K, V]) PolicyStats() PolicyStats {
 func (c *Cache[K, V]) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
+		for _, s := range c.shards {
+			s.callbacks.close()
+		}
 		// Drain accepted writes before waking blocked producers and stopping workers.
 		// The queues remain open, so no sender can race a channel close.
 		c.flush()
