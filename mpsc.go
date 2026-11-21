@@ -1,6 +1,7 @@
 package kioshun
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -130,6 +131,18 @@ func (q *mpscQueue[K, V]) ready() bool {
 	pos := q.tail.Load()
 	cell := &q.buffer[pos&q.mask]
 	return cell.seq.Load() == pos+1
+}
+
+// waitClaimed returns false once the consumer reaches end.
+// Otherwise it waits for the producer at tail to publish. Only the consumer may call it.
+func (q *mpscQueue[K, V]) waitClaimed(end uint64) bool {
+	if int64(end-q.tail.Load()) <= 0 {
+		return false
+	}
+	for !q.ready() {
+		runtime.Gosched()
+	}
+	return true
 }
 
 func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {

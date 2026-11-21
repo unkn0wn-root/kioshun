@@ -19,6 +19,21 @@ func drainAll(q *mpscQueue[int, int], buf []writeCommand[int, int]) []writeComma
 	}
 }
 
+// claimSlot pauses a producer between claiming and publishing a slot.
+// publish fills the slot without sending a wake-up.
+func claimSlot[K comparable, V any](t *testing.T, q *mpscQueue[K, V]) (publish func(cmd writeCommand[K, V])) {
+	t.Helper()
+	pos := q.head.Load()
+	cell := &q.buffer[pos&q.mask]
+	if cell.seq.Load() != pos || !q.head.CompareAndSwap(pos, pos+1) {
+		t.Fatal("could not claim the next ring slot")
+	}
+	return func(cmd writeCommand[K, V]) {
+		cell.cmd = cmd
+		cell.seq.Store(pos + 1)
+	}
+}
+
 func TestMPSCQueueMinimumRingSize(t *testing.T) {
 	// Sizes 0 and 1 must still allocate the algorithm's minimum two slots.
 	for _, size := range []int{0, 1} {
@@ -316,5 +331,28 @@ func TestMPSCQueueSpaceLeavesNothingBehind(t *testing.T) {
 		if q.spaceWanted.Load() || len(q.space) != 0 {
 			t.Fatalf("round %d: left behind: space wanted %v, %d wake-ups queued", round, q.spaceWanted.Load(), len(q.space))
 		}
+	}
+}
+
+func TestMPSCQueueWaitClaimedIgnoresLaterClaims(t *testing.T) {
+	q := newMPSCQueue[int, int](8, make(chan struct{}, 1), make(chan struct{}))
+	if err := q.enqueue(writeCommand[int, int]{hash: 1}); err != nil {
+		t.Fatal(err)
+	}
+	end := q.head.Load()
+	claimSlot(t, q) // claimed after end and never published
+
+	if got := drainAll(q, make([]writeCommand[int, int], 8)); len(got) != 1 || got[0].hash != 1 {
+		t.Fatalf("drained %v, want [1]", got)
+	}
+	done := make(chan bool, 1)
+	go func() { done <- q.waitClaimed(end) }()
+	select {
+	case more := <-done:
+		if more {
+			t.Fatal("waitClaimed reported an unconsumed slot claimed before end")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitClaimed waited for a slot claimed after end")
 	}
 }

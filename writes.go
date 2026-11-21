@@ -201,8 +201,7 @@ func (c *Cache[K, V]) releaseWriteWaiter(waiter *writeWaiter) {
 	c.waiterPool.Put(waiter)
 }
 
-// syncMutate drains earlier writes before applying a direct mutation under the
-// shard lock. drainMu keeps queue consumption ordered.
+// syncMutate orders a direct mutation after writes already claimed on the shard.
 func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 	if c.isClosed() {
 		return ErrCacheClosed
@@ -215,7 +214,11 @@ func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 		return ErrCacheClosed
 	}
 
+	end := s.queue.head.Load()
 	c.drainShardQueue(s)
+	for s.queue.waitClaimed(end) {
+		c.drainShardQueue(s)
+	}
 
 	s.mu.Lock()
 	apply()
