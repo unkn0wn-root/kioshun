@@ -11,13 +11,15 @@ import (
 // Fields read without a lock are immutable after publication. A lock-free reader
 // may retain an item after eviction, so updates allocate a new item and the
 // garbage collector reclaims old ones.
+//
+// Keeping the links, key and value first lets the garbage collector skip the trailing scalar fields.
 type cacheItem[K comparable, V any] struct {
-	value      V
-	expireTime int64 // monotonic nanoseconds since cache creation; 0 means no expiry
-	cost       int64
 	prev       *cacheItem[K, V]
 	next       *cacheItem[K, V]
 	key        K
+	value      V
+	expireTime int64 // monotonic nanoseconds since cache creation. 0 means no expiry.
+	cost       int64
 	hash       uint64
 	queue      sieveQueueID
 	queueOwner uint8
