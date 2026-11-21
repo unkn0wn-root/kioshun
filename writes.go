@@ -215,9 +215,9 @@ func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 	}
 
 	end := s.queue.head.Load()
-	c.drainShardQueue(s)
+	c.drainShardQueue(s, end)
 	for s.queue.waitClaimed(end) {
-		c.drainShardQueue(s)
+		c.drainShardQueue(s, end)
 	}
 
 	s.mu.Lock()
@@ -310,10 +310,9 @@ func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 	for {
 		select {
 		case <-s.wake:
-			// Clear wakeState before checking the ring. A concurrent producer is then
-			// either visible to ready or responsible for sending a new wake-up.
 			for {
 				c.drainShard(s)
+				// Clear wakeState first so a producer that publishes at tail after the check can wake us.
 				s.queue.wakeState.Store(0)
 				if !s.queue.ready() {
 					break
@@ -335,13 +334,13 @@ func (c *Cache[K, V]) tryDrainShard(s *shard[K, V]) {
 	if !s.drainMu.TryLock() {
 		return
 	}
-	c.drainShardQueue(s)
+	c.drainShardQueue(s, s.queue.head.Load())
 	s.drainMu.Unlock()
 }
 
 func (c *Cache[K, V]) drainShard(s *shard[K, V]) {
 	s.drainMu.Lock()
-	c.drainShardQueue(s)
+	c.drainShardQueue(s, s.queue.head.Load())
 	s.drainMu.Unlock()
 }
 
@@ -351,22 +350,29 @@ func (c *Cache[K, V]) drainMissAndLookup(s *shard[K, V], kh uint64, key K) (*cac
 	if s.queue.quiescent() || !s.drainMu.TryLock() {
 		return nil, false
 	}
-	c.drainShardQueue(s)
+	c.drainShardQueue(s, s.queue.head.Load())
 	s.drainMu.Unlock()
 	return s.tab.lookup(kh, key)
 }
 
-func (c *Cache[K, V]) drainShardQueue(s *shard[K, V]) {
+// drainShardQueue applies published writes before end. The caller holds drainMu.
+// A fixed end bounds the drain to one ring's worth of writes even as producers refill it.
+func (c *Cache[K, V]) drainShardQueue(s *shard[K, V], end uint64) {
 	batch := s.writeBatch
 
 	s.drainReadSamples()
 	for {
-		n := s.queue.tryDequeue(batch)
+		n := s.queue.tryDequeue(batch, end)
 		if n == 0 {
-			return
+			break
 		}
 		c.applyWriteBatch(s, batch[:n])
 		s.drainReadSamples()
+	}
+	// A ready command can be left behind if its producer checked tail before this drain reached it.
+	// Wake the worker in case that producer skipped the wake-up.
+	if s.queue.ready() {
+		s.queue.wakeConsumer()
 	}
 }
 

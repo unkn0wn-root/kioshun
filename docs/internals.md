@@ -211,6 +211,9 @@ or it may still be waiting for the worker. Call `Sync` when committed visibility
 
 This preserves per-shard ordering and gives `Set` immediate read-after-write visibility.
 
+Every drain of the write queue, whichever call runs it, applies at most the writes that were queued when it started. A steady stream of
+`SetAsync` calls therefore cannot keep `Set`, `SetWithCallback`, or `Delete` waiting for `drainMu` indefinitely.
+
 Shard workers sleep on a coalesced `wake` channel. Each wake runs this sequence:
 
 1. Drain buffered SieveTinyLFU read samples into the sketch.

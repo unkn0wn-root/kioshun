@@ -64,8 +64,7 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 			if q.head.CompareAndSwap(pos, pos+1) {
 				cell.cmd = cmd
 				cell.seq.Store(pos + 1)
-				// Wake only for the consumer's next slot. Read tail after publishing,
-				// so a consumer that reaches this slot later finds it published.
+				// Publish before reading tail so we either send a wake-up or the consumer sees the command itself.
 				if q.tail.Load() == pos {
 					q.wakeConsumer()
 				}
@@ -145,10 +144,11 @@ func (q *mpscQueue[K, V]) waitClaimed(end uint64) bool {
 	return true
 }
 
-func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
+// tryDequeue moves contiguous published commands before end into buf. Only the consumer may call it.
+func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V], end uint64) int {
 	n := 0
 	pos := q.tail.Load()
-	for n < len(buf) {
+	for n < len(buf) && int64(end-pos) > 0 {
 		cell := &q.buffer[pos&q.mask]
 		if cell.seq.Load() != pos+1 {
 			break

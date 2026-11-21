@@ -11,7 +11,7 @@ import (
 func drainAll(q *mpscQueue[int, int], buf []writeCommand[int, int]) []writeCommand[int, int] {
 	var out []writeCommand[int, int]
 	for {
-		n := q.tryDequeue(buf)
+		n := q.tryDequeue(buf, q.head.Load())
 		if n == 0 {
 			return out
 		}
@@ -90,7 +90,7 @@ func TestMPSCQueueBackpressureBlocksUntilDrain(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if n := q.tryDequeue(make([]writeCommand[int, int], 1)); n != 1 {
+	if n := q.tryDequeue(make([]writeCommand[int, int], 1), q.head.Load()); n != 1 {
 		t.Fatalf("dequeued %d, want 1", n)
 	}
 	select {
@@ -149,7 +149,7 @@ func TestMPSCQueueConcurrentProducersNoLoss(t *testing.T) {
 		buf := make([]writeCommand[int, int], 32)
 		defer close(done)
 		for got < want {
-			n := q.tryDequeue(buf)
+			n := q.tryDequeue(buf, q.head.Load())
 			if n == 0 {
 				continue
 			}
@@ -225,7 +225,7 @@ func TestMPSCQueueFreedSlotsWakeEveryWaiter(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if n := q.tryDequeue(make([]writeCommand[int, int], 2)); n != 2 {
+	if n := q.tryDequeue(make([]writeCommand[int, int], 2), q.head.Load()); n != 2 {
 		t.Fatalf("dequeued %d, want 2", n)
 	}
 	for i := range 2 {
@@ -304,7 +304,7 @@ func TestMPSCQueueSpaceLeavesNothingBehind(t *testing.T) {
 			defer close(consumed)
 			buf := make([]writeCommand[int, int], 2)
 			for !quit.Load() {
-				if q.tryDequeue(buf) == 0 {
+				if q.tryDequeue(buf, q.head.Load()) == 0 {
 					runtime.Gosched() // lets the producer run when GOMAXPROCS is 1
 				}
 			}
@@ -354,5 +354,52 @@ func TestMPSCQueueWaitClaimedIgnoresLaterClaims(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("waitClaimed waited for a slot claimed after end")
+	}
+}
+
+func TestMPSCQueueTryDequeueStopsAtEnd(t *testing.T) {
+	tests := []struct {
+		name     string
+		consumed int
+		end      uint64
+		want     int
+	}{
+		{"end inside published run", 0, 2, 2},
+		{"end at tail", 2, 2, 0},
+		{"end behind tail", 2, 1, 0},
+		{"end past unpublished slot", 0, 5, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q := newMPSCQueue[int, int](8, make(chan struct{}, 1), make(chan struct{}))
+			for i := range 3 {
+				if err := q.enqueue(writeCommand[int, int]{hash: uint64(i)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			claimSlot(t, q) // leave an unpublished slot before the write at 4
+			if err := q.enqueue(writeCommand[int, int]{hash: 4}); err != nil {
+				t.Fatal(err)
+			}
+			if tt.consumed > 0 {
+				if n := q.tryDequeue(make([]writeCommand[int, int], tt.consumed), q.head.Load()); n != tt.consumed {
+					t.Fatalf("setup dequeued %d, want %d", n, tt.consumed)
+				}
+			}
+
+			buf := make([]writeCommand[int, int], 8)
+			n := q.tryDequeue(buf, tt.end)
+			if n != tt.want {
+				t.Fatalf("tryDequeue(end=%d) at tail %d = %d, want %d", tt.end, tt.consumed, n, tt.want)
+			}
+			for i, cmd := range buf[:n] {
+				if want := uint64(tt.consumed + i); cmd.hash != want {
+					t.Fatalf("command %d has hash %d, want %d", i, cmd.hash, want)
+				}
+			}
+			if got, want := q.tail.Load(), uint64(tt.consumed+n); got != want {
+				t.Fatalf("tail = %d, want %d", got, want)
+			}
+		})
 	}
 }
