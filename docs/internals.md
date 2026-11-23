@@ -189,6 +189,9 @@ allocate new buffers while the worker keeps up. A buffer whose capacity a burst 
 Every shard has a bounded multi-producer, single-consumer ring queue. Producers claim slots with CAS on `head`; the shard worker owns `tail`. Sequence numbers
 on each cell distinguish free, published, and stale slots across ring laps. The ring size is rounded to a power of two and is never smaller than 2. A
 producer that finds the ring full waits for a free slot, and a drain that frees several slots lets that many waiting producers through.
+Producers on one shard share one ring and one worker and compete for the same `head`, so many goroutines calling `SetAsync` on one shard get
+less total throughput than the same calls spread over several shards. A small `ShardCount`, or keys that hash to the same shard, put more
+producers on one shard.
 
 `SetAsync` is the fast write API. It tries the cheapest path first: apply the write inline when the shard is completely idle.
 
@@ -222,10 +225,15 @@ Shard workers sleep on a coalesced `wake` channel. Each wake runs this sequence:
 4. Acknowledge commands that carry result channels.
 5. Drain read samples again between batches.
 
-`Sync`, `Clear`, and shutdown use barrier commands. A barrier sent to every shard is acknowledged only after earlier commands on that shard have been
-applied. `Close` marks the cache closed, stops each shard's callback timer and drops its heap, flushes accepted writes, closes `closeCh`, waits
-for workers, and clears all shards. Producers blocked on a full queue wake through `closeCh` and return `ErrCacheClosed`. Pending callbacks are
-reachable only through the shard heaps, so nothing pending stays reachable after `Close`. A callback already due may still run.
+`Sync`, `Clear`, and shutdown use barrier commands. A barrier sent to every shard is acknowledged only after earlier commands on that shard have
+been applied. When a shard's queue is full, `Sync`, `Clear`, and the shutdown flush do not wait for room. They apply that shard's queued writes
+themselves, and `Clear` then empties the shard. `Close` marks the cache closed, stops each shard's callback timer and drops its heap, flushes
+accepted writes, closes `closeCh`, waits for workers, and clears all shards. Once the cache is closed, a `Sync`, `Clear`, or read that overlaps
+`Close` no longer applies queued writes itself. If a shard worker applies its barrier first, such a `Sync` or `Clear` still takes effect, though
+`Sync` may return `ErrCacheClosed` even then. Otherwise it does nothing, and `Sync` returns `ErrCacheClosed`. `Close` applies every write accepted
+before `Close` was called, then clears the shards, and no entries remain after it returns. Producers blocked on a full queue wake through `closeCh`
+and return `ErrCacheClosed`. Pending callbacks are reachable only through the shard heaps, so nothing pending stays reachable after `Close`. A
+callback already due may still run.
 
 ## Read Path
 

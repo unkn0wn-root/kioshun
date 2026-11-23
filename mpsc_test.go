@@ -2,6 +2,7 @@ package kioshun
 
 import (
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -100,6 +101,47 @@ func TestMPSCQueueBackpressureBlocksUntilDrain(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("enqueue stayed blocked after a slot was freed")
+	}
+}
+
+func TestMPSCQueueWokenProducerWaitsAgain(t *testing.T) {
+	closeCh := make(chan struct{})
+	t.Cleanup(func() { close(closeCh) })
+	q := newMPSCQueue[int, int](2, make(chan struct{}, 1), closeCh)
+	for h := range uint64(2) {
+		if err := q.enqueue(writeCommand[int, int]{hash: h}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- q.enqueue(writeCommand[int, int]{hash: 2}) }()
+	waitFor(t, q.spaceWanted.Load)
+
+	// Hold the space wake-up until another producer takes the freed slot.
+	if !q.spaceWanted.CompareAndSwap(true, false) {
+		t.Fatal("the producer withdrew its space request")
+	}
+	if n := q.tryDequeue(make([]writeCommand[int, int], 1), q.head.Load()); n != 1 {
+		t.Fatalf("dequeued %d, want 1", n)
+	}
+	if err := q.enqueue(writeCommand[int, int]{hash: 3}); err != nil {
+		t.Fatal(err)
+	}
+	q.space <- struct{}{}
+
+	waitFor(t, func() bool { return q.spaceWanted.Load() || len(done) > 0 })
+	got := drainAll(q, make([]writeCommand[int, int], 4))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueue stayed blocked after the ring was drained")
+	}
+	got = append(got, drainAll(q, make([]writeCommand[int, int], 4))...)
+	if !slices.ContainsFunc(got, func(cmd writeCommand[int, int]) bool { return cmd.hash == 2 }) {
+		t.Fatalf("enqueue returned nil, but its command is not in the ring (drained %d commands)", len(got))
 	}
 }
 

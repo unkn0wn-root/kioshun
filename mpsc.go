@@ -55,6 +55,16 @@ func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-c
 }
 
 func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
+	for !q.tryEnqueue(cmd) {
+		if err := q.waitForSpace(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tryEnqueue returns false if it finds the ring full.
+func (q *mpscQueue[K, V]) tryEnqueue(cmd writeCommand[K, V]) bool {
 	for {
 		pos := q.head.Load()
 		cell := &q.buffer[pos&q.mask]
@@ -68,12 +78,10 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 				if q.tail.Load() == pos {
 					q.wakeConsumer()
 				}
-				return nil
+				return true
 			}
 		case dif < 0:
-			if err := q.waitForSpace(); err != nil {
-				return err
-			}
+			return false
 		default:
 			// Another producer advanced head.
 		}

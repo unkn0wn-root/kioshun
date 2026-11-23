@@ -13,6 +13,7 @@ const (
 	writeSet writeOp = iota
 	writeClear
 	writeBarrier
+	writeFlush // Close's barrier
 )
 
 // inlineAckBuf keeps acknowledgements for small batches on the stack.
@@ -214,16 +215,39 @@ func (c *Cache[K, V]) syncMutate(s *shard[K, V], apply func()) error {
 		return ErrCacheClosed
 	}
 
-	end := s.queue.head.Load()
-	c.drainShardQueue(s, end)
-	for s.queue.waitClaimed(end) {
-		c.drainShardQueue(s, end)
-	}
+	c.drainClaimed(s)
 
 	s.mu.Lock()
 	apply()
 	s.mu.Unlock()
 	return nil
+}
+
+// drainClaimed drains to a single head snapshot, waiting for producers that still need to publish.
+// The caller holds drainMu.
+func (c *Cache[K, V]) drainClaimed(s *shard[K, V]) {
+	end := s.queue.head.Load()
+	c.drainShardQueue(s, end)
+	for s.queue.waitClaimed(end) {
+		c.drainShardQueue(s, end)
+	}
+}
+
+// applyBarrierDirect runs a barrier on the calling goroutine when the ring is full.
+func (c *Cache[K, V]) applyBarrierDirect(s *shard[K, V], op writeOp) bool {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	// Recheck under drainMu in case Close started while we waited.
+	if op != writeFlush && c.isClosed() {
+		return false
+	}
+	c.drainClaimed(s)
+	if op == writeClear {
+		s.mu.Lock()
+		c.clearShard(s)
+		s.mu.Unlock()
+	}
+	return true
 }
 
 func (c *Cache[K, V]) applySetSync(s *shard[K, V], cmd writeCommand[K, V]) error {
@@ -266,10 +290,10 @@ func (c *Cache[K, V]) enqueueAllAndWait(op writeOp) error {
 }
 
 func (c *Cache[K, V]) flush() {
-	_ = c.enqueueAllShardsAndWait(writeBarrier)
+	_ = c.enqueueAllShardsAndWait(writeFlush)
 }
 
-// enqueueAllShardsAndWait places an ordered barrier on every shard.
+// enqueueAllShardsAndWait queues barriers where possible so shard workers can run them in parallel.
 func (c *Cache[K, V]) enqueueAllShardsAndWait(op writeOp) error {
 	waiters := make([]*writeWaiter, 0, len(c.shards))
 	for _, s := range c.shards {
@@ -278,9 +302,12 @@ func (c *Cache[K, V]) enqueueAllShardsAndWait(op writeOp) error {
 			op:     op,
 			result: waiter.ch,
 		}
-		if err := s.queue.enqueue(cmd); err != nil {
+		if !s.queue.tryEnqueue(cmd) {
 			c.releaseWriteWaiter(waiter)
-			return err
+			if !c.applyBarrierDirect(s, op) {
+				return ErrCacheClosed
+			}
+			continue
 		}
 		waiters = append(waiters, waiter)
 	}
@@ -296,11 +323,15 @@ func (c *Cache[K, V]) enqueueAllShardsAndWait(op writeOp) error {
 	return nil
 }
 
+// clearDirect resets each shard during Close.
+// Hold drainMu through the reset because drainers can update the frequency sketch without mu.
 func (c *Cache[K, V]) clearDirect() {
 	for _, s := range c.shards {
+		s.drainMu.Lock()
 		s.mu.Lock()
 		c.clearShard(s)
 		s.mu.Unlock()
+		s.drainMu.Unlock()
 	}
 }
 
@@ -329,12 +360,14 @@ func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 	}
 }
 
-// tryDrainShard processes read samples and queued writes if no drain is active.
+// tryDrainShard lets callers help drain an open cache without waiting for the consumer lock.
 func (c *Cache[K, V]) tryDrainShard(s *shard[K, V]) {
 	if !s.drainMu.TryLock() {
 		return
 	}
-	c.drainShardQueue(s, s.queue.head.Load())
+	if !c.isClosed() {
+		c.drainShardQueue(s, s.queue.head.Load())
+	}
 	s.drainMu.Unlock()
 }
 
@@ -344,10 +377,13 @@ func (c *Cache[K, V]) drainShard(s *shard[K, V]) {
 	s.drainMu.Unlock()
 }
 
-// drainMissAndLookup checks whether a lock-free miss is a queued Set. It drains
-// only when it can take the consumer lock without waiting.
+// drainMissAndLookup checks whether a queued Set can satisfy a lock-free miss.
 func (c *Cache[K, V]) drainMissAndLookup(s *shard[K, V], kh uint64, key K) (*cacheItem[K, V], bool) {
 	if s.queue.quiescent() || !s.drainMu.TryLock() {
+		return nil, false
+	}
+	if c.isClosed() {
+		s.drainMu.Unlock()
 		return nil, false
 	}
 	c.drainShardQueue(s, s.queue.head.Load())

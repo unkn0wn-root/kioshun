@@ -27,11 +27,11 @@ func closeIfPassed(t *testing.T, c *Cache[string, string]) {
 
 func queueSet(t *testing.T, c *Cache[string, string], key string) {
 	t.Helper()
-	_, cmd, err := c.setCommand(key, "v", NoExpiration, nil)
+	s, cmd, err := c.setCommand(key, "v", NoExpiration, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.shards[0].queue.enqueue(cmd); err != nil {
+	if err := s.queue.enqueue(cmd); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -59,6 +59,8 @@ var drainers = []struct {
 	{"tryDrainShard", func(c *Cache[string, string], s *shard[string, string]) { c.tryDrainShard(s) }},
 	{"syncMutate", func(c *Cache[string, string], s *shard[string, string]) { c.Delete("k") }},
 	{"drainMissAndLookup", func(c *Cache[string, string], s *shard[string, string]) { c.Get("missing") }},
+	{"applyBarrierDirect", func(c *Cache[string, string], s *shard[string, string]) { c.applyBarrierDirect(s, writeBarrier) }},
+	{"applyBarrierDirectClear", func(c *Cache[string, string], s *shard[string, string]) { c.applyBarrierDirect(s, writeClear) }},
 }
 
 func TestWorkerDrainsWritesQueuedDuringItsDrain(t *testing.T) {
