@@ -329,8 +329,6 @@ func (c *Cache[K, V]) clearDirect() {
 	for _, s := range c.shards {
 		s.drainMu.Lock()
 		s.queue.seal()
-		// Drop any references still held by the last batch.
-		clear(s.writeBatch)
 		s.mu.Lock()
 		c.clearShard(s)
 		s.mu.Unlock()
@@ -406,6 +404,8 @@ func (c *Cache[K, V]) drainShardQueue(s *shard[K, V], end uint64) {
 			break
 		}
 		c.applyWriteBatch(s, batch[:n])
+		// Drop the batch's references so it can't keep removed entries alive.
+		clear(batch[:n])
 		s.drainReadSamples()
 	}
 	// A ready command can be left behind if its producer checked tail before this drain reached it.
