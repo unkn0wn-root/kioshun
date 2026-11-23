@@ -445,3 +445,69 @@ func TestMPSCQueueTryDequeueStopsAtEnd(t *testing.T) {
 		})
 	}
 }
+
+// A producer can slip between a separate load and store in seal more readily with multiple Ps.
+func TestMPSCQueueSealRefusesProducers(t *testing.T) {
+	const rounds, producers = 2000, 4
+	yield := runtime.GOMAXPROCS(0) <= producers
+	for round := range rounds {
+		size := []int{2, 4, 16}[round%3]
+		q := newMPSCQueue[int, int](size, make(chan struct{}, 1), make(chan struct{}))
+		q.wakeState.Store(1) // suppress wake-ups because the test drains the queue
+		var sealed, stop atomic.Bool
+		var late atomic.Int64
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for p := range producers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				cmd := writeCommand[int, int]{key: p + 1}
+				<-start
+				for !stop.Load() {
+					after := sealed.Load()
+					if q.tryEnqueue(cmd) {
+						if after {
+							late.Add(1)
+						}
+					} else if yield {
+						runtime.Gosched() // let the test drain if producers occupy every P
+					}
+				}
+			}()
+		}
+		buf := make([]writeCommand[int, int], size)
+		close(start)
+		if round%2 == 0 { // let producers start claiming before the test drains or seals
+			for q.head.Load() == 0 {
+				runtime.Gosched()
+			}
+		}
+		for range round % 17 {
+			q.tryDequeue(buf, q.head.Load())
+		}
+		q.seal()
+		if round%3 == 0 {
+			q.seal()
+		}
+		sealed.Store(true)
+		runtime.Gosched()
+		stop.Store(true)
+		wg.Wait()
+
+		for i := range q.buffer {
+			if cmd := q.buffer[i].cmd; cmd != (writeCommand[int, int]{}) {
+				t.Fatalf("round %d: after seal, cell %d holds the write of producer %d", round, i, cmd.key)
+			}
+		}
+		if head, tail := q.head.Load(), q.tail.Load(); head != tail {
+			t.Fatalf("round %d: after seal, head is %d and tail is %d", round, head, tail)
+		}
+		if q.tryEnqueue(writeCommand[int, int]{key: producers + 1}) {
+			late.Add(1)
+		}
+		if n := late.Load(); n != 0 {
+			t.Fatalf("round %d: %d writes were published after seal returned", round, n)
+		}
+	}
+}

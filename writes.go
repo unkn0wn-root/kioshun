@@ -323,11 +323,14 @@ func (c *Cache[K, V]) enqueueAllShardsAndWait(op writeOp) error {
 	return nil
 }
 
-// clearDirect resets each shard during Close.
+// clearDirect seals each queue and resets its shard during Close.
 // Hold drainMu through the reset because drainers can update the frequency sketch without mu.
 func (c *Cache[K, V]) clearDirect() {
 	for _, s := range c.shards {
 		s.drainMu.Lock()
+		s.queue.seal()
+		// Drop any references still held by the last batch.
+		clear(s.writeBatch)
 		s.mu.Lock()
 		c.clearShard(s)
 		s.mu.Unlock()
@@ -353,7 +356,7 @@ func (c *Cache[K, V]) writeWorker(s *shard[K, V]) {
 				}
 			}
 		case <-c.closeCh:
-			// Process writes accepted before shutdown.
+			// Give writes queued after the flush one last pass before the shard is cleared.
 			c.drainShard(s)
 			return
 		}

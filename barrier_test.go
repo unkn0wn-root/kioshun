@@ -14,7 +14,7 @@ import (
 
 // parkWorker makes producers see a pending wake-up while the worker sleeps.
 // release sends the actual wake-up.
-func parkWorker(t *testing.T, s *shard[string, string]) (release func()) {
+func parkWorker[K comparable, V any](t *testing.T, s *shard[K, V]) (release func()) {
 	s.queue.wakeState.Store(1)
 	release = sync.OnceFunc(func() {
 		s.queue.wakeState.Store(0)
@@ -187,9 +187,11 @@ func TestBarrierOnFullRingWaitsForClaimedWrite(t *testing.T) {
 			queueSet(t, c, "b")
 
 			done, returned := call(func() error { return tc.call(c) })
-			switch stackWith(t, returned, inWaitClaimed, inWaitForSpace) {
+			switch stackWith(t, returned, inWaitClaimed, inWaitForSpace, inSeal) {
 			case inWaitForSpace:
 				t.Fatalf("%s waited for a free ring slot instead of draining the ring", tc.name)
+			case inSeal:
+				t.Fatalf("%s reached seal without its flush waiting for the claimed write", tc.name)
 			case "":
 				t.Fatalf("%s returned while a write claimed before it was unpublished", tc.name)
 			}
@@ -197,11 +199,13 @@ func TestBarrierOnFullRingWaitsForClaimedWrite(t *testing.T) {
 			if err := wait(t, done, tc.name); err != nil {
 				t.Fatalf("%s: %v", tc.name, err)
 			}
+			if tc.closes {
+				// Sealing advances tail past the queued writes, so inspect the cells directly.
+				ringHoldsNothing(t, s)
+				return
+			}
 			if got := s.queue.tail.Load(); got != 2 {
 				t.Fatalf("%s returned with tail %d, want 2", tc.name, got)
-			}
-			if tc.closes {
-				return
 			}
 			for _, k := range []string{"claimed", "b"} {
 				if _, ok := c.Get(k); ok != tc.present {
@@ -455,66 +459,62 @@ func TestBarrierAfterCloseAppliesNothing(t *testing.T) {
 		name string
 		op   writeOp
 	}{{"Sync", writeBarrier}, {"Clear", writeClear}} {
-		for _, queued := range []int{1, 2} { // 1 leaves room in the ring of two, 2 fills it
-			t.Run(tc.name+"/queued="+strconv.Itoa(queued), func(t *testing.T) {
-				c := newTestCache[string, string](t, Config{
-					MaxSize: 1024, ShardCount: 1, EvictionPolicy: LRU, WriteBufferSize: 2, WriteBatchSize: 1,
-				})
-				s := c.shards[0]
-				c.Close()
-				// These writes stand in for SetAsync calls that passed the closed check.
-				for i := range queued {
-					queueSet(t, c, "k"+strconv.Itoa(i))
-				}
-				tail := s.queue.tail.Load()
-				done, _ := call(func() error { return c.enqueueAllShardsAndWait(tc.op) })
-				if err := wait(t, done, tc.name); !errors.Is(err, ErrCacheClosed) {
-					t.Errorf("%s after Close returned %v, want ErrCacheClosed", tc.name, err)
-				}
-				if got := s.queue.tail.Load(); got != tail {
-					t.Errorf("%s after Close drained the ring: tail moved from %d to %d", tc.name, tail, got)
-				}
-				if n := s.tab.length(); n != 0 {
-					t.Errorf("%s after Close left %d entries in the closed cache", tc.name, n)
-				}
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestCache[string, string](t, Config{
+				MaxSize: 1024, ShardCount: 1, EvictionPolicy: LRU, WriteBufferSize: 2, WriteBatchSize: 1,
 			})
-		}
+			s := c.shards[0]
+			queueSet(t, c, "k")
+			c.Close()
+			head, tail := s.queue.head.Load(), s.queue.tail.Load()
+			// Resume a barrier that passed its closed check before Close sealed the ring.
+			done, _ := call(func() error { return c.enqueueAllShardsAndWait(tc.op) })
+			if err := wait(t, done, tc.name); !errors.Is(err, ErrCacheClosed) {
+				t.Errorf("%s after Close returned %v, want ErrCacheClosed", tc.name, err)
+			}
+			if h, tl := s.queue.head.Load(), s.queue.tail.Load(); h != head || tl != tail {
+				t.Errorf("%s after Close moved head from %d to %d and tail from %d to %d", tc.name, head, h, tail, tl)
+			}
+			if n := s.tab.length(); n != 0 {
+				t.Errorf("%s after Close left %d entries in the closed cache", tc.name, n)
+			}
+		})
 	}
 }
 
-func TestMissAfterCloseAppliesNothing(t *testing.T) {
-	c := newTestCache[string, string](t, Config{MaxSize: 1024, ShardCount: 1, EvictionPolicy: SieveTinyLFU})
-	s := c.shards[0]
-	c.Close()
-	queueSet(t, c, "k")
-	if _, ok := c.drainMissAndLookup(s, c.hasher.Sum("k"), "k"); ok {
-		t.Error("a miss after Close applied a queued write")
-	}
-	if n := s.tab.length(); n != 0 {
-		t.Errorf("a miss after Close left %d entries in the closed cache", n)
-	}
-}
+func TestDrainOnClosedCacheReleasesDrainLock(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		drain func(c *Cache[string, string], s *shard[string, string])
+	}{
+		{"miss", func(c *Cache[string, string], s *shard[string, string]) {
+			c.drainMissAndLookup(s, c.hasher.Sum("k"), "k")
+		}},
+		{"tryDrainShard", func(c *Cache[string, string], s *shard[string, string]) { c.tryDrainShard(s) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestCache[string, string](t, Config{MaxSize: 1024, ShardCount: 1, EvictionPolicy: SieveTinyLFU})
+			s := c.shards[0]
+			release := parkWorker(t, s)
+			queueSet(t, c, "k")
+			c.closed.Store(true) // simulate the start of Close before the flush
 
-func TestMissDuringCloseReleasesDrainLock(t *testing.T) {
-	c := newTestCache[string, string](t, Config{MaxSize: 1024, ShardCount: 1, EvictionPolicy: SieveTinyLFU})
-	s := c.shards[0]
-	release := parkWorker(t, s)
-	queueSet(t, c, "k")
-	c.closed.Store(true) // simulate the start of Close before the flush
-
-	if _, ok := c.drainMissAndLookup(s, c.hasher.Sum("k"), "k"); ok {
-		t.Error("a miss on a closed cache applied a queued write")
-	}
-	if s.drainMu.TryLock() {
-		s.drainMu.Unlock()
-	} else {
-		t.Error("a miss on a closed cache kept drainMu")
-		s.drainMu.Unlock() // so that Close can finish
-	}
-	release()
-	done, _ := call(func() error { return c.Close() })
-	if err := wait(t, done, "Close"); err != nil {
-		t.Fatal(err)
+			tc.drain(c, s)
+			if got := s.queue.tail.Load(); got != 0 {
+				t.Errorf("a %s on a closed cache applied a queued write: tail moved to %d", tc.name, got)
+			}
+			if s.drainMu.TryLock() {
+				s.drainMu.Unlock()
+			} else {
+				t.Errorf("a %s on a closed cache kept drainMu", tc.name)
+				s.drainMu.Unlock() // so that Close can finish
+			}
+			release()
+			done, _ := call(func() error { return c.Close() })
+			if err := wait(t, done, "Close"); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

@@ -228,12 +228,13 @@ Shard workers sleep on a coalesced `wake` channel. Each wake runs this sequence:
 `Sync`, `Clear`, and shutdown use barrier commands. A barrier sent to every shard is acknowledged only after earlier commands on that shard have
 been applied. When a shard's queue is full, `Sync`, `Clear`, and the shutdown flush do not wait for room. They apply that shard's queued writes
 themselves, and `Clear` then empties the shard. `Close` marks the cache closed, stops each shard's callback timer and drops its heap, flushes
-accepted writes, closes `closeCh`, waits for workers, and clears all shards. Once the cache is closed, a `Sync`, `Clear`, or read that overlaps
-`Close` no longer applies queued writes itself. If a shard worker applies its barrier first, such a `Sync` or `Clear` still takes effect, though
-`Sync` may return `ErrCacheClosed` even then. Otherwise it does nothing, and `Sync` returns `ErrCacheClosed`. `Close` applies every write accepted
-before `Close` was called, then clears the shards, and no entries remain after it returns. Producers blocked on a full queue wake through `closeCh`
-and return `ErrCacheClosed`. Pending callbacks are reachable only through the shard heaps, so nothing pending stays reachable after `Close`. A
-callback already due may still run.
+accepted writes, closes `closeCh`, waits for workers, and clears all shards and their queues. Once the cache is closed, a `Sync`, `Clear`, or read
+that overlaps `Close` no longer applies queued writes itself. If a shard worker applies its barrier first, such a `Sync` or `Clear` still takes
+effect, though `Sync` may return `ErrCacheClosed` even then. Otherwise it does nothing, and `Sync` returns `ErrCacheClosed`. `Close` applies every
+write accepted before `Close` was called, then clears the shards, and no entries remain after it returns. When `Close` clears a queue, it drops the
+writes still in it. The queue refuses writes from then on, and a `SetAsync` that reaches it returns `ErrCacheClosed`. A `SetAsync` that overlaps
+`Close` may still return nil for a write that `Close` drops. No write queue holds a key or value after `Close` returns. Pending callbacks are
+reachable only through the shard heaps, so nothing pending stays reachable after `Close`. A callback already due may still run.
 
 ## Read Path
 

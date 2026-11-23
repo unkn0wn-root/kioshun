@@ -175,3 +175,21 @@ func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V], end uint64) int {
 	}
 	return n
 }
+
+// seal makes the ring look full to producers and discards every outstanding command.
+// The consumer calls it after closeCh is closed so producers waiting for space can return.
+func (q *mpscQueue[K, V]) seal() {
+	tail := q.tail.Load()
+	end := tail + q.mask + 1
+	// Swap reserves the free slots and captures the old head in one step.
+	// A separate load and store could miss a claim made between them.
+	claimed := q.head.Swap(end)
+	for pos := tail; pos != claimed; pos++ {
+		cell := &q.buffer[pos&q.mask]
+		for cell.seq.Load() != pos+1 {
+			runtime.Gosched()
+		}
+		cell.cmd = writeCommand[K, V]{}
+	}
+	q.tail.Store(end)
+}
