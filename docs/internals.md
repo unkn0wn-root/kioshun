@@ -181,6 +181,10 @@ buffer while holding the shard lock. A dedicated worker drains those buffers and
 cache. If no listener is configured, no buffer or worker is allocated. Delivery is asynchronous, so secondary indexes must handle a notification arriving after
 the same key has already been inserted again.
 
+`Close` delivers every removal that happened before it cleared the cache, and it does not report the entries it clears. It may make the last listener calls
+itself, on the goroutine that called it, without holding a shard lock. Listener calls never overlap, and none happens after `Close` returns. Because `Close`
+returns only after those calls return, a listener must not call `Close` or wait for a lock held by the goroutine that calls `Close`.
+
 Staging buffers are reused: when the worker takes a shard's staged removals, it leaves an empty buffer that it has already delivered, so removals do not
 allocate new buffers while the worker keeps up. A buffer whose capacity a burst grew past 256 entries is dropped after delivery instead of kept.
 
@@ -228,13 +232,14 @@ Shard workers sleep on a coalesced `wake` channel. Each wake runs this sequence:
 `Sync`, `Clear`, and shutdown use barrier commands. A barrier sent to every shard is acknowledged only after earlier commands on that shard have
 been applied. When a shard's queue is full, `Sync`, `Clear`, and the shutdown flush do not wait for room. They apply that shard's queued writes
 themselves, and `Clear` then empties the shard. `Close` marks the cache closed, stops each shard's callback timer and drops its heap, flushes
-accepted writes, closes `closeCh`, waits for workers, and clears all shards and their queues. Once the cache is closed, a `Sync`, `Clear`, or read
-that overlaps `Close` no longer applies queued writes itself. If a shard worker applies its barrier first, such a `Sync` or `Clear` still takes
-effect, though `Sync` may return `ErrCacheClosed` even then. Otherwise it does nothing, and `Sync` returns `ErrCacheClosed`. `Close` applies every
-write accepted before `Close` was called, then clears the shards, and no entries remain after it returns. When `Close` clears a queue, it drops the
-writes still in it. The queue refuses writes from then on, and a `SetAsync` that reaches it returns `ErrCacheClosed`. A `SetAsync` that overlaps
-`Close` may still return nil for a write that `Close` drops. No write queue holds a key or value after `Close` returns. Pending callbacks are
-reachable only through the shard heaps, so nothing pending stays reachable after `Close`. A callback already due may still run.
+accepted writes, closes `closeCh`, waits for workers, clears all shards and their queues, and then delivers the removals still staged for the removal
+listeners. Once the cache is closed, a `Sync`, `Clear`, or read that overlaps `Close` no longer applies queued writes itself. If a shard worker
+applies its barrier first, such a `Sync` or `Clear` still takes effect, though `Sync` may return `ErrCacheClosed` even then. Otherwise it does
+nothing, and `Sync` returns `ErrCacheClosed`. `Close` applies every write accepted before `Close` was called, then clears the shards, and no entries
+remain after it returns. When `Close` clears a queue, it drops the writes still in it. The queue refuses writes from then on, and a `SetAsync` that
+reaches it returns `ErrCacheClosed`. A `SetAsync` that overlaps `Close` may still return nil for a write that `Close` drops. No write queue or
+removal staging buffer holds a key or value after `Close` returns. Pending callbacks are reachable only through the shard heaps, so nothing pending
+stays reachable after `Close`. A callback already due may still run.
 
 ## Read Path
 

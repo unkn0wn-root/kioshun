@@ -116,7 +116,7 @@ func TestCloseDropsWriteClaimedBeforeSeal(t *testing.T) {
 	}
 
 	closed, returned := call(func() error { return c.Close() })
-	if stackWith(t, returned, `\.\(\*WaitGroup\)\.Wait\(`) == "" {
+	if stackWith(t, returned, inWaitWorkers) == "" {
 		t.Fatal("Close returned while the removal listener was blocked")
 	}
 	// Claim after the flush and hold publication so only seal can pick up the command.

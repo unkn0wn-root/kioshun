@@ -60,9 +60,8 @@ type shard[K comparable, V any] struct {
 	size int64 // live items
 	cost int64 // live item cost
 
-	// Removed entries are staged in removeBuf under mu. The notify worker swaps
-	// in an empty buffer and delivers after unlocking. removePending is written
-	// only under mu. removeWake is nil when no listener is registered.
+	// mu protects removeBuf and writes to removePending. Listeners run after unlocking.
+	// removeWake is nil when no listener is registered.
 	removeWake       *removalWake
 	removeNotifyMask removalNotifyMask
 	removeBuf        []removedEntry[K, V]

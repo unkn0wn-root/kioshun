@@ -448,6 +448,8 @@ func (c *Cache[K, V]) PolicyStats() PolicyStats {
 }
 
 // Close stops background work and clears the cache. It is safe to call more than once.
+// It waits for all pending removal notifications to be delivered.
+// Entries cleared by Close are discarded silently.
 func (c *Cache[K, V]) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
@@ -459,7 +461,9 @@ func (c *Cache[K, V]) Close() error {
 		c.flush()
 		close(c.closeCh)
 		c.workers.Wait()
+		// An expiry check already in flight can stage a removal until its shard is cleared.
 		c.clearDirect()
+		c.drainRemovals(nil)
 	})
 	return nil
 }
