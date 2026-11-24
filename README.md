@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo.JPG" alt="Kioshun Logo" width="200"/>
+  <img src="assets/logo.png" alt="Kioshun Logo" width="200"/>
 
   # Kioshun - In-Memory Cache for Go
 
