@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+## [1.7.0](https://github.com/unkn0wn-root/kioshun/compare/v1.6.0...v1.7.0) (2026-11-24)
+
+
+### Bug Fixes
+
+* bound write queue drains so Set and Delete cannot starve ([defe3b0](https://github.com/unkn0wn-root/kioshun/commit/defe3b0ede99f283ebbfeccb5589de1be4516ea9))
+* clear the write batch after each drain ([f0b86af](https://github.com/unkn0wn-root/kioshun/commit/f0b86af1c54d5cfc9343a6fc5f2abc58ed7bc15d))
+* deliver staged removals at Close ([9fb69b5](https://github.com/unkn0wn-root/kioshun/commit/9fb69b531b0ed0578010f28e9fc5342038bb3271))
+* drain full queues on barriers and stop drains after Close ([a453068](https://github.com/unkn0wn-root/kioshun/commit/a45306818dab5eb314da3f62e2dbb552685feac9))
+* order Set and Delete after earlier SetAsync writes ([977f6d5](https://github.com/unkn0wn-root/kioshun/commit/977f6d5daf936caa3522e4270aebca5fdad6f0ae))
+* seal write queues at Close ([24bbfde](https://github.com/unkn0wn-root/kioshun/commit/24bbfdeace83a31fb13340178e1f02996def65e3))
+
 ## [1.6.0](https://github.com/unkn0wn-root/kioshun/compare/v1.5.2...v1.6.0) (2026-11-19)
 
 
