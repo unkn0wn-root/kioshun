@@ -54,6 +54,8 @@ func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-c
 	return q
 }
 
+// enqueue waits for space when the ring is full. It returns ErrCacheClosed if
+// the cache closes while it waits.
 func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 	for !q.tryEnqueue(cmd) {
 		if err := q.waitForSpace(); err != nil {
