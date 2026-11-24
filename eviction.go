@@ -94,11 +94,16 @@ func removalNotifyBit(reason RemovalReason) removalNotifyMask {
 // WithOnRemove registers a listener for capacity eviction, admission rejection,
 // expiration, and deletion. Clear and value replacement do not call it. Only
 // capacity removals increase Stats().Evictions.
+//
+// Listener calls run one at a time. [Cache.Close] may make the final calls itself.
+// Calling Close from a listener or waiting on a lock held by the caller of Close can deadlock.
+// A listener can call other cache methods.
 func WithOnRemove[K comparable, V any](listener func(key K, value V, reason RemovalReason)) Option[K, V] {
 	return func(c *Cache[K, V]) { c.onRemove = listener }
 }
 
 // WithOnEvict registers a listener for entries removed to stay within capacity.
+// The same listener rules as [WithOnRemove] apply.
 func WithOnEvict[K comparable, V any](listener func(key K, value V)) Option[K, V] {
 	return func(c *Cache[K, V]) { c.onEvict = listener }
 }
@@ -149,15 +154,14 @@ func (w *removalWake) wait(done <-chan struct{}) bool {
 	}
 }
 
-// removeNotifyWorker calls listeners without holding a shard lock, allowing a
-// listener to use the cache safely. On close it delivers what is still staged.
+// removeNotifyWorker calls listeners without shard locks so they can use the cache.
+// Close waits for this worker to stop before delivering any remaining removals.
 func (c *Cache[K, V]) removeNotifyWorker() {
 	defer c.workers.Done()
 	var spare []removedEntry[K, V]
 	for c.removeWake.wait(c.closeCh) {
 		spare = c.drainRemovals(spare)
 	}
-	c.drainRemovals(spare)
 }
 
 // drainRemovals delivers all staged removals. Each pending shard gets the empty

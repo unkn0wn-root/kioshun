@@ -1,6 +1,7 @@
 package kioshun
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -53,7 +54,19 @@ func newMPSCQueue[K comparable, V any](size int, wake chan struct{}, closeCh <-c
 	return q
 }
 
+// enqueue waits for space when the ring is full. It returns ErrCacheClosed if
+// the cache closes while it waits.
 func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
+	for !q.tryEnqueue(cmd) {
+		if err := q.waitForSpace(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tryEnqueue returns false if it finds the ring full.
+func (q *mpscQueue[K, V]) tryEnqueue(cmd writeCommand[K, V]) bool {
 	for {
 		pos := q.head.Load()
 		cell := &q.buffer[pos&q.mask]
@@ -63,17 +76,14 @@ func (q *mpscQueue[K, V]) enqueue(cmd writeCommand[K, V]) error {
 			if q.head.CompareAndSwap(pos, pos+1) {
 				cell.cmd = cmd
 				cell.seq.Store(pos + 1)
-				// Wake only for the consumer's next slot. Read tail after publishing,
-				// so a consumer that reaches this slot later finds it published.
+				// Publish before reading tail so we either send a wake-up or the consumer sees the command itself.
 				if q.tail.Load() == pos {
 					q.wakeConsumer()
 				}
-				return nil
+				return true
 			}
 		case dif < 0:
-			if err := q.waitForSpace(); err != nil {
-				return err
-			}
+			return false
 		default:
 			// Another producer advanced head.
 		}
@@ -132,10 +142,23 @@ func (q *mpscQueue[K, V]) ready() bool {
 	return cell.seq.Load() == pos+1
 }
 
-func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
+// waitClaimed returns false once the consumer reaches end.
+// Otherwise it waits for the producer at tail to publish. Only the consumer may call it.
+func (q *mpscQueue[K, V]) waitClaimed(end uint64) bool {
+	if int64(end-q.tail.Load()) <= 0 {
+		return false
+	}
+	for !q.ready() {
+		runtime.Gosched()
+	}
+	return true
+}
+
+// tryDequeue moves contiguous published commands before end into buf. Only the consumer may call it.
+func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V], end uint64) int {
 	n := 0
 	pos := q.tail.Load()
-	for n < len(buf) {
+	for n < len(buf) && int64(end-pos) > 0 {
 		cell := &q.buffer[pos&q.mask]
 		if cell.seq.Load() != pos+1 {
 			break
@@ -153,4 +176,22 @@ func (q *mpscQueue[K, V]) tryDequeue(buf []writeCommand[K, V]) int {
 		q.space <- struct{}{}
 	}
 	return n
+}
+
+// seal makes the ring look full to producers and discards every outstanding command.
+// The consumer calls it after closeCh is closed so producers waiting for space can return.
+func (q *mpscQueue[K, V]) seal() {
+	tail := q.tail.Load()
+	end := tail + q.mask + 1
+	// Swap reserves the free slots and captures the old head in one step.
+	// A separate load and store could miss a claim made between them.
+	claimed := q.head.Swap(end)
+	for pos := tail; pos != claimed; pos++ {
+		cell := &q.buffer[pos&q.mask]
+		for cell.seq.Load() != pos+1 {
+			runtime.Gosched()
+		}
+		cell.cmd = writeCommand[K, V]{}
+	}
+	q.tail.Store(end)
 }

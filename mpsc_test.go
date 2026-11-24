@@ -2,6 +2,7 @@ package kioshun
 
 import (
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,11 +12,26 @@ import (
 func drainAll(q *mpscQueue[int, int], buf []writeCommand[int, int]) []writeCommand[int, int] {
 	var out []writeCommand[int, int]
 	for {
-		n := q.tryDequeue(buf)
+		n := q.tryDequeue(buf, q.head.Load())
 		if n == 0 {
 			return out
 		}
 		out = append(out, buf[:n]...)
+	}
+}
+
+// claimSlot pauses a producer between claiming and publishing a slot.
+// publish fills the slot without sending a wake-up.
+func claimSlot[K comparable, V any](t *testing.T, q *mpscQueue[K, V]) (publish func(cmd writeCommand[K, V])) {
+	t.Helper()
+	pos := q.head.Load()
+	cell := &q.buffer[pos&q.mask]
+	if cell.seq.Load() != pos || !q.head.CompareAndSwap(pos, pos+1) {
+		t.Fatal("could not claim the next ring slot")
+	}
+	return func(cmd writeCommand[K, V]) {
+		cell.cmd = cmd
+		cell.seq.Store(pos + 1)
 	}
 }
 
@@ -75,7 +91,7 @@ func TestMPSCQueueBackpressureBlocksUntilDrain(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if n := q.tryDequeue(make([]writeCommand[int, int], 1)); n != 1 {
+	if n := q.tryDequeue(make([]writeCommand[int, int], 1), q.head.Load()); n != 1 {
 		t.Fatalf("dequeued %d, want 1", n)
 	}
 	select {
@@ -85,6 +101,47 @@ func TestMPSCQueueBackpressureBlocksUntilDrain(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("enqueue stayed blocked after a slot was freed")
+	}
+}
+
+func TestMPSCQueueWokenProducerWaitsAgain(t *testing.T) {
+	closeCh := make(chan struct{})
+	t.Cleanup(func() { close(closeCh) })
+	q := newMPSCQueue[int, int](2, make(chan struct{}, 1), closeCh)
+	for h := range uint64(2) {
+		if err := q.enqueue(writeCommand[int, int]{hash: h}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- q.enqueue(writeCommand[int, int]{hash: 2}) }()
+	waitFor(t, q.spaceWanted.Load)
+
+	// Hold the space wake-up until another producer takes the freed slot.
+	if !q.spaceWanted.CompareAndSwap(true, false) {
+		t.Fatal("the producer withdrew its space request")
+	}
+	if n := q.tryDequeue(make([]writeCommand[int, int], 1), q.head.Load()); n != 1 {
+		t.Fatalf("dequeued %d, want 1", n)
+	}
+	if err := q.enqueue(writeCommand[int, int]{hash: 3}); err != nil {
+		t.Fatal(err)
+	}
+	q.space <- struct{}{}
+
+	waitFor(t, func() bool { return q.spaceWanted.Load() || len(done) > 0 })
+	got := drainAll(q, make([]writeCommand[int, int], 4))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueue stayed blocked after the ring was drained")
+	}
+	got = append(got, drainAll(q, make([]writeCommand[int, int], 4))...)
+	if !slices.ContainsFunc(got, func(cmd writeCommand[int, int]) bool { return cmd.hash == 2 }) {
+		t.Fatalf("enqueue returned nil, but its command is not in the ring (drained %d commands)", len(got))
 	}
 }
 
@@ -134,7 +191,7 @@ func TestMPSCQueueConcurrentProducersNoLoss(t *testing.T) {
 		buf := make([]writeCommand[int, int], 32)
 		defer close(done)
 		for got < want {
-			n := q.tryDequeue(buf)
+			n := q.tryDequeue(buf, q.head.Load())
 			if n == 0 {
 				continue
 			}
@@ -210,7 +267,7 @@ func TestMPSCQueueFreedSlotsWakeEveryWaiter(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if n := q.tryDequeue(make([]writeCommand[int, int], 2)); n != 2 {
+	if n := q.tryDequeue(make([]writeCommand[int, int], 2), q.head.Load()); n != 2 {
 		t.Fatalf("dequeued %d, want 2", n)
 	}
 	for i := range 2 {
@@ -289,7 +346,7 @@ func TestMPSCQueueSpaceLeavesNothingBehind(t *testing.T) {
 			defer close(consumed)
 			buf := make([]writeCommand[int, int], 2)
 			for !quit.Load() {
-				if q.tryDequeue(buf) == 0 {
+				if q.tryDequeue(buf, q.head.Load()) == 0 {
 					runtime.Gosched() // lets the producer run when GOMAXPROCS is 1
 				}
 			}
@@ -315,6 +372,142 @@ func TestMPSCQueueSpaceLeavesNothingBehind(t *testing.T) {
 		}
 		if q.spaceWanted.Load() || len(q.space) != 0 {
 			t.Fatalf("round %d: left behind: space wanted %v, %d wake-ups queued", round, q.spaceWanted.Load(), len(q.space))
+		}
+	}
+}
+
+func TestMPSCQueueWaitClaimedIgnoresLaterClaims(t *testing.T) {
+	q := newMPSCQueue[int, int](8, make(chan struct{}, 1), make(chan struct{}))
+	if err := q.enqueue(writeCommand[int, int]{hash: 1}); err != nil {
+		t.Fatal(err)
+	}
+	end := q.head.Load()
+	claimSlot(t, q) // claimed after end and never published
+
+	if got := drainAll(q, make([]writeCommand[int, int], 8)); len(got) != 1 || got[0].hash != 1 {
+		t.Fatalf("drained %v, want [1]", got)
+	}
+	done := make(chan bool, 1)
+	go func() { done <- q.waitClaimed(end) }()
+	select {
+	case more := <-done:
+		if more {
+			t.Fatal("waitClaimed reported an unconsumed slot claimed before end")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitClaimed waited for a slot claimed after end")
+	}
+}
+
+func TestMPSCQueueTryDequeueStopsAtEnd(t *testing.T) {
+	tests := []struct {
+		name     string
+		consumed int
+		end      uint64
+		want     int
+	}{
+		{"end inside published run", 0, 2, 2},
+		{"end at tail", 2, 2, 0},
+		{"end behind tail", 2, 1, 0},
+		{"end past unpublished slot", 0, 5, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q := newMPSCQueue[int, int](8, make(chan struct{}, 1), make(chan struct{}))
+			for i := range 3 {
+				if err := q.enqueue(writeCommand[int, int]{hash: uint64(i)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			claimSlot(t, q) // leave an unpublished slot before the write at 4
+			if err := q.enqueue(writeCommand[int, int]{hash: 4}); err != nil {
+				t.Fatal(err)
+			}
+			if tt.consumed > 0 {
+				if n := q.tryDequeue(make([]writeCommand[int, int], tt.consumed), q.head.Load()); n != tt.consumed {
+					t.Fatalf("setup dequeued %d, want %d", n, tt.consumed)
+				}
+			}
+
+			buf := make([]writeCommand[int, int], 8)
+			n := q.tryDequeue(buf, tt.end)
+			if n != tt.want {
+				t.Fatalf("tryDequeue(end=%d) at tail %d = %d, want %d", tt.end, tt.consumed, n, tt.want)
+			}
+			for i, cmd := range buf[:n] {
+				if want := uint64(tt.consumed + i); cmd.hash != want {
+					t.Fatalf("command %d has hash %d, want %d", i, cmd.hash, want)
+				}
+			}
+			if got, want := q.tail.Load(), uint64(tt.consumed+n); got != want {
+				t.Fatalf("tail = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+// A producer can slip between a separate load and store in seal more readily with multiple Ps.
+func TestMPSCQueueSealRefusesProducers(t *testing.T) {
+	const rounds, producers = 2000, 4
+	yield := runtime.GOMAXPROCS(0) <= producers
+	for round := range rounds {
+		size := []int{2, 4, 16}[round%3]
+		q := newMPSCQueue[int, int](size, make(chan struct{}, 1), make(chan struct{}))
+		q.wakeState.Store(1) // suppress wake-ups because the test drains the queue
+		var sealed, stop atomic.Bool
+		var late atomic.Int64
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for p := range producers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				cmd := writeCommand[int, int]{key: p + 1}
+				<-start
+				for !stop.Load() {
+					after := sealed.Load()
+					if q.tryEnqueue(cmd) {
+						if after {
+							late.Add(1)
+						}
+					} else if yield {
+						runtime.Gosched() // let the test drain if producers occupy every P
+					}
+				}
+			}()
+		}
+		buf := make([]writeCommand[int, int], size)
+		close(start)
+		if round%2 == 0 { // let producers start claiming before the test drains or seals
+			for q.head.Load() == 0 {
+				runtime.Gosched()
+			}
+		}
+		for range round % 17 {
+			q.tryDequeue(buf, q.head.Load())
+		}
+		q.seal()
+		if round%3 == 0 {
+			q.seal()
+		}
+		sealed.Store(true)
+		runtime.Gosched()
+		stop.Store(true)
+		wg.Wait()
+
+		for i := range q.buffer {
+			if cmd := q.buffer[i].cmd; cmd != (writeCommand[int, int]{}) {
+				t.Fatalf("round %d: after seal, cell %d holds the write of producer %d", round, i, cmd.key)
+			}
+		}
+		if head, tail := q.head.Load(), q.tail.Load(); head != tail {
+			t.Fatalf("round %d: after seal, head is %d and tail is %d", round, head, tail)
+		}
+		if q.tryEnqueue(writeCommand[int, int]{key: producers + 1}) {
+			late.Add(1)
+		}
+		if n := late.Load(); n != 0 {
+			t.Fatalf("round %d: %d writes were published after seal returned", round, n)
 		}
 	}
 }
